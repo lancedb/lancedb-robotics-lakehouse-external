@@ -1,0 +1,237 @@
+[project]
+name = "lancedb-robotics"
+version = "0.0.1"
+description = "Multimodal data lakehouse substrate for Physical AI pipelines, built on LanceDB"
+authors = [
+    { name = "Sarwar Bhuiyan", email = "sarwar@lancedb.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "lancedb>=0.33",
+    # pylance is the fast-access layer (decision 0024 / backlog 0035). lancedb's
+    # Table API does not expose blob materialization or per-column UDF/schema
+    # evolution; the blob fetch path (``to_lance().take_blobs``) and the additive
+    # quality write (``drop_columns`` + ``add_columns`` on the Lance dataset) both
+    # drop to the underlying ``lance.LanceDataset``. Pinned alongside lancedb>=0.33
+    # for on-disk format compatibility.
+    "pylance>=7.0",
+    "pyarrow>=17",
+    "mcap>=1.1",
+    # Chunk-compression codecs (backlog 0017). Real corpora are always
+    # compressed -- didi/demo chunks are zstd, nuScenes chunks are lz4 -- so the
+    # codecs are base dependencies, not extras: an absent codec must surface as a
+    # clear AdapterError, which is impossible if the codec is simply missing from
+    # the install. (The `mcap` reader uses these transparently to decompress.)
+    "zstandard>=0.21",
+    "lz4>=4.0",
+    # Split / multi-file recordings (backlog 0019). rosbag2 splits one session
+    # into a directory of shards described by a YAML ``metadata.yaml`` (ordered
+    # shard list + declared time range); parsing it needs a YAML reader.
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Payload decoders (backlog 0014/0017/0020). We depend on the official upstream
+# mcap decoder packages directly, not on mcap-lancedb (decision
+# 20260613T035038Z-decode-via-official-mcap-decoder-packages-not-mc): the decode
+# dispatch is thin glue over these, and we only need generic payload_json/blob.
+# `flatbuffer` decodes generically from the channel schema's embedded .bfbs via
+# the `flatbuffers` runtime; `cbor`/`msgpack` are self-describing binary decoded
+# schema-free (backlog 0020). All are lazily imported, so the base install
+# decodes json (stdlib) and leaves the rest as `raw` until the matching extra is
+# present. One extra per family, plus `all` to pull every decoder at once.
+ros1 = ["mcap-ros1-support>=0.7"]
+ros2 = ["mcap-ros2-support>=0.5"]
+protobuf = ["mcap-protobuf-support>=0.5"]
+flatbuffer = ["flatbuffers>=23.5"]
+cbor = ["cbor2>=5.4"]
+msgpack = ["msgpack>=1.0"]
+# Optional ROS bag container reader (backlog 0025). `rosbags` reads ROS1 `.bag`
+# and ROS2 sqlite `.db3` stores without requiring a ROS installation. The adapter
+# imports it lazily, so base installs discover the format but report it
+# unavailable with an install hint until this extra is present.
+rosbag = ["rosbags>=0.11.3"]
+# Dataset export native loaders (backlog 0026/0041). The exporter can always
+# write a deterministic projection manifest, but native LeRobot/RLDS validation
+# and loading stay optional and are imported lazily so base installs do not pull
+# the training stacks.
+lerobot = ["lerobot>=0.4.0"]
+# Official LeRobotDataset benchmark lane (backlog 0374). This is the supported
+# one-command native benchmark stack for researchers and CI. It deliberately
+# declares PyAV with the same floor as the video-decode extra and does not
+# require TorchCodec directly: the benchmark probes TorchCodec first if a
+# host/LeRobot install provides it, then falls back to PyAV for stable CPU CI and
+# macOS/Linux local runs.
+lerobot-native-bench = [
+    "lerobot>=0.4.0",
+    "torch>=2.0",
+    "av>=12.0",
+    "numpy>=1.24",
+]
+rlds = [
+    # `rlds` 0.1.x publishes Linux x86_64 wheels only, and the native
+    # TensorFlow/RLDS validation stack currently fails to build on Python
+    # 3.14/macOS arm64. Keep the optional extra resolvable on local-development
+    # hosts and run native conformance in a supported Linux x86_64/Python 3.11
+    # job. The upstream `rlds` package imports TensorFlow and Reverb at module
+    # import time, so the native stack must include those packages, not only
+    # TFDS.
+    "dm-reverb[tensorflow]>=0.14,<0.15; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.13'",
+    "rlds>=0.1; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.13'",
+    "tensorflow-datasets>=4.9; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.13'",
+]
+webdataset = ["webdataset>=0.2.86"]
+# Optional: decoded media materialization for native training samples. The base
+# install can still return metadata, URI references, lazy handles, and bytes.
+media = [
+    "numpy>=1.24",
+    "pillow>=10.0",
+]
+# Optional decoded source-video conformance lane for LeRobot/source MP4s. The
+# base install remains metadata/sample-byte only; PyAV is imported lazily.
+video-decode = [
+    "av>=12.0",
+    "numpy>=1.24",
+]
+all = [
+    "mcap-ros1-support>=0.7",
+    "mcap-ros2-support>=0.5",
+    "mcap-protobuf-support>=0.5",
+    "flatbuffers>=23.5",
+    "cbor2>=5.4",
+    "msgpack>=1.0",
+    "rosbags>=0.11.3",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff",
+    "click>=8.0",
+    # CI installs every decoder so the didi (ros1), nuScenes (protobuf + json),
+    # synthetic ros2/cdr, flatbuffer (foxglove .bfbs), and cbor/msgpack decode
+    # paths are all exercised for real -- none probe-only (backlog 0017/0020). The
+    # sliced real-corpus fixtures still skip cleanly if a decoder is somehow absent.
+    "mcap-ros1-support>=0.7",
+    "mcap-ros2-support>=0.5",
+    "mcap-protobuf-support>=0.5",
+    "flatbuffers>=23.5",
+    "cbor2>=5.4",
+    "msgpack>=1.0",
+    "rosbags>=0.11.3",
+    # Real Foxglove flatbuffer schemas (.bfbs + builders) for regenerating the
+    # checked-in flatbuffer fixture; the decode tests themselves need only
+    # `flatbuffers`.
+    "foxglove-schemas-flatbuffer>=0.3",
+]
+# Optional: enables `train preview torch` to emit tensor batches. The dict
+# preview works without it.
+torch = [
+    "torch>=2.0",
+]
+# Optional: real, model-backed embedding providers (backlog 0021). Lazily
+# imported exactly like the decoder extras -- absent, `scenarios enrich
+# --provider sentence-transformers|clip` degrades to the demo provider with a
+# notice (never a crash). The dependency-free `demo`/`hashed-text`/`hashed-image`
+# providers need none of this. Deliberately NOT in `dev`: the degrade-safe
+# fallback is exercised precisely *because* these are absent in CI.
+#
+# `sentence-transformers` is capped to the text-capable 3.x line (BUG-09). From
+# 4.x/5.x its package `__init__` eagerly imports `torchcodec`, whose native
+# dylib fails to load on several supported hosts (e.g. Python 3.14 / torch 2.10
+# / macOS arm64), so `import sentence_transformers` raises `OSError` and the
+# real-embedding path is unavailable. 3.x (verified: 3.4.1 with transformers
+# 4.57.x) is text-only -- no torchcodec import -- and produces real 384-dim
+# MiniLM vectors. The provider import is also wrapped to degrade safely if a
+# model dependency is present but fails to import (see embeddings.py), so a
+# broken host install still falls back to demo with a loud notice rather than
+# crashing.
+embeddings = [
+    "sentence-transformers>=3,<4",
+    "open-clip-torch>=2.20",
+    "pillow>=10.0",
+    "torch>=2.0",
+]
+# Optional: object-store raw-source reads (backlog 0023). LanceDB handles remote
+# lake tables natively via ``storage_options``; fsspec-backed readers let MCAP
+# inspect/ingest open raw ``s3://``/``gs://``/``az://`` objects with ranged reads
+# instead of staging a whole local copy. Credentials still come from the standard
+# provider chain or ``auth_ref``-scoped environment, never from lake rows.
+object-store = [
+    "s3fs>=2024.6",
+    "gcsfs>=2024.6",
+    "adlfs>=2024.7",
+]
+# Optional lineage hook providers. The hook layer imports these lazily and never
+# requires them for the base SDK/CLI.
+mlflow = ["mlflow>=2.0"]
+wandb = ["wandb>=0.16"]
+openlineage = ["openlineage-python>=1.20"]
+datahub = ["acryl-datahub>=0.14"]
+# Optional: expert Cypher/property-graph query backend over the canonical lineage
+# tables (backlog 0099). Never a hard dependency -- absent, `lake.lineage.cypher`
+# and `lineage cypher` raise an actionable missing-extra error; the default
+# trace/impact/audit APIs need none of it. Deliberately NOT in `dev`: the
+# degrade-safe missing-extra path is exercised precisely because it is absent in
+# CI (mirrors the `embeddings` extra). Alpha upstream, so kept to a floor pin.
+graph = ["lance-graph>=0.5.4"]
+
+[project.scripts]
+lancedb-robotics = "lancedb_robotics.cli:app"
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "lerobot" },
+        { extra = "rlds" },
+    ],
+    [
+        { extra = "lerobot-native-bench" },
+        { extra = "rlds" },
+    ],
+]
+
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+pythonpath = ["src"]
+markers = [
+    # Integration tests that read the real MCAP corpora under data/ (gitignored,
+    # not in CI). They skip cleanly when their corpus file is absent, so the
+    # default suite stays green without the data. Run them with `pytest -m realcorpus`.
+    "realcorpus: reads a real MCAP corpus under data/; skipped when absent",
+    # The heavy subset: a full-file ingest of a multi-hundred-MB real log. Deselect
+    # with `pytest -m \"realcorpus and not slow\"` for the fast real-corpus checks.
+    "slow: heavy real-corpus test (full-file ingest of a large log)",
+    # Native RLDS/TFDS optional-dependency checks. These skip on unsupported local
+    # platforms unless LANCEDB_ROBOTICS_REQUIRE_RLDS_NATIVE=1 is set by CI.
+    "rlds_native: requires the Linux x86_64 RLDS optional dependency stack",
+    # Torch-enabled Enterprise/native DataLoader tests (backlog 0118). They skip
+    # cleanly when the optional `torch` extra is absent (the default light dev/CI
+    # environment); the dedicated torch CI lane installs it and sets
+    # LANCEDB_ROBOTICS_REQUIRE_TORCH=1 so a missing/broken install fails instead of
+    # skipping. Select the lane with `pytest -m torch_loader`.
+    "torch_loader: exercises the real PyTorch DataLoader path (needs the torch extra)",
+    # Real source-MP4 decoded-frame checks for LeRobot ingest/source conformance.
+    # They skip cleanly without the optional `video-decode` extra; the dedicated
+    # CI lane installs it and sets LANCEDB_ROBOTICS_REQUIRE_VIDEO_DECODE=1 so
+    # missing/broken decoder dependencies or fixture encoders fail the lane.
+    "video_decode: exercises real LeRobot source MP4 decoded-frame conformance (needs the video-decode extra)",
+    # Official LeRobotDataset benchmark fixture matrix. Default suites skip when
+    # the heavy native stack is absent; the dedicated lane installs LeRobot,
+    # torch, and decode extras, then sets
+    # LANCEDB_ROBOTICS_REQUIRE_LEROBOT_NATIVE_BENCHMARK=1 so dependency/import,
+    # sample-access, DataLoader, decode-backend, and metric-key gaps fail.
+    "lerobot_native_benchmark: exercises the real official LeRobotDataset benchmark arm",
+]

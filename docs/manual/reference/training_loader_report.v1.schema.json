@@ -1,0 +1,374 @@
+{
+  "$defs": {
+    "entity_ref": {
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "table_versions": {
+      "items": {
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "tag": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "table",
+          "version"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "worker": {
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "num_workers": {
+          "type": "integer"
+        },
+        "resume_from": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "num_workers"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "lancedb-robotics/training-loader-report/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "loader": {
+            "properties": {
+              "kind": {
+                "const": "native-training"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "snapshot"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "loader": {
+            "properties": {
+              "kind": {
+                "const": "aligned-training"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "alignment",
+          "read_table_versions"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "alignment": {
+      "$ref": "#/$defs/entity_ref"
+    },
+    "disabled_capabilities": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "fallback_events": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "kind": {
+      "const": "lancedb-robotics/training-loader-report/v1"
+    },
+    "lake": {
+      "properties": {
+        "backend_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "connection_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_routing": {
+          "type": "object"
+        },
+        "uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "uri",
+        "display_uri",
+        "backend_kind",
+        "connection_kind",
+        "execution_mode",
+        "request_routing"
+      ],
+      "type": "object"
+    },
+    "loader": {
+      "properties": {
+        "access_pattern": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "native-training",
+            "aligned-training"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "access_pattern"
+      ],
+      "type": "object"
+    },
+    "metrics": {
+      "properties": {
+        "cache": {
+          "type": "object"
+        },
+        "operations": {
+          "type": "array"
+        },
+        "operations_by_type": {
+          "type": "object"
+        },
+        "summary": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "summary",
+        "operations_by_type",
+        "cache",
+        "operations"
+      ],
+      "type": "object"
+    },
+    "plans": {
+      "properties": {
+        "epoch": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "epoch_plan_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ordering_policy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_rows": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_rows": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "worker": {
+          "$ref": "#/$defs/worker"
+        }
+      },
+      "required": [
+        "epoch",
+        "epoch_plan_id",
+        "ordering_policy",
+        "worker",
+        "selected_rows",
+        "total_rows"
+      ],
+      "type": "object"
+    },
+    "policies": {
+      "properties": {
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enterprise_cache": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "columns",
+        "enterprise_cache"
+      ],
+      "type": "object"
+    },
+    "read_table_versions": {
+      "$ref": "#/$defs/table_versions"
+    },
+    "remote_execution": {
+      "properties": {
+        "capabilities": {
+          "type": "object"
+        },
+        "connection_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fallback_policy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_executor": {
+          "type": "object"
+        },
+        "request_routing": {
+          "type": "object"
+        },
+        "requested_backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolved_backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "requested_backend",
+        "resolved_backend",
+        "execution_mode",
+        "connection_kind",
+        "display_uri",
+        "capabilities",
+        "plan_executor",
+        "request_routing",
+        "fallback_policy",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "run": {
+      "type": "object"
+    },
+    "snapshot": {
+      "$ref": "#/$defs/entity_ref"
+    },
+    "table_versions": {
+      "$ref": "#/$defs/table_versions"
+    }
+  },
+  "required": [
+    "kind",
+    "loader",
+    "lake",
+    "table_versions",
+    "plans",
+    "policies",
+    "remote_execution",
+    "metrics",
+    "fallback_events",
+    "disabled_capabilities",
+    "run"
+  ],
+  "title": "LanceDB Robotics training loader report (v1)",
+  "type": "object"
+}

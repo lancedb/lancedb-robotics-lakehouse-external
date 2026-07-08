@@ -1,0 +1,12 @@
+rosbag2_bagfile_information:
+  version: 5
+  storage_identifier: mcap
+  duration:
+    nanoseconds: 80000000
+  starting_time:
+    nanoseconds_since_epoch: 1700000000000000000
+  message_count: 18
+  relative_file_paths:
+    - recording_0.mcap
+    - recording_1.mcap
+    - recording_2.mcap

@@ -1,0 +1,43 @@
+site_name: LanceDB Robotics Lakehouse — Manual
+site_description: Task-oriented manual for the Physical AI data lakehouse built on LanceDB.
+docs_dir: docs/manual
+use_directory_urls: false
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+    - toc.integrate
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+
+nav:
+  - Home: index.md
+  - Concepts:
+      - Overview: concepts/overview.md
+      - Architecture: concepts/architecture.md
+      - Storage and auth: concepts/storage-and-auth.md
+      - OSS core vs. enterprise/plugin: concepts/oss-core-vs-enterprise.md
+      - The training loader report contract: concepts/training-loader-report.md
+  - Journeys:
+      - Bring a LeRobot dataset into the lake: journeys/lerobot-ingest.md
+      - The rebuild loop: journeys/rebuild-loop.md
+      - Retention policy and governance: journeys/retention-governance.md
+      - Lineage audit reports and cleanup gates: journeys/lineage-audit-reports.md
+      - Scoped lineage context and hook plugins: journeys/lineage-scoped-context.md
+      - Find a run by its external ID: journeys/external-context-lookup.md
+      - Compare Enterprise training runs over time: journeys/training-report-history.md
+      - Prove Enterprise training behaves the same everywhere: journeys/enterprise-training-conformance.md
+      - Page a fleet-scale training epoch from a server-side plan: journeys/server-side-plan.md
+  - Reference:
+      - CLI: reference/cli.generated.md
+      - Python API (lake.*): reference/api.generated.md
+      - Canonical tables: reference/tables.generated.md
+      - Enterprise training compatibility matrix: reference/enterprise-training-compatibility.generated.md

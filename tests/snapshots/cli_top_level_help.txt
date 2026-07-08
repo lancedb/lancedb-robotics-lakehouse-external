@@ -1,0 +1,31 @@
+Usage: lancedb-robotics [OPTIONS] COMMAND [ARGS]...
+
+  Multimodal data lakehouse substrate for Physical AI pipelines, built on
+  LanceDB.
+
+Options:
+  --version             Show the package version and exit.
+  --install-completion  Install completion for the current shell.
+  --show-completion     Show completion for the current shell, to copy it or
+                        customize the installation.
+  --help                Show this message and exit.
+
+Commands:
+  lake       Create and manage a LanceDB robotics lake.
+  inspect    Inspect robot log files (MCAP first) without ingesting.
+  ingest     Register sources and ingest robot logs into canonical lake rows.
+  quality    Validate required streams and manage quarantine results.
+  align      Create multi-rate temporally aligned observation views.
+  scenarios  Create searchable scenario/clip windows over ingested runs.
+  episodes   Derive and inspect first-class episode boundaries and frames.
+  video      Encode and inspect codec-aware camera video frames.
+  embed      Create observation-level embedding columns (image/pixel vectors).
+  search     Search scenarios and camera frames with scalar, text, vector,...
+  curate     Curate, sample, mine, and snapshot scenario selections.
+  gaps       Analyze distribution gaps and balance reports.
+  dataset    Create reproducible dataset snapshots from search results.
+  train      Preview dataset snapshots as training datasets.
+  export     Export selected clips back to MCAP and replay-tool workflows.
+  lineage    Refresh and traverse canonical lineage graph provenance.
+  bench      Run reproducible benchmark harnesses for training data access.
+  writeback  Import labels, model outputs, and feedback into the closed loop.

@@ -1,0 +1,10 @@
+{
+  "run_id": "demo-run-0001",
+  "source_uri": "fixtures/demo.mcap",
+  "time_range_ns": [1700000000000000000, 1700000005000000000],
+  "topics": [
+    { "topic": "/camera/front/image", "encoding": "foxglove.CompressedImage", "message_count": 10 },
+    { "topic": "/imu/data", "encoding": "sensor_msgs/Imu", "message_count": 25 },
+    { "topic": "/tf", "encoding": "tf2_msgs/TFMessage", "message_count": 7 }
+  ]
+}

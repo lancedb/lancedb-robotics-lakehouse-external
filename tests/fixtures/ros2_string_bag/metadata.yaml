@@ -1,0 +1,30 @@
+rosbag2_bagfile_information:
+  compression_format: ''
+  compression_mode: ''
+  custom_data: null
+  duration:
+    nanoseconds: 100000000
+  files:
+  - duration:
+      nanoseconds: 100000000
+    message_count: 2
+    path: ros2_string_bag.db3
+    starting_time:
+      nanoseconds_since_epoch: 1700000000500000000
+  message_count: 2
+  relative_file_paths:
+  - ros2_string_bag.db3
+  ros_distro: rosbags
+  starting_time:
+    nanoseconds_since_epoch: 1700000000500000000
+  storage_identifier: sqlite3
+  topics_with_message_count:
+  - message_count: 2
+    topic_metadata:
+      name: /chatter
+      offered_qos_profiles: []
+      serialization_format: cdr
+      type: std_msgs/msg/String
+      type_description_hash: 
+        RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18
+  version: 9

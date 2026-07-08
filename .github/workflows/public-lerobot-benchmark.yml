@@ -1,0 +1,152 @@
+name: Public LeRobot Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: LeRobot HF repo id or source path.
+        default: lerobot/droid_100
+        required: true
+      revision:
+        description: Pinned HF revision or commit.
+        required: true
+      formats:
+        description: Comma-separated benchmark formats.
+        default: lance,lerobot-default,webdataset,deeplake
+        required: true
+      size_tier:
+        description: Source size tier label.
+        default: droid-100
+        required: true
+      storage_tier:
+        description: Storage tier label.
+        default: hf-cache
+        required: true
+      capacity_dry_run:
+        description: Plan capacity and retain skip/dry-run artifacts without running.
+        default: "false"
+        required: true
+      capacity_max_source_bytes:
+        description: Maximum estimated source bytes allowed; blank falls back to repo variable.
+        required: false
+      capacity_max_artifact_bytes:
+        description: Maximum estimated retained artifact bytes allowed; blank falls back to repo variable.
+        required: false
+      capacity_time_budget_seconds:
+        description: Maximum estimated wall-clock seconds allowed; blank falls back to repo variable.
+        required: false
+      capacity_require_gpu:
+        description: Require detected GPU before running.
+        default: "false"
+        required: true
+      capacity_require_object_store:
+        description: Require object-store publication destination before running.
+        default: "false"
+        required: true
+      capacity_publication_destination:
+        description: Object-store publication destination checked by capacity gate.
+        required: false
+  schedule:
+    - cron: "17 6 * * 0"
+
+jobs:
+  public-lerobot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve pinned revision
+        id: revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="${{ github.event.inputs.revision }}"
+          if [ -z "$revision" ]; then
+            revision="${{ vars.LEROBOT_DROID_100_REVISION }}"
+          fi
+          if [ -z "$revision" ]; then
+            echo "No pinned LeRobot revision configured; skipping scheduled benchmark."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          safe_revision="$(printf '%s' "$revision" | tr -c 'A-Za-z0-9._-' '-')"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "value=$revision" >> "$GITHUB_OUTPUT"
+          echo "safe=$safe_revision" >> "$GITHUB_OUTPUT"
+      - name: Install uv
+        if: steps.revision.outputs.skip != 'true'
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        if: steps.revision.outputs.skip != 'true'
+        run: uv python install 3.11
+      - name: Sync benchmark dependencies
+        if: steps.revision.outputs.skip != 'true'
+        run: uv sync --extra dev --extra lerobot --extra webdataset
+      - name: Initialize benchmark lake
+        if: steps.revision.outputs.skip != 'true'
+        run: uv run --no-sync lancedb-robotics lake init ./public-lerobot-benchmark.robot.lance
+      - name: Run retained public benchmark
+        if: steps.revision.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="${{ github.event.inputs.source }}"
+          formats="${{ github.event.inputs.formats }}"
+          size_tier="${{ github.event.inputs.size_tier }}"
+          storage_tier="${{ github.event.inputs.storage_tier }}"
+          capacity_dry_run="${{ github.event.inputs.capacity_dry_run }}"
+          capacity_max_source_bytes="${{ github.event.inputs.capacity_max_source_bytes }}"
+          capacity_max_artifact_bytes="${{ github.event.inputs.capacity_max_artifact_bytes }}"
+          capacity_time_budget_seconds="${{ github.event.inputs.capacity_time_budget_seconds }}"
+          capacity_require_gpu="${{ github.event.inputs.capacity_require_gpu }}"
+          capacity_require_object_store="${{ github.event.inputs.capacity_require_object_store }}"
+          capacity_publication_destination="${{ github.event.inputs.capacity_publication_destination }}"
+          source="${source:-lerobot/droid_100}"
+          formats="${formats:-lance,lerobot-default,webdataset,deeplake}"
+          size_tier="${size_tier:-droid-100}"
+          storage_tier="${storage_tier:-hf-cache}"
+          capacity_max_source_bytes="${capacity_max_source_bytes:-${{ vars.LANCEDB_ROBOTICS_PUBLIC_LEROBOT_MAX_SOURCE_BYTES }}}"
+          capacity_max_artifact_bytes="${capacity_max_artifact_bytes:-${{ vars.LANCEDB_ROBOTICS_PUBLIC_LEROBOT_MAX_ARTIFACT_BYTES }}}"
+          capacity_time_budget_seconds="${capacity_time_budget_seconds:-${{ vars.LANCEDB_ROBOTICS_PUBLIC_LEROBOT_TIME_BUDGET_SECONDS }}}"
+          capacity_publication_destination="${capacity_publication_destination:-${{ vars.LANCEDB_ROBOTICS_PUBLIC_LEROBOT_PUBLICATION_DESTINATION }}}"
+          args=(
+            --lake ./public-lerobot-benchmark.robot.lance
+            --artifact-root ./public-benchmarks/lerobot
+            --source "$source"
+            --revision "${{ steps.revision.outputs.value }}"
+            --report-id "$size_tier-${{ steps.revision.outputs.safe }}-${{ github.sha }}"
+            --formats "$formats"
+            --size-tier "$size_tier"
+            --storage-tier "$storage_tier"
+            --sample-limit 256
+            --random-access-samples 64
+            --random-frame-samples 64
+            --frames-per-clip 4
+          )
+          if [ -n "$capacity_max_source_bytes" ]; then
+            args+=(--capacity-max-source-bytes "$capacity_max_source_bytes")
+          fi
+          if [ -n "$capacity_max_artifact_bytes" ]; then
+            args+=(--capacity-max-artifact-bytes "$capacity_max_artifact_bytes")
+          fi
+          if [ -n "$capacity_time_budget_seconds" ]; then
+            args+=(--capacity-time-budget-seconds "$capacity_time_budget_seconds")
+          fi
+          if [ -n "$capacity_publication_destination" ]; then
+            args+=(--capacity-publication-destination "$capacity_publication_destination")
+          fi
+          if [ "${capacity_dry_run:-false}" = "true" ]; then
+            args+=(--capacity-dry-run)
+          fi
+          if [ "${capacity_require_gpu:-false}" = "true" ]; then
+            args+=(--capacity-require-gpu)
+          fi
+          if [ "${capacity_require_object_store:-false}" = "true" ]; then
+            args+=(--capacity-require-object-store)
+          fi
+          uv run --no-sync lancedb-robotics bench run-public-lerobot "${args[@]}"
+      - name: Upload benchmark artifacts
+        if: steps.revision.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-lerobot-benchmark
+          path: public-benchmarks/lerobot

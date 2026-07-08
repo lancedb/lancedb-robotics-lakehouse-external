@@ -1,0 +1,70 @@
+## lake init
+  integration_sources (v1)
+  runs (v1)
+  episodes (v1)
+  observations (v4)
+  videos (v1)
+  attachments (v2)
+  events (v1)
+  scenarios (v3)
+  dataset_snapshots (v1)
+  labels (v1)
+  model_outputs (v1)
+  feedback (v1)
+  transform_runs (v1)
+
+## inspect mcap
+  5 messages, 2 topics, 0.2s (1700000000000000000 .. 1700000000200000000)
+  /camera/front	cbor	sample.CompressedImage	2 msgs	decodable
+  /imu	json	sample.Imu	3 msgs	decodable
+
+## ingest mcap
+rows added:
+  integration_sources +1
+  runs +1
+  observations +5
+  attachments +0
+  events +2
+  transform_runs +2
+observations by topic:
+  /camera/front	2
+  /imu	3
+
+## quality validate
+profile: demo
+runs: 1 validated, 1 passed, 0 failed, 0 quarantined
+
+## scenarios create
+window: 50ms (50000000 ns)
+topics: all topics
+partial final window: included
+runs: 1
+scenarios: 4 created
+
+## scenarios enrich
+caption provider: demo-template-v1
+embedding provider: demo-hash-v1 (dim 16)
+scenarios enriched: 4
+transform: tfm-enrich-b531e97abc4798d2
+fts index: built (FTS over scenarios.summary, 4 rows)
+
+## search hybrid
+mode: hybrid
+query: "imu observations"
+results: 4
+
+## dataset snapshot create
+tag: demo-v1
+source: search (hybrid "imu observations")
+scenarios: 4
+
+## train preview torch
+tag: demo-v1
+split by: run
+scenarios: 4
+columns: scenario_id, split, summary, topics, embedding
+framework: torch optional path exercised
+
+## export mcap
+format: mcap
+clips: 4 (exported 4, skipped 0, planned 0)

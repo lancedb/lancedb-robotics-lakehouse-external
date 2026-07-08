@@ -1,0 +1,35 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+.miagent-worktrees/
+
+.miagent/backend.env
+
+# local showcase data and generated lake artifacts
+examples/*
+!examples/README.md
+
+# local robotics corpus: multi-GB MCAP under data/ (demo/nuScenes/didi). Never
+# committed -- and gitignored so `git add -A` on the main working dir does not
+# hash gigabytes / hold the index lock. See docs/product/open-questions.md.
+data/
+
+# editor-local workspace files
+*.code-workspace
+
+# local scratch, generated exports, and private research notes
+$LAKE/
+*.pdf
+README_backup.*
+docs/research/*call*.md
+docs/research/*interview*.md
+docs/research/ai-researcher-*.md
+docs/product/*reframe*.md

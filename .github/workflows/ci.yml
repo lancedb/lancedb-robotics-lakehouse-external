@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        run: uv python install 3.11
+      # The `dev` extra pulls mcap-ros1/ros2/protobuf-support, so the didi
+      # (ros1), nuScenes (protobuf + json), and synthetic ros2/cdr decode paths
+      # all run against real bytes -- none are probe-only (backlog 0017).
+      - name: Sync (with all decoders)
+        run: uv sync --extra dev
+      - name: Lint
+        run: uv run --no-sync ruff check src tests
+      # The multi-GB memory smoke test is opt-in (needs the corpus, which is not
+      # in the repo); the default suite runs on the small checked-in fixtures.
+      - name: Test
+        run: uv run --no-sync pytest -q
+
+  rlds-native:
+    name: RLDS native optional dependency
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # The upstream rlds package publishes Linux x86_64 artifacts only. This
+      # lane is intentionally narrow so unsupported local platforms keep
+      # resolving the extra while CI still proves the real native stack.
+      - name: Test RLDS native conformance in Linux amd64 container
+        run: scripts/verify-rlds-native-docker.sh
+
+  torch-loader:
+    name: Torch-enabled Enterprise loader matrix
+    runs-on: ubuntu-latest
+    env:
+      # This lane exists precisely to exercise real PyTorch DataLoader workers
+      # (backlog 0118), so a missing or broken torch install must FAIL, not skip.
+      # The require-flag turns any torch-absent skip in a `torch_loader` test into
+      # a hard failure (see tests/conftest.py::require_torch_loader).
+      LANCEDB_ROBOTICS_REQUIRE_TORCH: "1"
+      # The loader tests need no GPU; pull the CPU torch wheels so the lane stays
+      # small and fast. Ignored by uv versions that predate --torch-backend.
+      UV_TORCH_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        run: uv python install 3.11
+      # `dev` brings pytest + the decoders; `torch` adds the optional PyTorch
+      # extra so the native, aligned, and Enterprise iterable DataLoader tests run
+      # with real multiprocessing workers instead of skipping. On Linux both fork
+      # (the default) and spawn start methods are available, so the mocked-db://
+      # fork tests and the spawn pickling/reopen tests both execute here; the
+      # Windows-only fork gap stays documented (tests/conftest.py).
+      - name: Sync (dev + torch)
+        run: uv sync --extra dev --extra torch
+      # `-m torch_loader` selects only the DataLoader lane. `-v` prints per-test
+      # PASS/SKIP so an unexpected skip is visible, and `-ra` (the repo default)
+      # prints skip reasons for the documented platform gaps. Worker reopen and
+      # pickling failures surface with the worker's full traceback, which is the
+      # diagnostic signal this lane must publish.
+      - name: Torch loader matrix
+        run: uv run --no-sync pytest -m torch_loader -v
+
+  video-decode:
+    name: LeRobot source MP4 video-decode conformance
+    runs-on: ubuntu-latest
+    env:
+      # This lane exists to prove real decoded RGB hashes from LeRobot/source MP4s
+      # with only the declared video-decode extra installed. Missing PyAV/NumPy,
+      # unavailable fixture encoders, or decoder regressions must fail here
+      # instead of silently skipping (see tests/conftest.py::require_video_decode).
+      LANCEDB_ROBOTICS_REQUIRE_VIDEO_DECODE: "1"
+      LANCEDB_ROBOTICS_VIDEO_DECODE_ARTIFACT_DIR: artifacts/video-decode
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        run: uv python install 3.11
+      # `dev` brings pytest + metadata decoders; `video-decode` adds PyAV/NumPy
+      # for real source MP4 decode. The test fixture is generated at runtime so
+      # the repo does not carry opaque binary media while the lane still exercises
+      # real MP4 sample tables and decoded RGB pixel hashes.
+      - name: Sync (dev + video-decode)
+        run: uv sync --extra dev --extra video-decode
+      - name: LeRobot video decode conformance
+        run: |
+          mkdir -p artifacts/video-decode
+          uv run --no-sync pytest -m video_decode -v \
+            --junitxml=artifacts/video-decode/junit.xml
+      - name: Upload video decode diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-decode-conformance
+          path: artifacts/video-decode
+
+  lerobot-native-benchmark:
+    name: LeRobot native benchmark fixture matrix
+    runs-on: ubuntu-latest
+    env:
+      # This lane exists to prove the official LeRobotDataset benchmark arm with
+      # the real optional stack installed. Missing/broken LeRobot, torch,
+      # DataLoader, decode backend, sample access, or metric-key conformance must
+      # fail here instead of silently becoming a dependency-light skip.
+      LANCEDB_ROBOTICS_REQUIRE_LEROBOT_NATIVE_BENCHMARK: "1"
+      LANCEDB_ROBOTICS_LEROBOT_NATIVE_ARTIFACT_DIR: artifacts/lerobot-native-benchmark
+      # Optional public smoke matrix. Leave unset for the generated local v3
+      # fixture only; set both vars to run an additional pinned HF/source fixture
+      # when network and credentials are available.
+      LANCEDB_ROBOTICS_LEROBOT_NATIVE_PUBLIC_REPO_ID: ${{ vars.LANCEDB_ROBOTICS_LEROBOT_NATIVE_PUBLIC_REPO_ID }}
+      LANCEDB_ROBOTICS_LEROBOT_NATIVE_PUBLIC_REVISION: ${{ vars.LANCEDB_ROBOTICS_LEROBOT_NATIVE_PUBLIC_REVISION }}
+      LANCEDB_ROBOTICS_LEROBOT_NATIVE_PUBLIC_SOURCE_URI: ${{ vars.LANCEDB_ROBOTICS_LEROBOT_NATIVE_PUBLIC_SOURCE_URI }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      UV_TORCH_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        run: uv python install 3.11
+      # `lerobot-native-bench` is the supported one-command native benchmark
+      # stack: LeRobot + torch DataLoader + PyAV decode fallback. TorchCodec is
+      # still probed when present, but PyAV is the declared stable CI backend.
+      - name: Sync (dev + LeRobot native benchmark stack)
+        run: uv sync --extra dev --extra lerobot-native-bench
+      - name: LeRobot native benchmark fixture matrix
+        run: |
+          mkdir -p artifacts/lerobot-native-benchmark
+          uv run --no-sync pytest -m lerobot_native_benchmark -v \
+            --junitxml=artifacts/lerobot-native-benchmark/junit.xml
+      - name: Upload LeRobot native benchmark diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lerobot-native-benchmark
+          path: artifacts/lerobot-native-benchmark
