@@ -549,6 +549,89 @@ def ingest_lerobot_job_command(
         )
 
 
+@ingest_app.command("lerobot-media-inspection-timeout-plan")
+def ingest_lerobot_media_inspection_timeout_plan_command(
+    lake: str | None = typer.Option(
+        None,
+        "--lake",
+        help="Path or object-store URI to the lake; optional with --checkpoint-rows-json.",
+    ),
+    checkpoint_rows_json: Path | None = _LEROBOT_CLAIM_CHAOS_CHECKPOINT_ROWS_JSON_OPTION,
+    job_id: str | None = typer.Option(None, "--job-id", help="Filter by LeRobot job id."),
+    source_id: str | None = typer.Option(None, "--source-id", help="Filter by source id."),
+    source_uri: str | None = typer.Option(None, "--source-uri", help="Filter by source URI."),
+    storage_tier: str | None = typer.Option(
+        None,
+        "--storage-tier",
+        help="Group/filter storage tier label, for example local, object-store, or huggingface.",
+    ),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Group/filter storage provider label, for example local, s3, gcs, or huggingface.",
+    ),
+    min_timeout_seconds: float = typer.Option(
+        1.0,
+        "--min-timeout-seconds",
+        help="Minimum recommended media-inspection timeout.",
+    ),
+    max_timeout_seconds: float = typer.Option(
+        600.0,
+        "--max-timeout-seconds",
+        help="Maximum recommended media-inspection timeout.",
+    ),
+    output_format: str = typer.Option("text", "--format", help="Output format: text or json."),
+    auth_ref: str | None = _AUTH_REF_OPTION,
+    remote_auth_ref: str | None = _REMOTE_AUTH_REF_OPTION,
+    storage_auth_ref: str | None = _STORAGE_AUTH_REF_OPTION,
+    storage_option: list[str] | None = _STORAGE_OPTION,
+    region: str | None = _REGION_OPTION,
+    host_override: str | None = _HOST_OVERRIDE_OPTION,
+) -> None:
+    """Recommend LeRobot media-inspection timeout and retry settings from telemetry."""
+    from lancedb_robotics.ingest import recommend_lerobot_media_inspection_timeouts
+
+    parsed_format = _parse_lerobot_job_format(output_format)
+    try:
+        checkpoint_rows = _load_lerobot_checkpoint_rows_json(checkpoint_rows_json)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if lake is None and checkpoint_rows is None:
+        typer.echo("error: --lake or --checkpoint-rows-json is required", err=True)
+        raise typer.Exit(code=2)
+    opened = None
+    if lake is not None:
+        opened = _open_lake_for_ingest_cli(
+            lake,
+            auth_ref=auth_ref,
+            remote_auth_ref=remote_auth_ref,
+            storage_auth_ref=storage_auth_ref,
+            storage_option=storage_option,
+            region=region,
+            host_override=host_override,
+        )
+    try:
+        report = recommend_lerobot_media_inspection_timeouts(
+            opened,
+            checkpoint_rows=checkpoint_rows,
+            job_id=job_id,
+            source_id=source_id,
+            source_uri=source_uri,
+            storage_tier=storage_tier,
+            provider=provider,
+            min_timeout_seconds=min_timeout_seconds,
+            max_timeout_seconds=max_timeout_seconds,
+        )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if parsed_format == "json":
+        typer.echo(json.dumps(_json_ready(report), indent=2, sort_keys=True))
+        return
+    _print_lerobot_media_inspection_timeout_plan(report)
+
+
 @ingest_app.command("lerobot-claim-watchdog")
 def ingest_lerobot_claim_watchdog_command(
     lake: str = _LAKE_OPTION,
@@ -1593,6 +1676,56 @@ def _print_lerobot_job_summary(job: dict) -> None:
         )
     if job.get("error"):
         typer.echo(f"  error: {job.get('error')}")
+
+
+def _print_lerobot_media_inspection_timeout_plan(report: dict) -> None:
+    telemetry = report.get("telemetry") or {}
+    recommendation = report.get("recommendation") or {}
+    durations = telemetry.get("duration_ms") or {}
+    source_counts = report.get("source_counts") or {}
+    typer.echo(f"lake: {report.get('lake_uri') or 'offline'}")
+    typer.echo(
+        "lerobot media-inspection timeout plan: "
+        f"reports={source_counts.get('reports')} "
+        f"checkpoints={source_counts.get('checkpoints')} "
+        f"transforms={source_counts.get('completed_transforms')} "
+        f"videos={telemetry.get('reported_video_count')} "
+        f"timeouts={telemetry.get('total_timeouts')} "
+        f"retries={telemetry.get('total_retries')}"
+    )
+    typer.echo(
+        "duration_ms: "
+        f"count={durations.get('count')} "
+        f"p95={durations.get('p95')} "
+        f"p99={durations.get('p99')} "
+        f"max={durations.get('max')}"
+    )
+    typer.echo(
+        "recommended: "
+        f"status={recommendation.get('status')} "
+        f"timeout_s={recommendation.get('timeout_seconds')} "
+        f"retries={recommendation.get('retry_count')} "
+        f"backoff_s={recommendation.get('retry_backoff_seconds')}"
+    )
+    apply_args = recommendation.get("apply_args") or []
+    if apply_args:
+        typer.echo("apply args: " + " ".join(str(value) for value in apply_args))
+    flags = recommendation.get("flags") or []
+    if flags:
+        typer.echo("flags: " + ", ".join(str(flag) for flag in flags))
+    for group in report.get("groups") or []:
+        selector = group.get("selector") or {}
+        group_recommendation = group.get("recommendation") or {}
+        group_telemetry = group.get("telemetry") or {}
+        typer.echo(
+            "  "
+            f"{selector.get('storage_tier')}/{selector.get('provider')}/"
+            f"{selector.get('corpus_size_tier')}: "
+            f"reports={group.get('sample_count')} "
+            f"videos={group_telemetry.get('reported_video_count')} "
+            f"timeout_s={group_recommendation.get('timeout_seconds')} "
+            f"retries={group_recommendation.get('retry_count')}"
+        )
 
 
 def _print_lerobot_checkpoint_retention_report(report: dict) -> None:

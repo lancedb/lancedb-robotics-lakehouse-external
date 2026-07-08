@@ -297,6 +297,10 @@ Show one durable LeRobot ingest job and its checkpoint history.
 
 List latest durable LeRobot ingest jobs.
 
+### `ingest lerobot-media-inspection-timeout-plan`
+
+Recommend LeRobot media-inspection timeout and retry settings from telemetry.
+
 ### `ingest mcap`
 
 Register an MCAP file as a source and ingest it into canonical lake rows.

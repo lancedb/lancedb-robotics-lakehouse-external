@@ -336,6 +336,54 @@ Recommended media-inspection timeout defaults:
   `--source-storage-option` when the fsspec backend supports them; the media
   timeout is the outer per-video wall-clock guard.
 
+After a backfill has written durable checkpoints, ask the lake to recommend the
+next timeout and retry settings instead of widening by feel:
+
+```bash
+lancedb-robotics ingest lerobot-media-inspection-timeout-plan \
+  --lake ./robot.lance \
+  --format text
+```
+
+JSON mode is suitable for automation:
+
+```bash
+lancedb-robotics ingest lerobot-media-inspection-timeout-plan \
+  --lake ./robot.lance \
+  --source-id src-abc123 \
+  --format json
+```
+
+The report reads only `lerobot_ingest_checkpoints.progress_json` plus completed
+LeRobot `transform_runs.params`. It summarizes configured timeout/retry values,
+`total_timeouts`, `total_retries`, process worker kills, and per-video
+`inspection_duration_ms` p50/p95/p99 distributions, then emits `apply_args` such
+as `--media-inspection-timeout-seconds 40 --media-inspection-retries 2`. Reused
+media-inspection cache hits are counted but excluded from duration percentiles.
+Recommendations are also grouped by storage tier, provider, and corpus-size lane
+so a local smoke corpus does not hide an S3 mid-corpus timeout problem.
+
+For an incident review or CI fixture that has exported checkpoint rows but no
+openable lake, run the same planner offline:
+
+```bash
+lancedb-robotics ingest lerobot-media-inspection-timeout-plan \
+  --checkpoint-rows-json ./reports/lerobot-checkpoint-rows.json \
+  --format json
+```
+
+Use the lanes this way:
+
+- Local lane: keep timeout disabled or near `1` second and retries at `0` unless
+  fixture MP4 metadata reads are intentionally slow.
+- CI lane: run the planner after object-store fixtures and fail only on repeated
+  `timeout-policy-too-aggressive` recommendations.
+- Mid-corpus lane: apply the planner's `apply_args` between retry windows, then
+  compare the next report's p95/p99 and timeout counts.
+- Full-corpus lane: filter by `--source-id`, `--storage-tier`, or `--provider`
+  before applying a global setting so one storage backend does not overfit the
+  whole run.
+
 Recent LeRobot jobs are listable without scanning frame rows:
 
 ```bash

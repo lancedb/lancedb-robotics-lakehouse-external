@@ -30,6 +30,7 @@ from lancedb_robotics.ingest import (
     ingest_lerobot,
     list_lerobot_ingest_jobs,
     plan_lerobot_checkpoint_retention_scale,
+    recommend_lerobot_media_inspection_timeouts,
     recover_lerobot_ingest_claim,
     release_lerobot_checkpoint_hold,
     run_lerobot_checkpoint_retention_schedule,
@@ -41,6 +42,7 @@ from lancedb_robotics.schemas import (
     LEROBOT_INGEST_CHECKPOINTS_SCHEMA,
     LINEAGE_ARTIFACTS_SCHEMA,
     OBSERVATIONS_SCHEMA,
+    TRANSFORM_RUNS_SCHEMA,
 )
 
 runner = CliRunner()
@@ -528,6 +530,7 @@ def _add_lerobot_checkpoint_rows(
     hf_repo_id: str = "robotics/corpus",
     requested_revision: str | None = "main",
     resolved_revision: str | None = "a" * 40,
+    media_inspection: dict | None = None,
     error: str | None = None,
 ) -> None:
     rows = []
@@ -557,16 +560,19 @@ def _add_lerobot_checkpoint_rows(
                 "revision": resolved_revision,
                 "manifest_fingerprint": f"manifest-{job_id}",
             },
-            "media_inspection": {
-                "status_counts": {"completed": 2},
-                "videos": [
-                    {
-                        "path": "videos/chunk-000/observation.images.front/episode_000000.mp4",
-                        "inspection_status": "completed",
-                        "inspection_fingerprint": f"video-{job_id}",
-                    }
-                ],
-            },
+            "media_inspection": dict(
+                media_inspection
+                or {
+                    "status_counts": {"completed": 2},
+                    "videos": [
+                        {
+                            "path": "videos/chunk-000/observation.images.front/episode_000000.mp4",
+                            "inspection_status": "completed",
+                            "inspection_fingerprint": f"video-{job_id}",
+                        }
+                    ],
+                }
+            ),
         }
         if error:
             progress["error"] = error
@@ -1637,9 +1643,7 @@ def test_lerobot_process_media_inspection_completes_tiny_mp4s(tmp_path):
     assert all(video["inspection_worker_killed"] is False for video in media["videos"])
 
 
-def test_ingest_lerobot_process_media_inspection_timeout_kills_workers(
-    tmp_path, monkeypatch
-):
+def test_ingest_lerobot_process_media_inspection_timeout_kills_workers(tmp_path, monkeypatch):
     from conftest import require_start_method
 
     require_start_method("fork")
@@ -3989,3 +3993,201 @@ def test_cli_lerobot_ingest_jobs_list_and_get_without_observation_scan(tmp_path,
     detail = json.loads(shown.output)
     assert detail["job_id"] == jobs[0]["job_id"]
     assert detail["history"][-1]["phase"] in {"completed", "finalized"}
+
+
+def test_lerobot_media_inspection_timeout_recommendations_use_checkpoint_and_transform_telemetry(
+    tmp_path,
+):
+    lake = Lake.init(tmp_path / "lake")
+    now = datetime(2026, 1, 15, tzinfo=UTC)
+    checkpoint_media = {
+        "video_count": 3,
+        "timeout_seconds": 10.0,
+        "retry_count": 1,
+        "retry_backoff_seconds": 0.25,
+        "execution_mode": "thread",
+        "total_attempts": 5,
+        "total_retries": 2,
+        "total_timeouts": 1,
+        "status_counts": {"completed": 2, "timeout": 1},
+        "videos": [
+            {
+                "path": "videos/front/episode_000000.mp4",
+                "inspection_status": "completed",
+                "inspection_duration_ms": 4_000.0,
+                "inspection_attempts": 1,
+                "inspection_retries": 0,
+                "inspection_timeouts": 0,
+                "inspection_fingerprint": "fp-front-0",
+            },
+            {
+                "path": "videos/front/episode_000001.mp4",
+                "inspection_status": "timeout",
+                "inspection_duration_ms": 10_000.0,
+                "inspection_attempts": 3,
+                "inspection_retries": 2,
+                "inspection_timeouts": 1,
+                "inspection_fingerprint": "fp-front-1",
+            },
+        ],
+    }
+    _add_lerobot_checkpoint_rows(
+        lake,
+        job_id="job-timeout",
+        source_id="src-timeout",
+        updated_at=now,
+        phases=[("media-inspection", "running"), ("finalized", "completed")],
+        media_inspection=checkpoint_media,
+    )
+    transform_media = {
+        "video_count": 2,
+        "timeout_seconds": 20.0,
+        "retry_count": 0,
+        "execution_mode": "process",
+        "total_attempts": 2,
+        "total_retries": 0,
+        "total_timeouts": 0,
+        "status_counts": {"completed": 2},
+        "videos": [
+            {
+                "path": "videos/wrist/episode_000000.mp4",
+                "inspection_status": "completed",
+                "inspection_duration_ms": 6_000.0,
+                "inspection_fingerprint": "fp-wrist-0",
+            },
+            {
+                "path": "videos/wrist/episode_000001.mp4",
+                "inspection_status": "completed",
+                "inspection_duration_ms": 500.0,
+                "inspection_reused": True,
+                "inspection_fingerprint": "fp-wrist-1",
+            },
+        ],
+    }
+    lake.table("transform_runs").add(
+        pa.Table.from_pylist(
+            [
+                {
+                    "transform_id": "tfm-transform-media",
+                    "kind": "ingest",
+                    "source_id": "src-transform",
+                    "input_uris": ["s3://robotics-corpus/lerobot"],
+                    "output_tables": [],
+                    "params": json.dumps(
+                        {
+                            "adapter": "lerobot",
+                            "run_id": "run-transform-media",
+                            "media_inspection": transform_media,
+                        },
+                        sort_keys=True,
+                    ),
+                    "status": "completed",
+                    "started_at": now - timedelta(minutes=2),
+                    "finished_at": now,
+                    "created_by": "test",
+                    "created_at": now,
+                }
+            ],
+            schema=TRANSFORM_RUNS_SCHEMA,
+        )
+    )
+
+    report = recommend_lerobot_media_inspection_timeouts(
+        lake,
+        max_timeout_seconds=60.0,
+    )
+
+    assert report["source_counts"] == {
+        "reports": 2,
+        "checkpoints": 1,
+        "completed_transforms": 1,
+    }
+    telemetry = report["telemetry"]
+    assert telemetry["total_timeouts"] == 1
+    assert telemetry["total_retries"] == 2
+    assert telemetry["duration_ms"]["count"] == 3
+    assert telemetry["duration_reused_excluded_count"] == 1
+    assert telemetry["observed_timeout_seconds"] == [10.0, 20.0]
+    assert report["recommendation"]["timeout_seconds"] == 40
+    assert report["recommendation"]["retry_count"] == 2
+    assert report["recommendation"]["basis"]["total_timeouts"] == 1
+    assert report["recommendation"]["basis"]["timeout_video_count"] == 1
+    assert "timeout-policy-too-aggressive" in report["recommendation"]["flags"]
+    assert {
+        (
+            group["selector"]["storage_tier"],
+            group["selector"]["provider"],
+        )
+        for group in report["groups"]
+    } == {("huggingface", "huggingface"), ("object-store", "s3")}
+
+    s3_report = recommend_lerobot_media_inspection_timeouts(lake, provider="s3")
+    assert s3_report["source_counts"]["reports"] == 1
+    assert s3_report["groups"][0]["selector"]["storage_tier"] == "object-store"
+
+
+def test_cli_lerobot_media_inspection_timeout_plan_accepts_checkpoint_rows_json(tmp_path):
+    lake = Lake.init(tmp_path / "lake")
+    now = datetime(2026, 1, 15, tzinfo=UTC)
+    _add_lerobot_checkpoint_rows(
+        lake,
+        job_id="job-timeout",
+        source_id="src-timeout",
+        updated_at=now,
+        phases=[("media-inspection", "running"), ("finalized", "completed")],
+        media_inspection={
+            "video_count": 2,
+            "timeout_seconds": 10.0,
+            "retry_count": 1,
+            "total_attempts": 4,
+            "total_retries": 1,
+            "total_timeouts": 1,
+            "status_counts": {"completed": 1, "timeout": 1},
+            "videos": [
+                {
+                    "path": "videos/front/episode_000000.mp4",
+                    "inspection_status": "completed",
+                    "inspection_duration_ms": 3_000.0,
+                    "inspection_fingerprint": "fp-front-0",
+                },
+                {
+                    "path": "videos/front/episode_000001.mp4",
+                    "inspection_status": "timeout",
+                    "inspection_duration_ms": 10_000.0,
+                    "inspection_retries": 1,
+                    "inspection_timeouts": 1,
+                    "inspection_fingerprint": "fp-front-1",
+                },
+            ],
+        },
+    )
+    rows_path = tmp_path / "checkpoint-rows.json"
+    rows_path.write_text(
+        json.dumps({"checkpoint_rows": _durable_lerobot_checkpoint_rows(lake)}, default=str),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "lerobot-media-inspection-timeout-plan",
+            "--checkpoint-rows-json",
+            str(rows_path),
+            "--max-timeout-seconds",
+            "60",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["lake_uri"] is None
+    assert payload["source_counts"]["checkpoints"] == 1
+    assert payload["telemetry"]["total_timeouts"] == 1
+    assert payload["recommendation"]["timeout_seconds"] == 20
+    assert payload["recommendation"]["apply_args"][:2] == [
+        "--media-inspection-timeout-seconds",
+        "20",
+    ]

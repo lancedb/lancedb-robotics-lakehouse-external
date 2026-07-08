@@ -28,6 +28,7 @@ import importlib.metadata
 import importlib.util
 import inspect as inspect_module
 import json
+import math
 import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -218,6 +219,51 @@ def get_lerobot_ingest_job(lake: Lake, job_id: str) -> dict[str, Any]:
     latest = _hydrate_lerobot_checkpoint_row(ordered[-1])
     latest["history"] = [_hydrate_lerobot_checkpoint_row(row) for row in ordered]
     return latest
+
+
+def recommend_lerobot_media_inspection_timeouts(
+    lake: Lake | None = None,
+    *,
+    checkpoint_rows: Sequence[Mapping[str, Any]] | None = None,
+    transform_rows: Sequence[Mapping[str, Any]] | None = None,
+    job_id: str | None = None,
+    source_id: str | None = None,
+    source_uri: str | None = None,
+    storage_tier: str | None = None,
+    provider: str | None = None,
+    min_timeout_seconds: float = 1.0,
+    max_timeout_seconds: float = 600.0,
+) -> dict[str, Any]:
+    """Summarize LeRobot media-inspection timing and recommend timeout/retry settings."""
+    if min_timeout_seconds <= 0:
+        raise ValueError("min_timeout_seconds must be positive")
+    if max_timeout_seconds < min_timeout_seconds:
+        raise ValueError("max_timeout_seconds must be >= min_timeout_seconds")
+    if lake is None and checkpoint_rows is None and transform_rows is None:
+        raise ValueError("lake, checkpoint_rows, or transform_rows is required")
+    samples = _lerobot_media_inspection_samples(
+        lake,
+        checkpoint_rows=checkpoint_rows,
+        transform_rows=transform_rows,
+        job_id=job_id,
+        source_id=source_id,
+        source_uri=source_uri,
+        storage_tier=storage_tier,
+        provider=provider,
+    )
+    return _lerobot_media_inspection_timeout_report(
+        lake.uri if lake is not None else None,
+        samples,
+        filters={
+            "job_id": job_id,
+            "source_id": source_id,
+            "source_uri": source_uri,
+            "storage_tier": storage_tier,
+            "provider": provider,
+        },
+        min_timeout_seconds=float(min_timeout_seconds),
+        max_timeout_seconds=float(max_timeout_seconds),
+    )
 
 
 @dataclass(frozen=True)
@@ -4751,7 +4797,9 @@ def _lerobot_dataset_for_ingest(
     if _callable_accepts_keyword(adapter.dataset, "object_store_validation_sample_bytes"):
         kwargs["object_store_validation_sample_bytes"] = object_store_validation_sample_bytes
     if _callable_accepts_keyword(adapter.dataset, "object_store_validation_strict_max_bytes"):
-        kwargs["object_store_validation_strict_max_bytes"] = object_store_validation_strict_max_bytes
+        kwargs["object_store_validation_strict_max_bytes"] = (
+            object_store_validation_strict_max_bytes
+        )
     return adapter.dataset(source, **kwargs)
 
 
@@ -5155,6 +5203,661 @@ def _hydrate_lerobot_checkpoint_row(row: dict[str, Any]) -> dict[str, Any]:
     return hydrated
 
 
+def _lerobot_media_inspection_samples(
+    lake: Lake | None,
+    *,
+    checkpoint_rows: Sequence[Mapping[str, Any]] | None,
+    transform_rows: Sequence[Mapping[str, Any]] | None,
+    job_id: str | None,
+    source_id: str | None,
+    source_uri: str | None,
+    storage_tier: str | None,
+    provider: str | None,
+) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    if checkpoint_rows is None and lake is not None:
+        raw_checkpoint_rows = _lerobot_checkpoint_rows(lake)
+    else:
+        raw_checkpoint_rows = [dict(row) for row in checkpoint_rows or []]
+    for row in raw_checkpoint_rows:
+        sample = _lerobot_media_inspection_sample_from_checkpoint(
+            row,
+            storage_tier_override=None,
+            provider_override=None,
+        )
+        if sample is None or not _lerobot_media_sample_matches(
+            sample,
+            job_id=job_id,
+            source_id=source_id,
+            source_uri=source_uri,
+            storage_tier=storage_tier,
+            provider=provider,
+        ):
+            continue
+        key = _lerobot_media_sample_dedupe_key(sample)
+        if key in seen:
+            continue
+        seen.add(key)
+        samples.append(sample)
+
+    if transform_rows is None and lake is not None:
+        try:
+            raw_transform_rows = lake.table("transform_runs").to_arrow().to_pylist()
+        except Exception:  # noqa: BLE001 - older partial lakes may not have transform telemetry
+            raw_transform_rows = []
+    else:
+        raw_transform_rows = [dict(row) for row in transform_rows or []]
+    for row in raw_transform_rows:
+        sample = _lerobot_media_inspection_sample_from_transform(
+            row,
+            storage_tier_override=None,
+            provider_override=None,
+        )
+        if sample is None or not _lerobot_media_sample_matches(
+            sample,
+            job_id=job_id,
+            source_id=source_id,
+            source_uri=source_uri,
+            storage_tier=storage_tier,
+            provider=provider,
+        ):
+            continue
+        key = _lerobot_media_sample_dedupe_key(sample)
+        if key in seen:
+            continue
+        seen.add(key)
+        samples.append(sample)
+    return sorted(samples, key=_lerobot_media_sample_sort_key)
+
+
+def _lerobot_media_inspection_sample_from_checkpoint(
+    row: dict[str, Any],
+    *,
+    storage_tier_override: str | None,
+    provider_override: str | None,
+) -> dict[str, Any] | None:
+    progress = _lerobot_progress_from_checkpoint_row(row)
+    media = progress.get("media_inspection")
+    if not isinstance(media, dict) or not media:
+        return None
+    sample_source_uri = str(row.get("source_uri") or row.get("source_ref") or "")
+    return _lerobot_media_inspection_sample(
+        source_kind="checkpoint",
+        media_inspection=media,
+        source_uri=sample_source_uri,
+        storage_tier_override=storage_tier_override,
+        provider_override=provider_override,
+        checkpoint_id=str(row.get("checkpoint_id") or ""),
+        checkpoint_index=_optional_lerobot_int(row.get("checkpoint_index")),
+        job_id=str(row.get("job_id") or ""),
+        source_id=str(row.get("source_id") or ""),
+        run_id=str(row.get("run_id") or ""),
+        transform_id=str(row.get("transform_id") or ""),
+        status=str(row.get("status") or ""),
+        phase=str(row.get("phase") or ""),
+        updated_at=_coerce_lerobot_utc(row.get("updated_at") or row.get("created_at")),
+    )
+
+
+def _lerobot_media_inspection_sample_from_transform(
+    row: dict[str, Any],
+    *,
+    storage_tier_override: str | None,
+    provider_override: str | None,
+) -> dict[str, Any] | None:
+    if str(row.get("status") or "") != "completed":
+        return None
+    params = _lerobot_transform_params(row)
+    if params.get("adapter") != "lerobot":
+        return None
+    media = params.get("media_inspection")
+    if not isinstance(media, dict) or not media:
+        return None
+    input_uris = row.get("input_uris") or []
+    sample_source_uri = str(input_uris[0] if input_uris else "")
+    return _lerobot_media_inspection_sample(
+        source_kind="transform",
+        media_inspection=media,
+        source_uri=sample_source_uri,
+        storage_tier_override=storage_tier_override,
+        provider_override=provider_override,
+        checkpoint_id=None,
+        checkpoint_index=None,
+        job_id=None,
+        source_id=str(row.get("source_id") or ""),
+        run_id=str(params.get("run_id") or ""),
+        transform_id=str(row.get("transform_id") or ""),
+        status=str(row.get("status") or ""),
+        phase=str(row.get("kind") or ""),
+        updated_at=_coerce_lerobot_utc(row.get("finished_at") or row.get("created_at")),
+    )
+
+
+def _lerobot_transform_params(row: dict[str, Any]) -> dict[str, Any]:
+    value = row.get("params")
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _lerobot_media_inspection_sample(
+    *,
+    source_kind: str,
+    media_inspection: dict[str, Any],
+    source_uri: str,
+    storage_tier_override: str | None,
+    provider_override: str | None,
+    checkpoint_id: str | None,
+    checkpoint_index: int | None,
+    job_id: str | None,
+    source_id: str,
+    run_id: str,
+    transform_id: str,
+    status: str,
+    phase: str,
+    updated_at: datetime | None,
+) -> dict[str, Any]:
+    provider = provider_override or _lerobot_source_provider(source_uri)
+    storage_tier = storage_tier_override or _lerobot_storage_tier(source_uri, provider=provider)
+    video_count = _lerobot_media_report_video_count(media_inspection)
+    return {
+        "source_kind": source_kind,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_index": checkpoint_index,
+        "job_id": job_id,
+        "source_id": source_id,
+        "run_id": run_id,
+        "transform_id": transform_id,
+        "source_uri": source_uri,
+        "storage_tier": storage_tier,
+        "provider": provider,
+        "corpus_size_tier": _lerobot_corpus_size_tier(video_count),
+        "video_count": video_count,
+        "status": status,
+        "phase": phase,
+        "updated_at": updated_at,
+        "media_inspection": media_inspection,
+    }
+
+
+def _lerobot_media_sample_matches(
+    sample: dict[str, Any],
+    *,
+    job_id: str | None,
+    source_id: str | None,
+    source_uri: str | None,
+    storage_tier: str | None,
+    provider: str | None,
+) -> bool:
+    if job_id is not None and sample.get("job_id") != job_id:
+        return False
+    if source_id is not None and sample.get("source_id") != source_id:
+        return False
+    if source_uri is not None and sample.get("source_uri") != source_uri:
+        return False
+    if storage_tier is not None and sample.get("storage_tier") != storage_tier:
+        return False
+    if provider is not None and sample.get("provider") != provider:
+        return False
+    return True
+
+
+def _lerobot_media_sample_sort_key(sample: dict[str, Any]) -> tuple[Any, ...]:
+    updated_at = sample.get("updated_at") or datetime.min.replace(tzinfo=UTC)
+    return (
+        updated_at,
+        str(sample.get("source_kind") or ""),
+        str(sample.get("checkpoint_id") or ""),
+        str(sample.get("transform_id") or ""),
+    )
+
+
+def _lerobot_media_sample_dedupe_key(sample: dict[str, Any]) -> tuple[str, str, str]:
+    media = sample.get("media_inspection") or {}
+    payload = json.dumps(media, sort_keys=True, default=str, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return (
+        str(sample.get("source_id") or sample.get("source_uri") or ""),
+        str(sample.get("run_id") or sample.get("job_id") or ""),
+        digest,
+    )
+
+
+def _lerobot_source_provider(uri: str | None) -> str:
+    value = str(uri or "").strip().lower()
+    if value.startswith("hf://"):
+        return "huggingface"
+    if "://" in value:
+        scheme = value.split("://", maxsplit=1)[0]
+        return {
+            "s3": "s3",
+            "gs": "gcs",
+            "gcs": "gcs",
+            "az": "azure",
+            "abfs": "azure",
+            "abfss": "azure",
+            "file": "local",
+        }.get(scheme, scheme)
+    return "local"
+
+
+def _lerobot_storage_tier(uri: str | None, *, provider: str) -> str:
+    value = str(uri or "")
+    if provider == "huggingface":
+        return "huggingface"
+    if is_object_store_uri(value):
+        return "object-store"
+    return "local"
+
+
+def _lerobot_corpus_size_tier(video_count: int) -> str:
+    if video_count <= 0:
+        return "unknown"
+    if video_count <= 2:
+        return "local"
+    if video_count <= 25:
+        return "ci"
+    if video_count <= 10_000:
+        return "mid-corpus"
+    return "full-corpus"
+
+
+def _lerobot_media_report_video_count(media_inspection: dict[str, Any]) -> int:
+    video_count = _optional_lerobot_int(media_inspection.get("video_count"))
+    if video_count is not None:
+        return max(0, video_count)
+    videos = media_inspection.get("videos")
+    return len(videos) if isinstance(videos, list) else 0
+
+
+def _lerobot_media_inspection_timeout_report(
+    lake_uri: str | None,
+    samples: list[dict[str, Any]],
+    *,
+    filters: dict[str, Any],
+    min_timeout_seconds: float,
+    max_timeout_seconds: float,
+) -> dict[str, Any]:
+    telemetry = _lerobot_media_timeout_metrics(samples)
+    recommendation = _lerobot_media_timeout_recommendation(
+        telemetry,
+        min_timeout_seconds=min_timeout_seconds,
+        max_timeout_seconds=max_timeout_seconds,
+    )
+    groups = []
+    for selector, group_samples in _lerobot_media_timeout_groups(samples).items():
+        metrics = _lerobot_media_timeout_metrics(group_samples)
+        groups.append(
+            {
+                "selector": {
+                    "storage_tier": selector[0],
+                    "provider": selector[1],
+                    "corpus_size_tier": selector[2],
+                },
+                "sample_count": len(group_samples),
+                "telemetry": metrics,
+                "recommendation": _lerobot_media_timeout_recommendation(
+                    metrics,
+                    min_timeout_seconds=min_timeout_seconds,
+                    max_timeout_seconds=max_timeout_seconds,
+                ),
+            }
+        )
+    return {
+        "lake_uri": lake_uri,
+        "adapter": "lerobot",
+        "scope": "media-inspection-timeout-recommendations",
+        "filters": {key: value for key, value in filters.items() if value is not None},
+        "source_counts": {
+            "reports": len(samples),
+            "checkpoints": sum(
+                1 for sample in samples if sample.get("source_kind") == "checkpoint"
+            ),
+            "completed_transforms": sum(
+                1 for sample in samples if sample.get("source_kind") == "transform"
+            ),
+        },
+        "telemetry": telemetry,
+        "recommendation": recommendation,
+        "groups": sorted(
+            groups,
+            key=lambda item: (
+                str(item["selector"].get("storage_tier") or ""),
+                str(item["selector"].get("provider") or ""),
+                str(item["selector"].get("corpus_size_tier") or ""),
+            ),
+        ),
+        "evidence": [_lerobot_media_timeout_evidence(sample) for sample in samples],
+    }
+
+
+def _lerobot_media_timeout_groups(
+    samples: list[dict[str, Any]],
+) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for sample in samples:
+        key = (
+            str(sample.get("storage_tier") or "unknown"),
+            str(sample.get("provider") or "unknown"),
+            str(sample.get("corpus_size_tier") or "unknown"),
+        )
+        groups.setdefault(key, []).append(sample)
+    return groups
+
+
+def _lerobot_media_timeout_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    durations: list[float] = []
+    duration_keys: set[tuple[str, ...]] = set()
+    observed_timeouts: set[float] = set()
+    observed_retries: set[int] = set()
+    observed_backoffs: set[float] = set()
+    status_counts: dict[str, int] = {}
+    diagnostic_counts: dict[str, int] = {}
+    execution_modes: dict[str, int] = {}
+    totals = {
+        "reported_video_count": 0,
+        "video_sample_count": 0,
+        "total_attempts": 0,
+        "total_retries": 0,
+        "total_timeouts": 0,
+        "killed_worker_count": 0,
+        "completed_video_count": 0,
+        "failed_video_count": 0,
+        "timeout_video_count": 0,
+        "reused_video_count": 0,
+        "duration_reused_excluded_count": 0,
+    }
+    for sample in samples:
+        media = sample.get("media_inspection") or {}
+        if not isinstance(media, dict):
+            continue
+        totals["reported_video_count"] += _lerobot_media_report_video_count(media)
+        reported_attempts = _optional_lerobot_int(media.get("total_attempts"))
+        reported_retries = _optional_lerobot_int(media.get("total_retries"))
+        reported_timeouts = _optional_lerobot_int(media.get("total_timeouts"))
+        totals["killed_worker_count"] += (
+            _optional_lerobot_int(media.get("killed_worker_count")) or 0
+        )
+        timeout_seconds = _optional_lerobot_float(media.get("timeout_seconds"))
+        if timeout_seconds is not None and timeout_seconds > 0:
+            observed_timeouts.add(timeout_seconds)
+        retry_count = _optional_lerobot_int(media.get("retry_count"))
+        if retry_count is not None:
+            observed_retries.add(max(0, retry_count))
+        backoff = _optional_lerobot_float(media.get("retry_backoff_seconds"))
+        if backoff is not None and backoff >= 0:
+            observed_backoffs.add(backoff)
+        execution_mode = str(media.get("execution_mode") or "").strip()
+        if execution_mode:
+            _increment_lerobot_count(execution_modes, execution_mode)
+        has_report_status_counts = isinstance(media.get("status_counts"), dict)
+        if has_report_status_counts:
+            _merge_lerobot_counts(status_counts, media.get("status_counts"))
+        _merge_lerobot_counts(diagnostic_counts, media.get("diagnostic_counts"))
+        video_attempts = 0
+        video_retries = 0
+        video_timeouts = 0
+        video_status_counts: dict[str, int] = {}
+        for video in media.get("videos") or []:
+            if not isinstance(video, dict):
+                continue
+            totals["video_sample_count"] += 1
+            duration = _optional_lerobot_float(video.get("inspection_duration_ms"))
+            if video.get("inspection_reused"):
+                totals["reused_video_count"] += 1
+                totals["duration_reused_excluded_count"] += 1
+            elif duration is not None and duration >= 0:
+                duration_key = _lerobot_media_video_key(sample, video)
+                if duration_key not in duration_keys:
+                    duration_keys.add(duration_key)
+                    durations.append(duration)
+            status = str(video.get("inspection_status") or "").strip().lower()
+            if status:
+                _increment_lerobot_count(video_status_counts, status)
+            if status == "completed":
+                totals["completed_video_count"] += 1
+            elif status == "timeout":
+                totals["timeout_video_count"] += 1
+            elif status in {"failed", "error"}:
+                totals["failed_video_count"] += 1
+            video_retries += _optional_lerobot_int(video.get("inspection_retries")) or 0
+            video_timeouts += _optional_lerobot_int(video.get("inspection_timeouts")) or 0
+            video_attempts += _optional_lerobot_int(video.get("inspection_attempts")) or 0
+            for diagnostic in video.get("diagnostics") or []:
+                if isinstance(diagnostic, str):
+                    _increment_lerobot_count(diagnostic_counts, diagnostic)
+        if not has_report_status_counts:
+            _merge_lerobot_counts(status_counts, video_status_counts)
+        totals["total_attempts"] += (
+            reported_attempts if reported_attempts is not None else video_attempts
+        )
+        totals["total_retries"] += (
+            reported_retries if reported_retries is not None else video_retries
+        )
+        totals["total_timeouts"] += (
+            reported_timeouts if reported_timeouts is not None else video_timeouts
+        )
+    duration_stats = _lerobot_media_duration_stats(durations)
+    return {
+        "reports_count": len(samples),
+        **totals,
+        "status_counts": dict(sorted(status_counts.items())),
+        "diagnostic_counts": dict(sorted(diagnostic_counts.items())),
+        "execution_modes": dict(sorted(execution_modes.items())),
+        "duration_ms": duration_stats,
+        "observed_timeout_seconds": sorted(observed_timeouts),
+        "observed_retry_count": sorted(observed_retries),
+        "observed_retry_backoff_seconds": sorted(observed_backoffs),
+    }
+
+
+def _lerobot_media_video_key(sample: dict[str, Any], video: dict[str, Any]) -> tuple[str, ...]:
+    fingerprint = str(video.get("inspection_fingerprint") or "")
+    if fingerprint:
+        return ("fingerprint", fingerprint)
+    return (
+        "video",
+        str(sample.get("source_id") or sample.get("source_uri") or ""),
+        str(sample.get("run_id") or sample.get("job_id") or ""),
+        str(video.get("path") or video.get("uri") or ""),
+        str(video.get("episode_index") or ""),
+        str(video.get("camera_key") or ""),
+    )
+
+
+def _lerobot_media_duration_stats(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "min": None,
+            "mean": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "min": round(ordered[0], 3),
+        "mean": round(sum(ordered) / len(ordered), 3),
+        "p50": round(_lerobot_percentile(ordered, 0.50), 3),
+        "p95": round(_lerobot_percentile(ordered, 0.95), 3),
+        "p99": round(_lerobot_percentile(ordered, 0.99), 3),
+        "max": round(ordered[-1], 3),
+    }
+
+
+def _lerobot_percentile(ordered_values: list[float], percentile: float) -> float:
+    index = min(
+        len(ordered_values) - 1,
+        max(0, math.ceil(percentile * len(ordered_values)) - 1),
+    )
+    return ordered_values[index]
+
+
+def _lerobot_media_timeout_recommendation(
+    telemetry: dict[str, Any],
+    *,
+    min_timeout_seconds: float,
+    max_timeout_seconds: float,
+) -> dict[str, Any]:
+    if int(telemetry.get("reports_count") or 0) == 0:
+        return {
+            "status": "insufficient-data",
+            "reason": "no LeRobot media-inspection telemetry matched the requested filters",
+            "timeout_seconds": None,
+            "retry_count": None,
+            "retry_backoff_seconds": None,
+            "flags": [],
+            "apply_args": [],
+        }
+    durations = telemetry.get("duration_ms") or {}
+    observed_timeout_seconds = [
+        float(value) for value in telemetry.get("observed_timeout_seconds") or []
+    ]
+    current_timeout = max(observed_timeout_seconds) if observed_timeout_seconds else None
+    current_retry = max([0, *[int(value) for value in telemetry.get("observed_retry_count") or []]])
+    current_backoff = max(
+        [0.0, *[float(value) for value in telemetry.get("observed_retry_backoff_seconds") or []]]
+    )
+    p99_seconds = None
+    if durations.get("p99") is not None:
+        p99_seconds = float(durations["p99"]) / 1000.0
+    total_timeouts = int(telemetry.get("total_timeouts") or 0)
+    timeout_video_count = int(telemetry.get("timeout_video_count") or 0)
+    timeout_signal = total_timeouts > 0 or timeout_video_count > 0
+    total_failures = int(telemetry.get("failed_video_count") or 0)
+    killed_workers = int(telemetry.get("killed_worker_count") or 0)
+    flags: list[str] = []
+    reasons: list[str] = []
+    candidate_timeout: float | None = None
+    if p99_seconds is not None:
+        headroom = 2.0 if timeout_signal or killed_workers else 1.5
+        candidate_timeout = p99_seconds * headroom
+        reasons.append(f"p99 media inspection duration {round(p99_seconds, 3)}s")
+    if current_timeout is not None and (timeout_signal or killed_workers):
+        candidate_timeout = max(candidate_timeout or 0.0, current_timeout * 2.0)
+        flags.append("timeout-policy-too-aggressive")
+        reasons.append(
+            f"observed {total_timeouts} timeout attempt(s), "
+            f"{timeout_video_count} timed-out video(s), and {killed_workers} killed worker(s)"
+        )
+    if candidate_timeout is None and current_timeout is not None:
+        candidate_timeout = current_timeout
+        reasons.append("no per-video duration samples; preserving observed timeout")
+    recommended_timeout = None
+    if candidate_timeout is not None:
+        clamped = min(max_timeout_seconds, max(min_timeout_seconds, candidate_timeout))
+        if clamped != candidate_timeout:
+            flags.append("timeout-recommendation-clamped")
+        recommended_timeout = _ceil_lerobot_timeout(clamped)
+    if (
+        p99_seconds is not None
+        and current_timeout is not None
+        and not timeout_signal
+        and killed_workers == 0
+        and recommended_timeout is not None
+        and current_timeout > max(recommended_timeout * 2.0, p99_seconds * 4.0)
+    ):
+        flags.append("timeout-policy-too-loose")
+    if killed_workers:
+        flags.append("process-media-inspection-kills-observed")
+    if total_failures:
+        flags.append("media-inspection-failures-observed")
+    if timeout_signal or total_failures or killed_workers:
+        recommended_retry = min(3, max(1, current_retry + 1))
+    else:
+        recommended_retry = current_retry
+    recommended_backoff = current_backoff
+    apply_args = []
+    if recommended_timeout is not None:
+        apply_args.extend(
+            ["--media-inspection-timeout-seconds", _format_lerobot_number(recommended_timeout)]
+        )
+    apply_args.extend(["--media-inspection-retries", str(recommended_retry)])
+    if recommended_backoff > 0:
+        apply_args.extend(
+            [
+                "--media-inspection-retry-backoff-seconds",
+                _format_lerobot_number(recommended_backoff),
+            ]
+        )
+    status = "adjust" if flags else "keep"
+    return {
+        "status": status,
+        "timeout_seconds": recommended_timeout,
+        "retry_count": recommended_retry,
+        "retry_backoff_seconds": recommended_backoff,
+        "basis": {
+            "p99_seconds": round(p99_seconds, 3) if p99_seconds is not None else None,
+            "observed_timeout_seconds": observed_timeout_seconds,
+            "observed_retry_count": telemetry.get("observed_retry_count") or [],
+            "total_timeouts": total_timeouts,
+            "timeout_video_count": timeout_video_count,
+            "total_failures": total_failures,
+            "killed_worker_count": killed_workers,
+        },
+        "flags": sorted(set(flags)),
+        "reason": "; ".join(reasons) if reasons else "existing settings match observed telemetry",
+        "apply_args": apply_args,
+    }
+
+
+def _ceil_lerobot_timeout(value: float) -> float:
+    return math.ceil(value * 10.0) / 10.0
+
+
+def _format_lerobot_number(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _lerobot_media_timeout_evidence(sample: dict[str, Any]) -> dict[str, Any]:
+    media = sample.get("media_inspection") or {}
+    return {
+        "source_kind": sample.get("source_kind"),
+        "checkpoint_id": sample.get("checkpoint_id"),
+        "checkpoint_index": sample.get("checkpoint_index"),
+        "job_id": sample.get("job_id"),
+        "source_id": sample.get("source_id"),
+        "run_id": sample.get("run_id"),
+        "transform_id": sample.get("transform_id"),
+        "status": sample.get("status"),
+        "phase": sample.get("phase"),
+        "source_uri": sample.get("source_uri"),
+        "storage_tier": sample.get("storage_tier"),
+        "provider": sample.get("provider"),
+        "corpus_size_tier": sample.get("corpus_size_tier"),
+        "video_count": sample.get("video_count"),
+        "timeout_seconds": _optional_lerobot_float(media.get("timeout_seconds")),
+        "retry_count": _optional_lerobot_int(media.get("retry_count")),
+        "total_timeouts": _optional_lerobot_int(media.get("total_timeouts")) or 0,
+        "total_retries": _optional_lerobot_int(media.get("total_retries")) or 0,
+        "killed_worker_count": _optional_lerobot_int(media.get("killed_worker_count")) or 0,
+        "updated_at": sample.get("updated_at"),
+    }
+
+
+def _merge_lerobot_counts(target: dict[str, int], value: Any) -> None:
+    if not isinstance(value, dict):
+        return
+    for key, count in value.items():
+        _increment_lerobot_count(target, str(key), _optional_lerobot_int(count) or 0)
+
+
+def _increment_lerobot_count(target: dict[str, int], key: str, amount: int = 1) -> None:
+    if not key:
+        return
+    target[key] = int(target.get(key) or 0) + int(amount)
+
+
 def _normalize_lerobot_retention_statuses(
     statuses: tuple[str, ...] | list[str] | None,
 ) -> tuple[str, ...]:
@@ -5473,6 +6176,16 @@ def _optional_lerobot_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_lerobot_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 def _lerobot_claim_recovery_command(
