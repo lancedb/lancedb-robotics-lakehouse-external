@@ -32,22 +32,22 @@ backend is unchanged and remains the compatibility path.
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 import pyarrow as pa
 
 from lancedb_robotics.training import (
+    _TRAINING_TO_OBSERVATION_COLUMN,
     EPOCH_BACKEND_LANCEDB_PERMUTATION,
     EPOCH_PERMUTATION_TABLE_PREFIX,
-    ROW_ID_COLUMN,
     AlignedTrainingTickPlan,
     EpochPlan,
     TrainingError,
     TrainingRowPlan,
     _create_or_reuse_epoch_permutation_table,
     _stable_digest,
-    _TRAINING_TO_OBSERVATION_COLUMN,
 )
 
 NATIVE_PERMUTATION_PLAN_KIND = "lancedb-robotics/native-permutation-plan/v1"

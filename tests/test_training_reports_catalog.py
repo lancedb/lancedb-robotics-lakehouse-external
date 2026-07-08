@@ -12,16 +12,16 @@ backward-compatibility guarantee for ``dataset.manifest.backend``.
 import json
 
 import pytest
+
+# Reuse the native-training lake fixtures (real snapshot + enterprise marking).
+from test_native_training_dataset import _mark_enterprise_lake, _training_lake
 from typer.testing import CliRunner
 
 from lancedb_robotics.cli import app
 from lancedb_robotics.run_manifests import (
-    RunManifestError,
     TRAINING_REPORTS_TABLE,
+    RunManifestError,
 )
-
-# Reuse the native-training lake fixtures (real snapshot + enterprise marking).
-from test_native_training_dataset import _mark_enterprise_lake, _training_lake
 
 runner = CliRunner()
 

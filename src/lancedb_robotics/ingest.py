@@ -3480,6 +3480,7 @@ def ingest_lerobot(
     media_inspection_workers: int | None = None,
     media_inspection_retries: int = 0,
     media_inspection_retry_backoff_seconds: float = 0.0,
+    media_inspection_retry_policy: str = "fixed",
     media_inspection_execution_mode: str = "thread",
     keyframe_map_inline_threshold_bytes: int
     | None = DEFAULT_LEROBOT_KEYFRAME_MAP_INLINE_THRESHOLD_BYTES,
@@ -3581,6 +3582,7 @@ def ingest_lerobot(
             timeout_seconds=media_inspection_timeout_seconds,
             retry_count=media_inspection_retries,
             retry_backoff_seconds=media_inspection_retry_backoff_seconds,
+            retry_policy=media_inspection_retry_policy,
             execution_mode=media_inspection_execution_mode,
         )
         inspect_report = _lerobot_inspect_report_with_media(inspect_report, dataset)
@@ -3709,6 +3711,7 @@ def ingest_lerobot(
             timeout_seconds=media_inspection_timeout_seconds,
             retry_count=media_inspection_retries,
             retry_backoff_seconds=media_inspection_retry_backoff_seconds,
+            retry_policy=media_inspection_retry_policy,
             execution_mode=media_inspection_execution_mode,
         )
         inspect_report = _lerobot_inspect_report_with_media(inspect_report, dataset)
@@ -4812,6 +4815,7 @@ def _lerobot_inspect_media(
     timeout_seconds: float | None = None,
     retry_count: int = 0,
     retry_backoff_seconds: float = 0.0,
+    retry_policy: str = "fixed",
     execution_mode: str = "thread",
 ):
     inspect_media = getattr(adapter, "inspect_media", None)
@@ -4825,6 +4829,8 @@ def _lerobot_inspect_media(
             kwargs["media_inspection_retries"] = retry_count
         if _callable_accepts_keyword(inspect_media, "media_inspection_retry_backoff_seconds"):
             kwargs["media_inspection_retry_backoff_seconds"] = retry_backoff_seconds
+        if _callable_accepts_keyword(inspect_media, "media_inspection_retry_policy"):
+            kwargs["media_inspection_retry_policy"] = retry_policy
         if _callable_accepts_keyword(inspect_media, "media_inspection_execution_mode"):
             kwargs["media_inspection_execution_mode"] = execution_mode
         return inspect_media(dataset, **kwargs)
@@ -4838,6 +4844,7 @@ def _lerobot_inspect_media(
         media_inspection_timeout_seconds=timeout_seconds,
         media_inspection_retries=retry_count,
         media_inspection_retry_backoff_seconds=retry_backoff_seconds,
+        media_inspection_retry_policy=retry_policy,
         media_inspection_execution_mode=execution_mode,
     )
 
@@ -5019,6 +5026,9 @@ def _lerobot_video_file_summaries(
         "inspection_retries",
         "inspection_timeouts",
         "inspection_error_class",
+        "inspection_retry_class",
+        "inspection_retryable",
+        "inspection_retry_policy",
         "inspection_attempt_errors",
         "inspection_reused",
         "inspection_reused_from",

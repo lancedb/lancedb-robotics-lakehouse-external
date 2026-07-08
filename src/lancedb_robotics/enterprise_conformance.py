@@ -39,13 +39,14 @@ import shutil
 import socket
 import subprocess
 import time
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any
 
-from .connections import LakeCapabilities, LakeConnectionSpec
 from . import training as _training
+from .connections import LakeCapabilities, LakeConnectionSpec
 from .training import (
     EnterpriseTrainingError,
     TrainingError,
@@ -1146,7 +1147,7 @@ class LocalEnterpriseEndpoint:
     def http_endpoint(self) -> str:
         return f"http://{self.host}:{self.port}"
 
-    def __enter__(self) -> "LocalEnterpriseEndpoint":
+    def __enter__(self) -> LocalEnterpriseEndpoint:
         cli = self.cli_path or _enterprise_cli_path()
         if cli is None:
             raise ConformanceError("LanceDB Enterprise CLI binary not found")

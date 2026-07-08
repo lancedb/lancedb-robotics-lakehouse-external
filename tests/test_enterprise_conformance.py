@@ -15,17 +15,15 @@ from __future__ import annotations
 
 import pytest
 
+# Reuse the local training-lake builder + enterprise faker from the sibling suite.
+from test_native_training_dataset import _mark_enterprise_lake, _training_lake
+
 from lancedb_robotics import enterprise_conformance as ec
 from lancedb_robotics.training import (
-    MissingEnterpriseAuthError,
     NamespaceCredentialExpiredError,
     StaleTableVersionError,
     UnsupportedRemoteOperationError,
-    WorkerResumeMismatchError,
 )
-
-# Reuse the local training-lake builder + enterprise faker from the sibling suite.
-from test_native_training_dataset import _mark_enterprise_lake, _training_lake
 
 
 @pytest.fixture

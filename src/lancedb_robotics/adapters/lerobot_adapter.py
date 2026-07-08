@@ -8,6 +8,7 @@ ids through the optional LeRobot/Hugging Face stack when installed.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -15,6 +16,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import random
 import re
 import time
 from collections.abc import Iterator, Mapping
@@ -59,6 +61,8 @@ _SUPPORTED_CODEBASE_VERSIONS = ("v2.0", "v2.1", "v3.0")
 _INSTALL_HINT = "lancedb-robotics[lerobot]"
 _DEFAULT_MEDIA_INSPECTION_WORKERS = 4
 _DEFAULT_MEDIA_INSPECTION_RETRY_BACKOFF_SECONDS = 0.0
+_DEFAULT_MEDIA_INSPECTION_RETRY_POLICY = "fixed"
+_MEDIA_INSPECTION_RETRY_POLICIES = ("fixed", "exponential-jitter")
 _DEFAULT_MEDIA_INSPECTION_EXECUTION_MODE = "thread"
 _MEDIA_INSPECTION_EXECUTION_MODES = ("thread", "process")
 _MEDIA_INSPECTION_START_METHOD_ENV = "LANCEDB_ROBOTICS_LEROBOT_MEDIA_INSPECTION_START_METHOD"
@@ -163,6 +167,7 @@ class LeRobotAdapter:
         media_inspection_timeout_seconds: float | None = None,
         media_inspection_retries: int = 0,
         media_inspection_retry_backoff_seconds: float = _DEFAULT_MEDIA_INSPECTION_RETRY_BACKOFF_SECONDS,
+        media_inspection_retry_policy: str = _DEFAULT_MEDIA_INSPECTION_RETRY_POLICY,
         media_inspection_execution_mode: str = _DEFAULT_MEDIA_INSPECTION_EXECUTION_MODE,
         storage_options: dict[str, Any] | None = None,
         auth_ref: str | None = None,
@@ -183,6 +188,7 @@ class LeRobotAdapter:
             media_inspection_timeout_seconds=media_inspection_timeout_seconds,
             media_inspection_retries=media_inspection_retries,
             media_inspection_retry_backoff_seconds=media_inspection_retry_backoff_seconds,
+            media_inspection_retry_policy=media_inspection_retry_policy,
             media_inspection_execution_mode=media_inspection_execution_mode,
             storage_options=storage_options,
             auth_ref=auth_ref,
@@ -308,6 +314,7 @@ class LeRobotAdapter:
         media_inspection_timeout_seconds: float | None = None,
         media_inspection_retries: int = 0,
         media_inspection_retry_backoff_seconds: float = _DEFAULT_MEDIA_INSPECTION_RETRY_BACKOFF_SECONDS,
+        media_inspection_retry_policy: str = _DEFAULT_MEDIA_INSPECTION_RETRY_POLICY,
         media_inspection_execution_mode: str = _DEFAULT_MEDIA_INSPECTION_EXECUTION_MODE,
         storage_options: dict[str, Any] | None = None,
         auth_ref: str | None = None,
@@ -334,7 +341,9 @@ class LeRobotAdapter:
         camera_keys = tuple(_camera_keys(feature_schema))
         tasks = tuple(_read_tasks(resolved.root))
         raw_frames = _read_frame_rows(resolved.root) if include_frames else []
-        frames = tuple(_normalize_frames(raw_frames, info=info, tasks=tasks, camera_keys=camera_keys))
+        frames = tuple(
+            _normalize_frames(raw_frames, info=info, tasks=tasks, camera_keys=camera_keys)
+        )
         episodes = tuple(_read_or_synthesize_episodes(resolved.root, frames, tasks))
         video_files, media_inspection = _video_files(
             resolved.root,
@@ -347,6 +356,7 @@ class LeRobotAdapter:
             timeout_seconds=media_inspection_timeout_seconds,
             retry_count=media_inspection_retries,
             retry_backoff_seconds=media_inspection_retry_backoff_seconds,
+            retry_policy=media_inspection_retry_policy,
             execution_mode=media_inspection_execution_mode,
         )
         return LeRobotDataset(
@@ -359,7 +369,9 @@ class LeRobotAdapter:
             camera_keys=camera_keys,
             video_files=video_files,
             media_inspection=media_inspection,
-            data_files=tuple(_relative_path(resolved.root, path) for path in _data_files(resolved.root)),
+            data_files=tuple(
+                _relative_path(resolved.root, path) for path in _data_files(resolved.root)
+            ),
             native_loader=self.availability(),
         )
 
@@ -372,6 +384,7 @@ class LeRobotAdapter:
         media_inspection_timeout_seconds: float | None = None,
         media_inspection_retries: int = 0,
         media_inspection_retry_backoff_seconds: float = _DEFAULT_MEDIA_INSPECTION_RETRY_BACKOFF_SECONDS,
+        media_inspection_retry_policy: str = _DEFAULT_MEDIA_INSPECTION_RETRY_POLICY,
         media_inspection_execution_mode: str = _DEFAULT_MEDIA_INSPECTION_EXECUTION_MODE,
     ) -> LeRobotDataset:
         """Inspect LeRobot MP4 metadata with bounded workers and optional cache reuse."""
@@ -384,6 +397,7 @@ class LeRobotAdapter:
             timeout_seconds=media_inspection_timeout_seconds,
             retry_count=media_inspection_retries,
             retry_backoff_seconds=media_inspection_retry_backoff_seconds,
+            retry_policy=media_inspection_retry_policy,
             execution_mode=media_inspection_execution_mode,
         )
         return replace(dataset, video_files=inspected, media_inspection=report)
@@ -453,9 +467,7 @@ class LeRobotAdapter:
             source_manifest_cache=manifest_cache,
         )
         if not _is_file(root, "meta/info.json"):
-            raise AdapterError(
-                f"not a LeRobot dataset: {uri} is missing meta/info.json"
-            )
+            raise AdapterError(f"not a LeRobot dataset: {uri} is missing meta/info.json")
         if (
             root.is_remote
             and root.manifest_cache is None
@@ -585,7 +597,9 @@ def _download_hf_dataset(repo_id: str, *, revision: str | None = None) -> Path:
             snapshot_download(repo_id=repo_id, repo_type="dataset", revision=revision)
         ).resolve()
     except Exception as exc:  # noqa: BLE001 - external client errors need a stable adapter message.
-        raise AdapterError(f"cannot download LeRobot dataset {repo_id!r} from HF Hub: {exc}") from exc
+        raise AdapterError(
+            f"cannot download LeRobot dataset {repo_id!r} from HF Hub: {exc}"
+        ) from exc
 
 
 def _snapshot_revision(root: _LeRobotRoot) -> str | None:
@@ -650,7 +664,10 @@ def _read_or_synthesize_episodes(
         rows.extend(_read_jsonl(root, jsonl))
     if rows:
         return [_normalize_episode_row(row, frames, tasks) for row in rows]
-    return [_synthesized_episode(index, rows, tasks) for index, rows in _frames_by_episode(frames).items()]
+    return [
+        _synthesized_episode(index, rows, tasks)
+        for index, rows in _frames_by_episode(frames).items()
+    ]
 
 
 def _normalize_episode_row(
@@ -746,10 +763,14 @@ def _normalize_frames(
         episode_index = int(row.get("episode_index") or _episode_index_from_path(row) or 0)
         fallback_frame = per_episode_frame.get(episode_index, 0)
         per_episode_frame[episode_index] = fallback_frame + 1
-        frame_index = int(row.get("frame_index") if row.get("frame_index") is not None else fallback_frame)
+        frame_index = int(
+            row.get("frame_index") if row.get("frame_index") is not None else fallback_frame
+        )
         task_index = _optional_int(row.get("task_index"))
         task = str(row.get("task") or task_by_index.get(task_index or 0) or "unknown task")
-        timestamp_ns = _timestamp_ns(row, episode_index=episode_index, frame_index=frame_index, fps=fps)
+        timestamp_ns = _timestamp_ns(
+            row, episode_index=episode_index, frame_index=frame_index, fps=fps
+        )
         images = {
             key: _jsonable(_feature_value(row, f"observation.images.{key}"))
             for key in camera_keys
@@ -849,7 +870,9 @@ def _scan_frame_stats(
         for frame in batch.rows:
             frame_count += 1
             timestamp_ns = int(frame["_timestamp_ns"])
-            start_time_ns = timestamp_ns if start_time_ns is None else min(start_time_ns, timestamp_ns)
+            start_time_ns = (
+                timestamp_ns if start_time_ns is None else min(start_time_ns, timestamp_ns)
+            )
             end_time_ns = timestamp_ns if end_time_ns is None else max(end_time_ns, timestamp_ns)
             episode_index = int(frame["_episode_index"])
             episode = per_episode.setdefault(
@@ -928,12 +951,12 @@ def _video_files(
     timeout_seconds: float | None = None,
     retry_count: int = 0,
     retry_backoff_seconds: float = _DEFAULT_MEDIA_INSPECTION_RETRY_BACKOFF_SECONDS,
+    retry_policy: str = _DEFAULT_MEDIA_INSPECTION_RETRY_POLICY,
     execution_mode: str = _DEFAULT_MEDIA_INSPECTION_EXECUTION_MODE,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
     by_key_episode: dict[tuple[str, int], str | Path] = {}
     expected_frames = {
-        int(episode["episode_index"]): _optional_int(episode.get("length"))
-        for episode in episodes
+        int(episode["episode_index"]): _optional_int(episode.get("length")) for episode in episodes
     }
     template = info.get("video_path")
     chunks_size = int(info.get("chunks_size") or 1000)
@@ -987,6 +1010,7 @@ def _video_files(
             timeout_seconds=timeout_seconds,
             retry_count=retry_count,
             retry_backoff_seconds=retry_backoff_seconds,
+            retry_policy=retry_policy,
             execution_mode=execution_mode,
         )
     return _inspect_video_rows(
@@ -997,6 +1021,7 @@ def _video_files(
         timeout_seconds=timeout_seconds,
         retry_count=retry_count,
         retry_backoff_seconds=retry_backoff_seconds,
+        retry_policy=retry_policy,
         execution_mode=execution_mode,
     )
 
@@ -1063,6 +1088,9 @@ def _video_file_row(
         "inspection_retries": 0,
         "inspection_timeouts": 0,
         "inspection_error_class": None,
+        "inspection_retry_class": "missing-object" if diagnostics else None,
+        "inspection_retryable": False if diagnostics else None,
+        "inspection_retry_policy": None,
         "inspection_attempt_errors": [],
         "inspection_reused": False,
         "inspection_reused_from": None,
@@ -1101,11 +1129,13 @@ def _inspect_video_rows(
     timeout_seconds: float | None = None,
     retry_count: int = 0,
     retry_backoff_seconds: float = _DEFAULT_MEDIA_INSPECTION_RETRY_BACKOFF_SECONDS,
+    retry_policy: str = _DEFAULT_MEDIA_INSPECTION_RETRY_POLICY,
     execution_mode: str = _DEFAULT_MEDIA_INSPECTION_EXECUTION_MODE,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
     timeout_seconds = _normalize_timeout_seconds(timeout_seconds)
     retry_count = max(0, int(retry_count))
     retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
+    retry_policy = _normalize_media_inspection_retry_policy(retry_policy)
     execution_mode = _normalize_media_inspection_execution_mode(execution_mode)
     if not rows:
         return (), _media_inspection_report(
@@ -1114,6 +1144,7 @@ def _inspect_video_rows(
             timeout_seconds=timeout_seconds,
             retry_count=retry_count,
             retry_backoff_seconds=retry_backoff_seconds,
+            retry_policy=retry_policy,
             execution_mode=execution_mode,
         )
     cache = _media_cache_by_fingerprint(media_inspection_cache)
@@ -1130,6 +1161,7 @@ def _inspect_video_rows(
             timeout_seconds=timeout_seconds,
             retry_count=retry_count,
             retry_backoff_seconds=retry_backoff_seconds,
+            retry_policy=retry_policy,
         )
     elif timeout_seconds is None:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -1141,6 +1173,7 @@ def _inspect_video_rows(
                     cache,
                     retry_count=retry_count,
                     retry_backoff_seconds=retry_backoff_seconds,
+                    retry_policy=retry_policy,
                 ): index
                 for index, row in enumerate(rows)
             }
@@ -1156,6 +1189,7 @@ def _inspect_video_rows(
             timeout_seconds=timeout_seconds,
             retry_count=retry_count,
             retry_backoff_seconds=retry_backoff_seconds,
+            retry_policy=retry_policy,
         )
     completed = tuple(row for row in inspected if row is not None)
     return completed, _media_inspection_report(
@@ -1164,6 +1198,7 @@ def _inspect_video_rows(
         timeout_seconds=timeout_seconds,
         retry_count=retry_count,
         retry_backoff_seconds=retry_backoff_seconds,
+        retry_policy=retry_policy,
         execution_mode=execution_mode,
     )
 
@@ -1178,6 +1213,7 @@ def _inspect_video_rows_with_timeout(
     timeout_seconds: float,
     retry_count: int,
     retry_backoff_seconds: float,
+    retry_policy: str,
 ) -> None:
     pending = list(enumerate(rows))
     futures: dict[Any, tuple[int, dict[str, Any], float, float]] = {}
@@ -1194,6 +1230,7 @@ def _inspect_video_rows_with_timeout(
                 cache,
                 retry_count=retry_count,
                 retry_backoff_seconds=retry_backoff_seconds,
+                retry_policy=retry_policy,
             )
             futures[future] = (index, row, started, started + timeout_seconds)
 
@@ -1240,6 +1277,7 @@ def _inspect_video_rows_with_process_timeout(
     timeout_seconds: float | None,
     retry_count: int,
     retry_backoff_seconds: float,
+    retry_policy: str,
 ) -> None:
     context = _media_inspection_process_context()
     root_payload = _media_inspection_root_payload(root)
@@ -1267,6 +1305,7 @@ def _inspect_video_rows_with_process_timeout(
                     cache,
                     retry_count,
                     retry_backoff_seconds,
+                    retry_policy,
                 ),
             )
             process.daemon = True
@@ -1339,6 +1378,7 @@ def _inspect_video_row_process_target(
     cache: Mapping[str, Mapping[str, Any]],
     retry_count: int,
     retry_backoff_seconds: float,
+    retry_policy: str,
 ) -> None:
     try:
         root = _media_inspection_root_from_payload(root_payload)
@@ -1348,6 +1388,7 @@ def _inspect_video_row_process_target(
             {str(key): dict(value) for key, value in cache.items()},
             retry_count=retry_count,
             retry_backoff_seconds=retry_backoff_seconds,
+            retry_policy=retry_policy,
         )
         inspected["inspection_execution"] = "process"
         inspected.setdefault("inspection_worker_killed", False)
@@ -1466,11 +1507,18 @@ def _process_error_video_row(
         "inspection_retries": 0,
         "inspection_timeouts": 0,
         "inspection_error_class": error_class,
+        "inspection_retry_class": "process-error",
+        "inspection_retryable": False,
+        "inspection_retry_policy": None,
         "inspection_attempt_errors": [
             {
                 "attempt": 1,
                 "error_class": error_class,
                 "error": error,
+                "retry_class": "process-error",
+                "retryable": False,
+                "retry_policy": None,
+                "retry_delay_seconds": 0.0,
                 "duration_ms": duration_ms,
             }
         ],
@@ -1516,6 +1564,9 @@ def _cached_or_terminal_video_row(
         reused["inspection_retries"] = 0
         reused["inspection_timeouts"] = 0
         reused["inspection_error_class"] = None
+        reused["inspection_retry_class"] = None
+        reused["inspection_retryable"] = None
+        reused["inspection_retry_policy"] = None
         reused["inspection_attempt_errors"] = []
         reused["inspection_error"] = None
         reused["inspection_execution"] = execution_mode
@@ -1530,6 +1581,9 @@ def _cached_or_terminal_video_row(
         completed.setdefault("inspection_retries", 0)
         completed.setdefault("inspection_timeouts", 0)
         completed.setdefault("inspection_error_class", None)
+        completed.setdefault("inspection_retry_class", None)
+        completed.setdefault("inspection_retryable", None)
+        completed.setdefault("inspection_retry_policy", None)
         completed.setdefault("inspection_attempt_errors", [])
         completed.setdefault("inspection_execution", execution_mode)
         completed.setdefault("inspection_worker_killed", False)
@@ -1538,6 +1592,9 @@ def _cached_or_terminal_video_row(
         missing = dict(row)
         missing.setdefault("inspection_execution", None)
         missing.setdefault("inspection_worker_killed", False)
+        missing.setdefault("inspection_retry_class", "missing-object")
+        missing.setdefault("inspection_retryable", False)
+        missing.setdefault("inspection_retry_policy", None)
         return missing
     return None
 
@@ -1549,7 +1606,9 @@ def _inspect_video_row(
     *,
     retry_count: int = 0,
     retry_backoff_seconds: float = _DEFAULT_MEDIA_INSPECTION_RETRY_BACKOFF_SECONDS,
+    retry_policy: str = _DEFAULT_MEDIA_INSPECTION_RETRY_POLICY,
 ) -> dict[str, Any]:
+    retry_policy = _normalize_media_inspection_retry_policy(retry_policy)
     path = _join(root, str(row["path"]))
     cached_or_terminal = _cached_or_terminal_video_row(row, cache, execution_mode="thread")
     if cached_or_terminal is not None:
@@ -1574,6 +1633,8 @@ def _inspect_video_row(
     attempts = 0
     attempt_errors: list[dict[str, Any]] = []
     error_class: str | None = None
+    retry_class: str | None = None
+    retryable: bool | None = None
     metadata = None
     max_attempts = max(1, 1 + max(0, int(retry_count)))
     for attempt in range(1, max_attempts + 1):
@@ -1585,25 +1646,43 @@ def _inspect_video_row(
                 storage_options=dict(root.storage_options or {}),
                 auth_ref=root.auth_ref,
             )
-        except (OSError, Mp4MetadataError) as exc:
+        except (OSError, Mp4MetadataError, StorageConfigError) as exc:
             error = str(exc)
             error_class = exc.__class__.__name__
+            classification = _classify_media_inspection_exception(exc)
+            retry_class = str(classification["retry_class"])
+            retryable = bool(classification["retryable"])
+            will_retry = retryable and attempt < max_attempts
+            retry_delay_seconds = (
+                _media_inspection_retry_delay(
+                    attempt=attempt,
+                    retry_backoff_seconds=retry_backoff_seconds,
+                    retry_policy=retry_policy,
+                    retry_class=retry_class,
+                )
+                if will_retry
+                else 0.0
+            )
             attempt_errors.append(
                 {
                     "attempt": attempt,
                     "error_class": error_class,
                     "error": str(exc),
+                    "retry_class": retry_class,
+                    "retryable": retryable,
+                    "retry_policy": retry_policy,
+                    "retry_delay_seconds": retry_delay_seconds,
                     "duration_ms": (time.perf_counter() - attempt_started) * 1000.0,
                 }
             )
-            if attempt < max_attempts:
-                if retry_backoff_seconds > 0:
-                    time.sleep(retry_backoff_seconds)
+            if will_retry:
+                if retry_delay_seconds > 0:
+                    time.sleep(retry_delay_seconds)
                 continue
             status = "failed"
             diagnostics.append(
                 _video_diagnostic(
-                    "corrupt-video",
+                    str(classification["diagnostic_code"]),
                     "error",
                     camera_key=str(row["camera_key"]),
                     episode_index=int(row["episode_index"]),
@@ -1613,6 +1692,9 @@ def _inspect_video_row(
                         f"after {attempt} attempt(s): {exc}"
                     ),
                     error_class=error_class,
+                    retry_class=retry_class,
+                    retryable=retryable,
+                    retry_policy=retry_policy,
                     attempts=attempt,
                 )
             )
@@ -1643,6 +1725,9 @@ def _inspect_video_row(
                     path=str(row["path"]),
                     message=f"MP4 codec {codec!r} is not a known accelerated training codec",
                     codec=codec,
+                    retry_class="unsupported-codec",
+                    retryable=False,
+                    retry_policy=retry_policy,
                 )
             )
 
@@ -1687,6 +1772,9 @@ def _inspect_video_row(
         "inspection_retries": max(0, attempts - 1),
         "inspection_timeouts": 0,
         "inspection_error_class": error_class,
+        "inspection_retry_class": retry_class,
+        "inspection_retryable": retryable,
+        "inspection_retry_policy": retry_policy,
         "inspection_attempt_errors": attempt_errors,
         "inspection_reused": False,
         "inspection_reused_from": None,
@@ -1732,11 +1820,18 @@ def _timeout_video_row(
         "inspection_retries": 0,
         "inspection_timeouts": 1,
         "inspection_error_class": "TimeoutError",
+        "inspection_retry_class": "scheduler-timeout",
+        "inspection_retryable": False,
+        "inspection_retry_policy": None,
         "inspection_attempt_errors": [
             {
                 "attempt": 1,
                 "error_class": "TimeoutError",
                 "error": message,
+                "retry_class": "scheduler-timeout",
+                "retryable": False,
+                "retry_policy": None,
+                "retry_delay_seconds": 0.0,
                 "duration_ms": duration_ms,
             }
         ],
@@ -1776,8 +1871,176 @@ def _normalize_media_inspection_execution_mode(value: str | None) -> str:
     mode = (value or _DEFAULT_MEDIA_INSPECTION_EXECUTION_MODE).strip().lower()
     if mode not in _MEDIA_INSPECTION_EXECUTION_MODES:
         expected = ", ".join(_MEDIA_INSPECTION_EXECUTION_MODES)
-        raise ValueError(f"unknown LeRobot media inspection execution mode {value!r}; expected {expected}")
+        raise ValueError(
+            f"unknown LeRobot media inspection execution mode {value!r}; expected {expected}"
+        )
     return mode
+
+
+def _normalize_media_inspection_retry_policy(value: str | None) -> str:
+    policy = (value or _DEFAULT_MEDIA_INSPECTION_RETRY_POLICY).strip().lower()
+    policy = policy.replace("_", "-")
+    if policy == "exponential":
+        policy = "exponential-jitter"
+    if policy not in _MEDIA_INSPECTION_RETRY_POLICIES:
+        expected = ", ".join(_MEDIA_INSPECTION_RETRY_POLICIES)
+        raise ValueError(
+            f"unknown LeRobot media inspection retry policy {value!r}; expected {expected}"
+        )
+    return policy
+
+
+def _classify_media_inspection_exception(exc: BaseException) -> dict[str, Any]:
+    chain = _exception_chain(exc)
+    text = " ".join(str(item) for item in chain).lower()
+    names = " ".join(item.__class__.__name__.lower() for item in chain)
+    if any(isinstance(item, PermissionError) for item in chain) or _contains_any(
+        text,
+        (
+            "access denied",
+            "auth",
+            "credential",
+            "credentials",
+            "forbidden",
+            "permission",
+            "signature",
+            "unauthorized",
+        ),
+    ):
+        return _retry_class("auth-config", retryable=False, diagnostic_code="auth-config")
+    if any(isinstance(item, FileNotFoundError) for item in chain) or _contains_any(
+        text,
+        (
+            "404",
+            "not found",
+            "no such file",
+            "no such key",
+            "nosuchkey",
+            "notfound",
+            "missing object",
+        ),
+    ):
+        return _retry_class("missing-object", retryable=False, diagnostic_code="missing-object")
+    if _contains_any(
+        text + " " + names,
+        (
+            "429",
+            "503 slow",
+            "slowdown",
+            "throttle",
+            "throttling",
+            "too many requests",
+            "rate limit",
+            "ratelimit",
+            "service unavailable",
+        ),
+    ):
+        return _retry_class("throttle-backoff", retryable=True, diagnostic_code="throttle-backoff")
+    if any(isinstance(item, TimeoutError) for item in chain) or _contains_any(
+        text,
+        (
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "connection timed out",
+            "temporarily unavailable",
+            "temporary failure",
+            "timeout",
+            "timed out",
+            "transient",
+            "ranged read",
+            "read failed",
+            "read exhausted",
+        ),
+    ):
+        return _retry_class(
+            "retryable-transient",
+            retryable=True,
+            diagnostic_code="retryable-transient",
+        )
+    if any(
+        isinstance(item, OSError) and getattr(item, "errno", None) in _TRANSIENT_ERRNOS
+        for item in chain
+    ):
+        return _retry_class(
+            "retryable-transient",
+            retryable=True,
+            diagnostic_code="retryable-transient",
+        )
+    if _contains_any(
+        text,
+        (
+            "empty mp4",
+            "invalid",
+            "malformed",
+            "missing ftyp",
+            "missing moov",
+            "no samples",
+            "truncated",
+            "video track has no samples",
+        ),
+    ):
+        return _retry_class("corrupt-media", retryable=False, diagnostic_code="corrupt-video")
+    if any(isinstance(item, Mp4MetadataError) for item in chain):
+        return _retry_class("corrupt-media", retryable=False, diagnostic_code="corrupt-video")
+    return _retry_class(
+        "retryable-transient",
+        retryable=True,
+        diagnostic_code="retryable-transient",
+    )
+
+
+_TRANSIENT_ERRNOS = {
+    value
+    for value in (
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ECONNREFUSED", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "EHOSTUNREACH", None),
+        getattr(errno, "ENETDOWN", None),
+        getattr(errno, "ENETRESET", None),
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "ETIMEDOUT", None),
+    )
+    if value is not None
+}
+
+
+def _retry_class(name: str, *, retryable: bool, diagnostic_code: str) -> dict[str, Any]:
+    return {"retry_class": name, "retryable": bool(retryable), "diagnostic_code": diagnostic_code}
+
+
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _contains_any(value: str, needles: tuple[str, ...]) -> bool:
+    return any(needle in value for needle in needles)
+
+
+def _media_inspection_retry_delay(
+    *,
+    attempt: int,
+    retry_backoff_seconds: float,
+    retry_policy: str,
+    retry_class: str,
+) -> float:
+    base = max(0.0, float(retry_backoff_seconds))
+    if base <= 0:
+        return 0.0
+    if retry_policy == "fixed":
+        return base
+    multiplier = 2 ** max(0, int(attempt) - 1)
+    throttle_multiplier = 2.0 if retry_class == "throttle-backoff" else 1.0
+    return (base * multiplier * throttle_multiplier) + random.uniform(0.0, base)
 
 
 def _media_inspection_report(
@@ -1788,6 +2051,7 @@ def _media_inspection_report(
     timeout_seconds: float | None = None,
     retry_count: int = 0,
     retry_backoff_seconds: float = _DEFAULT_MEDIA_INSPECTION_RETRY_BACKOFF_SECONDS,
+    retry_policy: str = _DEFAULT_MEDIA_INSPECTION_RETRY_POLICY,
     execution_mode: str = _DEFAULT_MEDIA_INSPECTION_EXECUTION_MODE,
 ) -> dict[str, Any]:
     status_counts: dict[str, int] = {}
@@ -1800,6 +2064,7 @@ def _media_inspection_report(
     total_retries = 0
     total_timeouts = 0
     killed_worker_count = 0
+    retry_class_counts: dict[str, int] = {}
     videos: list[dict[str, Any]] = []
     for row in rows:
         status = str(row.get("inspection_status") or "pending")
@@ -1815,6 +2080,12 @@ def _media_inspection_report(
         total_timeouts += int(row.get("inspection_timeouts") or 0)
         if row.get("inspection_worker_killed"):
             killed_worker_count += 1
+        for attempt_error in row.get("inspection_attempt_errors") or []:
+            if not isinstance(attempt_error, dict):
+                continue
+            attempt_class = str(attempt_error.get("retry_class") or "")
+            if attempt_class:
+                retry_class_counts[attempt_class] = retry_class_counts.get(attempt_class, 0) + 1
         for diagnostic in row.get("diagnostics") or []:
             code = str(diagnostic.get("code") or "unknown")
             diagnostic_counts[code] = diagnostic_counts.get(code, 0) + 1
@@ -1827,6 +2098,7 @@ def _media_inspection_report(
         "timeout_seconds": timeout_seconds,
         "retry_count": int(max(0, retry_count)),
         "retry_backoff_seconds": float(max(0.0, retry_backoff_seconds)),
+        "retry_policy": _normalize_media_inspection_retry_policy(retry_policy),
         "video_count": len(videos),
         "reused_count": reused_count,
         "total_bytes_read": total_bytes_read,
@@ -1835,6 +2107,7 @@ def _media_inspection_report(
         "total_retries": total_retries,
         "total_timeouts": total_timeouts,
         "killed_worker_count": killed_worker_count,
+        "retry_class_counts": dict(sorted(retry_class_counts.items())),
         "status_counts": dict(sorted(status_counts.items())),
         "codec_counts": dict(sorted(codec_counts.items())),
         "diagnostic_counts": dict(sorted(diagnostic_counts.items())),
@@ -1853,6 +2126,9 @@ def _media_inspection_summary(row: dict[str, Any]) -> dict[str, Any]:
         "inspection_retries",
         "inspection_timeouts",
         "inspection_error_class",
+        "inspection_retry_class",
+        "inspection_retryable",
+        "inspection_retry_policy",
         "inspection_attempt_errors",
         "inspection_reused",
         "inspection_reused_from",
@@ -1889,16 +2165,19 @@ def _bounded_media_workers(value: int | None) -> int:
 
 
 def _video_inspection_id(row: dict[str, Any]) -> str:
-    return "media-inspection-" + hashlib.sha256(
-        json.dumps(
-            {
-                "fingerprint": row.get("inspection_fingerprint"),
-                "path": row.get("path"),
-                "status": row.get("inspection_status"),
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()[:16]
+    return (
+        "media-inspection-"
+        + hashlib.sha256(
+            json.dumps(
+                {
+                    "fingerprint": row.get("inspection_fingerprint"),
+                    "path": row.get("path"),
+                    "status": row.get("inspection_status"),
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
+    )
 
 
 def _video_inspection_fingerprint(

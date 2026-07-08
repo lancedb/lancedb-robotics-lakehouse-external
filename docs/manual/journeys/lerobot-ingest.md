@@ -336,6 +336,35 @@ Recommended media-inspection timeout defaults:
   `--source-storage-option` when the fsspec backend supports them; the media
   timeout is the outer per-video wall-clock guard.
 
+Media-inspection retries are provider-aware. Each failed attempt is classified
+as `retryable-transient`, `throttle-backoff`, `auth-config`, `missing-object`,
+or `corrupt-media`; unsupported codecs remain warnings after successful MP4
+metadata reads. Only transient and throttling failures spend retry budget.
+Permanent auth/config, missing-object, and corrupt-media failures stop after the
+first attempt so a bad credential, deleted object, or broken MP4 does not hide
+behind repeated sleeps. Attempt telemetry records `retry_class`, `retryable`,
+`retry_policy`, and `retry_delay_seconds`.
+
+The default policy remains fixed backoff for compatibility:
+
+```bash
+lancedb-robotics ingest lerobot s3://robotics-raw/policy_corpus \
+  --lake ./robot.lance \
+  --media-inspection-retries 2 \
+  --media-inspection-retry-backoff-seconds 1 \
+  --media-inspection-retry-policy fixed
+```
+
+Use exponential jitter for throttled object-store lanes:
+
+```bash
+lancedb-robotics ingest lerobot s3://robotics-raw/policy_corpus \
+  --lake ./robot.lance \
+  --media-inspection-retries 3 \
+  --media-inspection-retry-backoff-seconds 0.5 \
+  --media-inspection-retry-policy exponential-jitter
+```
+
 After a backfill has written durable checkpoints, ask the lake to recommend the
 next timeout and retry settings instead of widening by feel:
 

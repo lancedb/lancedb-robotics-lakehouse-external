@@ -47,6 +47,11 @@ _MEDIA_INSPECTION_RETRY_BACKOFF_OPTION = typer.Option(
     "--media-inspection-retry-backoff-seconds",
     help="Sleep seconds between LeRobot media-inspection retry attempts.",
 )
+_MEDIA_INSPECTION_RETRY_POLICY_OPTION = typer.Option(
+    "fixed",
+    "--media-inspection-retry-policy",
+    help="LeRobot media-inspection retry policy: fixed or exponential-jitter.",
+)
 _MEDIA_INSPECTION_EXECUTION_MODE_OPTION = typer.Option(
     "thread",
     "--media-inspection-execution-mode",
@@ -152,7 +157,9 @@ def inspect_rosbag(path: str = _PATH_ARGUMENT, format: str = _FORMAT_OPTION) -> 
 
 @inspect_app.command("lerobot")
 def inspect_lerobot(
-    path: str = typer.Argument(..., help="Local/object-store LeRobot dataset directory or HF Hub repo id."),
+    path: str = typer.Argument(
+        ..., help="Local/object-store LeRobot dataset directory or HF Hub repo id."
+    ),
     format: str = _FORMAT_OPTION,
     auth_ref: str | None = _AUTH_REF_OPTION,
     storage_option: list[str] | None = _STORAGE_OPTION,
@@ -165,6 +172,7 @@ def inspect_lerobot(
     media_inspection_workers: int | None = _MEDIA_INSPECTION_WORKERS_OPTION,
     media_inspection_retries: int = _MEDIA_INSPECTION_RETRIES_OPTION,
     media_inspection_retry_backoff_seconds: float = _MEDIA_INSPECTION_RETRY_BACKOFF_OPTION,
+    media_inspection_retry_policy: str = _MEDIA_INSPECTION_RETRY_POLICY_OPTION,
     media_inspection_execution_mode: str = _MEDIA_INSPECTION_EXECUTION_MODE_OPTION,
 ) -> None:
     """Describe a LeRobot dataset without ingesting it."""
@@ -190,6 +198,7 @@ def inspect_lerobot(
             media_inspection_timeout_seconds=media_inspection_timeout_seconds,
             media_inspection_retries=media_inspection_retries,
             media_inspection_retry_backoff_seconds=media_inspection_retry_backoff_seconds,
+            media_inspection_retry_policy=media_inspection_retry_policy,
             media_inspection_execution_mode=media_inspection_execution_mode,
             source_manifest_cache=source_manifest_cache,
             object_store_validation_policy=source_validation_policy,
@@ -317,10 +326,12 @@ def _print_lerobot_report(report: dict) -> None:
     native = report.get("native_loader") or {}
     if not native.get("available", False):
         missing = ", ".join(native.get("missing") or [])
-        typer.echo(f"  native loader unavailable: missing {missing}; install {native.get('install')}")
-    validation = report.get("object_store_validation") or (
-        report.get("source_identity") or {}
-    ).get("object_store_validation")
+        typer.echo(
+            f"  native loader unavailable: missing {missing}; install {native.get('install')}"
+        )
+    validation = report.get("object_store_validation") or (report.get("source_identity") or {}).get(
+        "object_store_validation"
+    )
     if validation:
         typer.echo(
             "  object-store validation: "
@@ -329,7 +340,9 @@ def _print_lerobot_report(report: dict) -> None:
             f"hashed_bytes={validation.get('hashed_bytes')}"
         )
         for warning in validation.get("warnings") or ():
-            typer.echo(f"    {warning.get('severity', 'warning')} {warning.get('code')}: {warning.get('message')}")
+            typer.echo(
+                f"    {warning.get('severity', 'warning')} {warning.get('code')}: {warning.get('message')}"
+            )
     for task in report.get("tasks", []):
         typer.echo(f"  task {task['task_index']}: {task['task']}")
     for episode in report.get("episodes", []):

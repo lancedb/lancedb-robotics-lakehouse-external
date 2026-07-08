@@ -44,6 +44,7 @@ from lancedb_robotics.schemas import (
     OBSERVATIONS_SCHEMA,
     TRANSFORM_RUNS_SCHEMA,
 )
+from lancedb_robotics.storage import StorageConfigError
 
 runner = CliRunner()
 
@@ -1535,6 +1536,9 @@ def test_lerobot_media_inspection_retries_transient_read_failures(tmp_path, monk
     media = _require_media_inspection(report)
     assert media["status_counts"] == {"completed": 2}
     assert media["diagnostic_counts"] == {}
+    assert media["retry_policy"] == "fixed"
+    assert media["retry_backoff_seconds"] == 0.0
+    assert media["retry_class_counts"] == {"retryable-transient": 2}
     assert media["total_attempts"] == 4
     assert media["total_retries"] == 2
     videos = sorted(media["videos"], key=lambda row: row["episode_index"])
@@ -1545,6 +1549,12 @@ def test_lerobot_media_inspection_retries_transient_read_failures(tmp_path, monk
         video["inspection_attempt_errors"][0]["error_class"] == "Mp4MetadataError"
         for video in videos
     )
+    assert all(
+        video["inspection_attempt_errors"][0]["retry_class"] == "retryable-transient"
+        for video in videos
+    )
+    assert all(video["inspection_attempt_errors"][0]["retry_policy"] == "fixed" for video in videos)
+    assert all(video["inspection_attempt_errors"][0]["retryable"] is True for video in videos)
 
 
 def test_lerobot_media_inspection_retry_exhaustion_records_attempts(tmp_path, monkeypatch):
@@ -1565,15 +1575,130 @@ def test_lerobot_media_inspection_retry_exhaustion_records_attempts(tmp_path, mo
 
     media = _require_media_inspection(report)
     assert media["status_counts"] == {"failed": 2}
-    assert media["diagnostic_counts"] == {"corrupt-video": 2}
+    assert media["diagnostic_counts"] == {"retryable-transient": 2}
+    assert media["retry_class_counts"] == {"retryable-transient": 6}
     assert media["total_attempts"] == 6
     assert media["total_retries"] == 4
     videos = sorted(media["videos"], key=lambda row: row["episode_index"])
     assert all(video["inspection_attempts"] == 3 for video in videos)
     assert all(video["inspection_retries"] == 2 for video in videos)
     assert all(video["inspection_error_class"] == "Mp4MetadataError" for video in videos)
+    assert all(video["inspection_retry_class"] == "retryable-transient" for video in videos)
+    assert all(video["inspection_retryable"] is True for video in videos)
     assert all(len(video["inspection_attempt_errors"]) == 3 for video in videos)
     assert all(video["diagnostics"][0]["attempts"] == 3 for video in videos)
+    assert all(video["diagnostics"][0]["retry_class"] == "retryable-transient" for video in videos)
+
+
+def test_lerobot_media_inspection_does_not_retry_corrupt_media(tmp_path, monkeypatch):
+    source = _lerobot_fixture(tmp_path / "lerobot-media-corrupt-no-retry", version="v3.0")
+    first_video = source / "videos/chunk-000/observation.images.front/episode_000000.mp4"
+    second_video = source / "videos/chunk-000/observation.images.front/episode_000001.mp4"
+    _write_tiny_mp4(first_video, [b"front-frame-0", b"front-frame-1"], keyframes=[0])
+    _write_tiny_mp4(second_video, [b"front-frame-2"], keyframes=[0])
+
+    import lancedb_robotics.adapters.lerobot_adapter as lerobot_module
+
+    def corrupt_inspect(path, *, storage_options=None, auth_ref=None):
+        raise Mp4MetadataError("missing ftyp box")
+
+    monkeypatch.setattr(lerobot_module, "inspect_mp4_video", corrupt_inspect)
+
+    report = get_adapter("lerobot").inspect(source, media_inspection_retries=3)
+
+    media = _require_media_inspection(report)
+    assert media["status_counts"] == {"failed": 2}
+    assert media["diagnostic_counts"] == {"corrupt-video": 2}
+    assert media["retry_class_counts"] == {"corrupt-media": 2}
+    assert media["total_attempts"] == 2
+    assert media["total_retries"] == 0
+    videos = sorted(media["videos"], key=lambda row: row["episode_index"])
+    assert all(video["inspection_attempts"] == 1 for video in videos)
+    assert all(video["inspection_retry_class"] == "corrupt-media" for video in videos)
+    assert all(video["inspection_retryable"] is False for video in videos)
+    assert all(
+        video["inspection_attempt_errors"][0]["retry_class"] == "corrupt-media" for video in videos
+    )
+
+
+def test_lerobot_media_inspection_does_not_retry_auth_or_missing_objects(tmp_path, monkeypatch):
+    source = _lerobot_fixture(tmp_path / "lerobot-media-auth-missing", version="v3.0")
+    first_video = source / "videos/chunk-000/observation.images.front/episode_000000.mp4"
+    second_video = source / "videos/chunk-000/observation.images.front/episode_000001.mp4"
+    _write_tiny_mp4(first_video, [b"front-frame-0", b"front-frame-1"], keyframes=[0])
+    _write_tiny_mp4(second_video, [b"front-frame-2"], keyframes=[0])
+
+    import lancedb_robotics.adapters.lerobot_adapter as lerobot_module
+
+    def classified_inspect(path, *, storage_options=None, auth_ref=None):
+        if str(path).endswith("episode_000000.mp4"):
+            raise StorageConfigError("Forbidden credentials for object")
+        raise FileNotFoundError("NoSuchKey: missing object")
+
+    monkeypatch.setattr(lerobot_module, "inspect_mp4_video", classified_inspect)
+
+    report = get_adapter("lerobot").inspect(source, media_inspection_retries=3)
+
+    media = _require_media_inspection(report)
+    assert media["status_counts"] == {"failed": 2}
+    assert media["diagnostic_counts"] == {"auth-config": 1, "missing-object": 1}
+    assert media["retry_class_counts"] == {"auth-config": 1, "missing-object": 1}
+    assert media["total_attempts"] == 2
+    assert media["total_retries"] == 0
+    videos = sorted(media["videos"], key=lambda row: row["episode_index"])
+    assert videos[0]["inspection_retry_class"] == "auth-config"
+    assert videos[1]["inspection_retry_class"] == "missing-object"
+    assert all(video["inspection_retryable"] is False for video in videos)
+
+
+def test_lerobot_media_inspection_retries_throttle_with_exponential_jitter(
+    tmp_path,
+    monkeypatch,
+):
+    source = _lerobot_fixture(tmp_path / "lerobot-media-throttle-jitter", version="v3.0")
+    first_video = source / "videos/chunk-000/observation.images.front/episode_000000.mp4"
+    second_video = source / "videos/chunk-000/observation.images.front/episode_000001.mp4"
+    _write_tiny_mp4(first_video, [b"front-frame-0", b"front-frame-1"], keyframes=[0])
+    _write_tiny_mp4(second_video, [b"front-frame-2"], keyframes=[0])
+
+    import lancedb_robotics.adapters.lerobot_adapter as lerobot_module
+
+    real_inspect = lerobot_module.inspect_mp4_video
+    attempts: dict[str, int] = {}
+    sleeps: list[float] = []
+
+    def throttled_inspect(path, *, storage_options=None, auth_ref=None):
+        key = str(path)
+        attempts[key] = attempts.get(key, 0) + 1
+        if key.endswith("episode_000000.mp4") and attempts[key] <= 2:
+            raise OSError("SlowDown: TooManyRequests 429")
+        return real_inspect(path, storage_options=storage_options, auth_ref=auth_ref)
+
+    monkeypatch.setattr(lerobot_module, "inspect_mp4_video", throttled_inspect)
+    monkeypatch.setattr(lerobot_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(lerobot_module.random, "uniform", lambda low, high: high / 2)
+
+    report = get_adapter("lerobot").inspect(
+        source,
+        media_inspection_workers=1,
+        media_inspection_retries=2,
+        media_inspection_retry_backoff_seconds=0.5,
+        media_inspection_retry_policy="exponential-jitter",
+    )
+
+    media = _require_media_inspection(report)
+    assert media["status_counts"] == {"completed": 2}
+    assert media["retry_policy"] == "exponential-jitter"
+    assert media["retry_backoff_seconds"] == 0.5
+    assert media["retry_class_counts"] == {"throttle-backoff": 2}
+    assert sleeps == pytest.approx([1.25, 2.25])
+    videos = sorted(media["videos"], key=lambda row: row["episode_index"])
+    assert videos[0]["inspection_attempts"] == 3
+    assert videos[0]["inspection_retry_class"] == "throttle-backoff"
+    assert [
+        error["retry_delay_seconds"] for error in videos[0]["inspection_attempt_errors"]
+    ] == pytest.approx([1.25, 2.25])
+    assert videos[1]["inspection_attempts"] == 1
 
 
 def test_ingest_lerobot_media_inspection_timeout_does_not_abort_frames(tmp_path, monkeypatch):
@@ -3386,6 +3511,12 @@ def test_cli_inspect_lerobot_process_media_inspection_options(tmp_path):
             "1",
             "--media-inspection-timeout-seconds",
             "5",
+            "--media-inspection-retries",
+            "1",
+            "--media-inspection-retry-backoff-seconds",
+            "0.5",
+            "--media-inspection-retry-policy",
+            "exponential-jitter",
             "--media-inspection-execution-mode",
             "process",
             "--format",
@@ -3397,6 +3528,9 @@ def test_cli_inspect_lerobot_process_media_inspection_options(tmp_path):
     payload = json.loads(inspected.output)
     media = _require_media_inspection(payload)
     assert media["execution_mode"] == "process"
+    assert media["retry_count"] == 1
+    assert media["retry_backoff_seconds"] == 0.5
+    assert media["retry_policy"] == "exponential-jitter"
     assert media["max_workers"] == 1
     assert media["status_counts"] == {"completed": 2}
 

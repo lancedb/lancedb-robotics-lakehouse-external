@@ -141,6 +141,11 @@ _LEROBOT_MEDIA_INSPECTION_RETRY_BACKOFF_OPTION = typer.Option(
     "--media-inspection-retry-backoff-seconds",
     help="Sleep seconds between LeRobot media-inspection retry attempts.",
 )
+_LEROBOT_MEDIA_INSPECTION_RETRY_POLICY_OPTION = typer.Option(
+    "fixed",
+    "--media-inspection-retry-policy",
+    help="LeRobot media-inspection retry policy: fixed or exponential-jitter.",
+)
 _LEROBOT_MEDIA_INSPECTION_EXECUTION_MODE_OPTION = typer.Option(
     "thread",
     "--media-inspection-execution-mode",
@@ -384,6 +389,7 @@ def ingest_lerobot_command(
     media_inspection_workers: int | None = _LEROBOT_MEDIA_INSPECTION_WORKERS_OPTION,
     media_inspection_retries: int = _LEROBOT_MEDIA_INSPECTION_RETRIES_OPTION,
     media_inspection_retry_backoff_seconds: float = _LEROBOT_MEDIA_INSPECTION_RETRY_BACKOFF_OPTION,
+    media_inspection_retry_policy: str = _LEROBOT_MEDIA_INSPECTION_RETRY_POLICY_OPTION,
     media_inspection_execution_mode: str = _LEROBOT_MEDIA_INSPECTION_EXECUTION_MODE_OPTION,
     keyframe_map_inline_threshold_bytes: int = _LEROBOT_KEYFRAME_MAP_INLINE_THRESHOLD_BYTES_OPTION,
     keyframe_map_inline_threshold_frames: int = _LEROBOT_KEYFRAME_MAP_INLINE_THRESHOLD_FRAMES_OPTION,
@@ -444,6 +450,7 @@ def ingest_lerobot_command(
             media_inspection_timeout_seconds=media_inspection_timeout_seconds,
             media_inspection_retries=media_inspection_retries,
             media_inspection_retry_backoff_seconds=media_inspection_retry_backoff_seconds,
+            media_inspection_retry_policy=media_inspection_retry_policy,
             media_inspection_execution_mode=media_inspection_execution_mode,
             keyframe_map_inline_threshold_bytes=keyframe_map_inline_threshold_bytes,
             keyframe_map_inline_threshold_frames=keyframe_map_inline_threshold_frames,
