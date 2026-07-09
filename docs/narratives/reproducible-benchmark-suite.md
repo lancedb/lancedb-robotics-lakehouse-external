@@ -133,6 +133,114 @@ the same lake, snapshot, and parameters creates the same benchmark snapshot name
 and structured report shape, with only wall-clock timings and `created_at`
 changing.
 
+## Live Enterprise Endpoint Conformance and Calibration
+
+Backlog 0074 (above) proves the `enterprise-lance` report shape against a
+fake-local `db://` fixture: `_run_enterprise_lance_format` wraps the same local
+Lance tables in a simulated Enterprise connection report, so CI can exercise
+cache phases and filter-change measurement without any live endpoint. That
+fixture cannot prove production network, query-node placement, or real cache
+behavior. Backlog 0125 adds an opt-in **live mode** that runs the same harness
+against an already-opened `db://` or REST Namespace lake and calibrates the two
+results against each other.
+
+```bash
+lancedb-robotics bench run \
+  --lake db://your-enterprise-lake \
+  --snapshot lerobot-droid-100-benchmark \
+  --formats enterprise-lance \
+  --enterprise-live \
+  --out ./benchmarks/enterprise-live-report.json
+```
+
+`--lake` must already resolve to a live Enterprise connection (`db://` remote
+DB or a REST Namespace/namespace URI) -- `--enterprise-live` does not open one
+for you. Combining `--enterprise-live` with `--enterprise-fixture-uri`, or
+passing `--enterprise-live` against a local/non-Enterprise lake, fails fast
+with a diagnostic instead of silently falling back to a skipped report entry;
+see `_enterprise_benchmark_lake` in `src/lancedb_robotics/benchmark.py`.
+
+### Report profile and confidence labeling
+
+Every `enterprise-lance` report entry now carries a `remote_endpoint.profile`
+and a `confidence` label so a report can never be misread as production
+evidence:
+
+| Profile | How it's produced | Confidence |
+| --- | --- | --- |
+| `fake-local-db` | `--enterprise-fixture-uri` (or `enterprise_fixture_uri=...`) | `sdk-contract-only` |
+| `live-db` | `--enterprise-live` against a `db://` remote DB lake | `production-calibrated` |
+| `live-namespace` | `--enterprise-live` against a REST Namespace / namespace lake | `production-calibrated` |
+
+### Capability preflight and degraded phases
+
+Before running any phase, the live path preflights the endpoint's capability
+negotiation using the exact same matrix the training loader itself uses
+(`training._enterprise_training_capabilities`), so the preflight can never
+drift from what the loader will actually do. `remote_scan` is the one
+capability the benchmark cannot run without at all -- if it's unavailable the
+whole `enterprise-lance` format is skipped with an explicit reason, the same as
+missing endpoint config today.
+
+Every other capability (`remote_take`, `blob_or_video_remote_hydration`,
+`plan_executor_cache_metrics`, `page_cache_prewarm`, `page_cache_status`) is
+optional: if the endpoint doesn't support it, only the phases that depend on it
+report `"status": "degraded"` with a `degraded_reasons` list, and the format
+still completes. In particular, if `plan_executor_cache_metrics` is
+unsupported, `phase["cache"]["hits"]`/`["misses"]` are `null` -- **unavailable,
+never a synthesized zero** -- because a missing counter and a real zero are not
+the same fact. This is the direct fix for the 2026-07-07 reframe at the top of
+backlog 0125: a benchmark client is a query-node client and cannot observe
+server-internal page-cache state, so cache metrics are either what the
+endpoint explicitly reports or explicitly absent, never assumed.
+
+Only the `fake-local-db` fixture synthesizes cache hits/misses and a prewarm
+completion (to keep the CI-only report shape deterministic); `live-db` and
+`live-namespace` runs always read whatever the endpoint's loader report
+actually contains.
+
+### Redaction
+
+`remote_endpoint` only ever copies the `region`, `host_override`, and
+`cache_policy` keys out of the connection's `lancedb_connect_kwargs` -- never
+the raw mapping -- so an `api_key` or other credential passed to `Lake.open`
+cannot reach the benchmark report even by accident. `capabilities` and
+`capability_checks` are booleans/labels only. Run
+`lancedb_robotics.training_report_schema.scan_report_secrets(report)` over a
+saved report before sharing it externally; it independently scans every key and
+string value for secret-shaped fields as a second line of defense.
+
+### Calibrating fake-local against live
+
+`compare_enterprise_benchmark_results(fake_report, live_report)` takes two
+`run_benchmark_suite` reports (or their `formats["enterprise-lance"]` entries)
+over the same logical sample set -- one `fake-local-db`, one live -- and returns
+the latency/throughput deltas between them plus each side's confidence label
+and any degraded capabilities on the live side. It refuses two reports of the
+same profile, so a calibration result always compares SDK-contract-only numbers
+against production-calibrated ones, never mixes two of the same kind:
+
+```python
+from lancedb_robotics.benchmark import compare_enterprise_benchmark_results
+
+calibration = compare_enterprise_benchmark_results(fake_report, live_report)
+```
+
+### Minimum live setup
+
+- The opened lake must be a `db://` remote DB or REST Namespace/namespace
+  connection with `capabilities.server_side_query` enabled; there is no
+  minimum row count, but a snapshot with at least a handful of scenarios is
+  needed for the shuffled-epoch and random-access measurements to be
+  meaningful rather than trivially fast.
+- Record `LANCEDB_ROBOTICS_ENTERPRISE_INSTANCE_CLASS` in the environment
+  running the benchmark to have the report's `hardware_class` field describe
+  the plan-executor/query-node instance class; it is omitted (not guessed) when
+  unset.
+- Software versions (`lancedb-robotics`, `lancedb`, `pylance`) are always
+  recorded from the local client environment, not the endpoint, since the
+  client cannot introspect server-side versions.
+
 ## Comparison Formats
 
 The Lance path uses `lake.training.dataset(...)` directly over the pinned

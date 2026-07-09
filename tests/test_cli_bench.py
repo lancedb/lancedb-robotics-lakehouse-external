@@ -135,6 +135,56 @@ def test_bench_run_enterprise_fixture_writes_phase_report(tmp_path):
     ] == 0
 
 
+def test_bench_run_enterprise_live_without_live_lake_exits_with_diagnostic(tmp_path):
+    lake_path = tmp_path / "robot.lance"
+    benchmark_lake(lake_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "bench",
+            "run",
+            "--lake",
+            str(lake_path),
+            "--snapshot",
+            "bench-v1",
+            "--formats",
+            "enterprise-lance",
+            "--enterprise-live",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "error:" in result.output
+    assert "enterprise_live=True requires" in result.output
+    assert "connection_kind='local_path'" in result.output
+
+
+def test_bench_run_enterprise_live_and_fixture_together_exits_with_diagnostic(tmp_path):
+    lake_path = tmp_path / "robot.lance"
+    benchmark_lake(lake_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "bench",
+            "run",
+            "--lake",
+            str(lake_path),
+            "--snapshot",
+            "bench-v1",
+            "--formats",
+            "enterprise-lance",
+            "--enterprise-live",
+            "--enterprise-fixture-uri",
+            "db://robotics-benchmark",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "cannot be combined with enterprise_fixture_uri" in result.output
+
+
 def test_bench_run_lerobot_native_skip_is_reported(tmp_path, monkeypatch):
     import lancedb_robotics.benchmark as benchmark
 

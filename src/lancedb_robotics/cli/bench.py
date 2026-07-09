@@ -137,6 +137,15 @@ _ENTERPRISE_HOST_OVERRIDE_OPTION = typer.Option(
     "--enterprise-host-override",
     help="HTTP endpoint recorded for the Enterprise benchmark endpoint.",
 )
+_ENTERPRISE_LIVE_OPTION = typer.Option(
+    False,
+    "--enterprise-live",
+    help=(
+        "Run enterprise-lance against the already-opened live db:// or namespace "
+        "lake instead of a fixture; fails fast with a diagnostic if --lake is not "
+        "a live Enterprise connection or --enterprise-fixture-uri is also set."
+    ),
+)
 _SOURCE_DATASET_ID_OPTION = typer.Option(
     None,
     "--source-dataset-id",
@@ -215,6 +224,7 @@ def run(
     enterprise_fixture_uri: str | None = _ENTERPRISE_FIXTURE_OPTION,
     enterprise_region: str = _ENTERPRISE_REGION_OPTION,
     enterprise_host_override: str | None = _ENTERPRISE_HOST_OVERRIDE_OPTION,
+    enterprise_live: bool = _ENTERPRISE_LIVE_OPTION,
 ) -> None:
     """Run the reproducible benchmark harness and emit a structured report."""
     from lancedb_robotics.benchmark import (
@@ -255,6 +265,7 @@ def run(
             enterprise_fixture_uri=enterprise_fixture_uri,
             enterprise_region=enterprise_region,
             enterprise_host_override=enterprise_host_override,
+            enterprise_live=enterprise_live,
         )
         if out is not None:
             write_benchmark_report(report, out)
@@ -277,11 +288,15 @@ def run(
         if status == "completed":
             metrics = result["metrics"]
             if fmt == ENTERPRISE_LANCE_FORMAT:
+                endpoint = result["remote_endpoint"]
                 cold = result["phases"]["cold_cache"]["cache"]
                 warm = result["phases"]["warm_second_epoch"]["cache"]
                 throughput = metrics["shuffled_epoch_throughput"]["value"]
                 latency = metrics["random_access_latency"]["value"]
                 filter_ms = metrics["subset_filter_change"]["value"]
+                typer.echo(
+                    f"  profile: {endpoint.get('profile')} confidence={endpoint.get('confidence')}"
+                )
                 typer.echo(
                     f"  cold cache: hits={cold['hits']} misses={cold['misses']}"
                 )
@@ -291,6 +306,10 @@ def run(
                 typer.echo(f"  throughput: {throughput:.3f} samples/s")
                 typer.echo(f"  random access: {latency:.3f} ms/sample")
                 typer.echo(f"  filter change: {filter_ms:.3f} ms")
+                if result.get("degraded_phases"):
+                    typer.echo(
+                        "  degraded phases: " + ", ".join(result["degraded_phases"])
+                    )
             else:
                 throughput = metrics["dataloader_throughput"]["value"]
                 latency = metrics["random_access_latency"]["value"]

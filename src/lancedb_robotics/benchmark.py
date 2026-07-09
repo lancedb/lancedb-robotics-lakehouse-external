@@ -40,6 +40,7 @@ from typing import Any
 import pyarrow.parquet as pq
 
 from lancedb_robotics import __version__
+from lancedb_robotics import training as _training
 from lancedb_robotics.connections import LakeCapabilities, LakeConnectionSpec
 from lancedb_robotics.dataset import DatasetError, create_snapshot
 from lancedb_robotics.dataset_export import (
@@ -127,6 +128,36 @@ DEEPLAKE_FORMAT = "deeplake"
 ENTERPRISE_BENCHMARK_CONNECTION_KINDS = frozenset(
     {"lancedb_remote_db", "rest_namespace_lancedb", "namespace_lancedb"}
 )
+ENTERPRISE_NAMESPACE_CONNECTION_KINDS = frozenset(
+    {"rest_namespace_lancedb", "namespace_lancedb"}
+)
+
+# Backlog 0125: report profile/confidence labels for the enterprise-lance format.
+# fake-local-db reuses local Lance tables behind a simulated Enterprise connection
+# report; live-db/live-namespace talk to an already-opened Enterprise endpoint.
+# Only fake-local-db numbers are "sdk-contract-only" -- live profiles are labeled
+# production-calibrated so a report can never be mistaken for the other kind.
+FAKE_LOCAL_DB_PROFILE = "fake-local-db"
+LIVE_DB_PROFILE = "live-db"
+LIVE_NAMESPACE_PROFILE = "live-namespace"
+ENTERPRISE_BENCHMARK_CONFIDENCE = {
+    FAKE_LOCAL_DB_PROFILE: "sdk-contract-only",
+    LIVE_DB_PROFILE: "production-calibrated",
+    LIVE_NAMESPACE_PROFILE: "production-calibrated",
+}
+ENTERPRISE_INSTANCE_CLASS_ENV = "LANCEDB_ROBOTICS_ENTERPRISE_INSTANCE_CLASS"
+
+# Required vs optional capabilities preflighted before a live benchmark run.
+# Missing the required one blocks the whole format (soft skip); missing an
+# optional one degrades only the phases that depend on it.
+_ENTERPRISE_REQUIRED_CAPABILITY = "remote_scan"
+_ENTERPRISE_OPTIONAL_CAPABILITIES = (
+    "remote_take",
+    "blob_or_video_remote_hydration",
+    "plan_executor_cache_metrics",
+    "page_cache_prewarm",
+    "page_cache_status",
+)
 
 DEFAULT_BENCHMARK_FORMATS = (
     ENTERPRISE_LANCE_FORMAT,
@@ -184,6 +215,7 @@ class BenchmarkRunConfig:
     enterprise_fixture_uri: str | None = None
     enterprise_region: str = "us-east-1"
     enterprise_host_override: str | None = None
+    enterprise_live: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -208,6 +240,7 @@ class BenchmarkRunConfig:
             "enterprise_fixture_uri": self.enterprise_fixture_uri,
             "enterprise_region": self.enterprise_region,
             "enterprise_host_override": self.enterprise_host_override,
+            "enterprise_live": self.enterprise_live,
         }
 
 
@@ -243,6 +276,7 @@ def run_benchmark_suite(
     enterprise_fixture_uri: str | None = None,
     enterprise_region: str = "us-east-1",
     enterprise_host_override: str | None = None,
+    enterprise_live: bool = False,
 ) -> dict[str, Any]:
     """Run the benchmark harness and return a structured JSON-safe report."""
     selected_formats = _normalize_formats(formats or DEFAULT_BENCHMARK_FORMATS)
@@ -274,6 +308,7 @@ def run_benchmark_suite(
         enterprise_fixture_uri=enterprise_fixture_uri,
         enterprise_region=str(enterprise_region),
         enterprise_host_override=enterprise_host_override,
+        enterprise_live=bool(enterprise_live),
     )
     artifact_root = Path(output_dir) if output_dir is not None else None
     if artifact_root is not None:
@@ -344,6 +379,97 @@ def write_benchmark_report(report: dict[str, Any], path: str | Path) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
     return out
+
+
+ENTERPRISE_CALIBRATION_SCHEMA_VERSION = "lancedb-robotics-enterprise-benchmark-calibration-v1"
+
+
+def compare_enterprise_benchmark_results(
+    fake_report: Mapping[str, Any],
+    live_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Calibrate a fake-local ``enterprise-lance`` result against a live one.
+
+    Each argument is either a full ``run_benchmark_suite`` report or the
+    ``report["formats"]["enterprise-lance"]`` entry from one, taken from two
+    separate runs over the same logical sample set: one with
+    ``enterprise_fixture_uri`` (profile ``fake-local-db``) and one with
+    ``enterprise_live=True`` against a real endpoint (profile ``live-db`` or
+    ``live-namespace``). The result labels every compared metric with its
+    source's confidence level so fake-local numbers can never be read as
+    production performance (backlog 0125).
+    """
+    fake_entry = _enterprise_format_entry(fake_report)
+    live_entry = _enterprise_format_entry(live_report)
+    for label, entry in (("fake_report", fake_entry), ("live_report", live_entry)):
+        if entry.get("status") != "completed":
+            raise BenchmarkError(
+                f"{label} enterprise-lance entry is not completed "
+                f"(status={entry.get('status')!r})"
+            )
+    fake_profile = str(fake_entry["remote_endpoint"]["profile"])
+    live_profile = str(live_entry["remote_endpoint"]["profile"])
+    if fake_profile != FAKE_LOCAL_DB_PROFILE:
+        raise BenchmarkError(
+            f"fake_report must use the {FAKE_LOCAL_DB_PROFILE!r} profile, got {fake_profile!r}"
+        )
+    if live_profile not in (LIVE_DB_PROFILE, LIVE_NAMESPACE_PROFILE):
+        raise BenchmarkError(
+            f"live_report must use a live Enterprise profile, got {live_profile!r}"
+        )
+
+    metric_names = (
+        "query_to_first_batch_latency",
+        "shuffled_epoch_throughput",
+        METRIC_RANDOM_ACCESS_LATENCY,
+    )
+    deltas: dict[str, Any] = {}
+    for name in metric_names:
+        fake_value = float(fake_entry["metrics"][name]["value"])
+        live_value = float(live_entry["metrics"][name]["value"])
+        deltas[name] = {
+            "fake_local_value": fake_value,
+            "live_value": live_value,
+            "unit": fake_entry["metrics"][name].get("unit"),
+            "absolute_delta": live_value - fake_value,
+            "relative_delta_pct": (
+                ((live_value - fake_value) / fake_value * 100.0) if fake_value else None
+            ),
+        }
+    return {
+        "schema_version": ENTERPRISE_CALIBRATION_SCHEMA_VERSION,
+        "created_at": _now_iso(),
+        "fake_local": {
+            "profile": fake_profile,
+            "confidence": fake_entry["remote_endpoint"].get("confidence", "sdk-contract-only"),
+        },
+        "live": {
+            "profile": live_profile,
+            "confidence": live_entry["remote_endpoint"].get(
+                "confidence", "production-calibrated"
+            ),
+            "degraded_capabilities": list(
+                live_entry["remote_endpoint"].get("degraded_capabilities") or []
+            ),
+            "degraded_phases": list(live_entry.get("degraded_phases") or []),
+        },
+        "metrics": deltas,
+        "notes": [
+            "fake-local-db numbers are sdk-contract-only: they prove report shape and "
+            "cache-phase wiring, not production performance.",
+            f"live numbers are labeled {live_entry['remote_endpoint'].get('confidence')} and "
+            "reflect the configured endpoint's real network, placement, and cache behavior.",
+        ],
+    }
+
+
+def _enterprise_format_entry(report: Mapping[str, Any]) -> Mapping[str, Any]:
+    if "formats" in report:
+        entry = report["formats"].get(ENTERPRISE_LANCE_FORMAT)
+        if entry is None:
+            raise BenchmarkError("report has no enterprise-lance format entry")
+        return entry
+    return report
 
 
 def plan_public_lerobot_benchmark_capacity(
@@ -1712,6 +1838,11 @@ def _run_enterprise_lance_format(
     if enterprise_lake is None:
         return _skip_enterprise_lance(skip_reason)
 
+    is_fake = endpoint.get("profile") == FAKE_LOCAL_DB_PROFILE
+    degraded_capabilities = frozenset(endpoint.get("degraded_capabilities") or ())
+    cache_metrics_available = is_fake or "plan_executor_cache_metrics" not in degraded_capabilities
+    prewarm_available = is_fake or "page_cache_prewarm" not in degraded_capabilities
+
     try:
         cold = _run_enterprise_phase(
             enterprise_lake,
@@ -1721,7 +1852,10 @@ def _run_enterprise_lance_format(
             phase="cold_cache",
             epoch=0,
             cache_policy="lazy",
-            cache_metrics=_enterprise_cache_metrics(hits=0, misses=config.sample_limit),
+            cache_metrics=(
+                _enterprise_cache_metrics(hits=0, misses=config.sample_limit) if is_fake else None
+            ),
+            cache_metrics_available=cache_metrics_available,
         )
         prewarmed = _run_enterprise_phase(
             enterprise_lake,
@@ -1731,7 +1865,9 @@ def _run_enterprise_lance_format(
             phase="prewarmed",
             epoch=0,
             cache_policy="epoch",
-            prewarm=True,
+            prewarm=is_fake,
+            cache_metrics_available=cache_metrics_available,
+            prewarm_available=prewarm_available,
         )
         warm = _run_enterprise_phase(
             enterprise_lake,
@@ -1741,7 +1877,10 @@ def _run_enterprise_lance_format(
             phase="warm_second_epoch",
             epoch=1,
             cache_policy="lazy",
-            cache_metrics=_enterprise_cache_metrics(hits=config.sample_limit, misses=0),
+            cache_metrics=(
+                _enterprise_cache_metrics(hits=config.sample_limit, misses=0) if is_fake else None
+            ),
+            cache_metrics_available=cache_metrics_available,
         )
         filter_change = _measure_enterprise_filter_change(
             enterprise_lake,
@@ -1758,10 +1897,13 @@ def _run_enterprise_lance_format(
         "prewarmed": prewarmed,
         "warm_second_epoch": warm,
     }
+    degraded_phases = sorted(name for name, phase in phases.items() if phase["status"] == "degraded")
     return {
         "status": "completed",
         "format": ENTERPRISE_LANCE_FORMAT,
         "remote_endpoint": endpoint,
+        "confidence": endpoint.get("confidence"),
+        "degraded_phases": degraded_phases,
         "metrics": {
             "query_to_first_batch_latency": cold["metrics"][
                 "query_to_first_batch_latency"
@@ -1776,9 +1918,78 @@ def _run_enterprise_lance_format(
             "Enterprise path uses the native training loader with backend='enterprise'.",
             "Fake-local db:// fixtures reuse local LanceDB tables with an Enterprise connection report.",
             "No training copy is materialized for filter changes or epoch reruns.",
+            (
+                "fake-local-db cache/prewarm numbers are synthesized to prove report shape; "
+                "live-db/live-namespace profiles never synthesize cache metrics -- missing "
+                "endpoint telemetry is reported as a degraded phase, not assumed zero."
+            ),
         ],
         "dataset_manifest": warm["dataset_manifest"],
     }
+
+
+def _enterprise_live_profile(connection_kind: str) -> str:
+    """Map a live connection kind to its report profile label."""
+    if connection_kind in ENTERPRISE_NAMESPACE_CONNECTION_KINDS:
+        return LIVE_NAMESPACE_PROFILE
+    return LIVE_DB_PROFILE
+
+
+def _validate_enterprise_capabilities(lake: Lake) -> tuple[list[dict[str, Any]], str | None]:
+    """Preflight capability negotiation for a live Enterprise endpoint.
+
+    Delegates to the same capability matrix the real training loader uses
+    (:func:`training._enterprise_training_capabilities` over
+    :func:`training._lake_capabilities_dict`) so this preflight can never drift
+    from what a subsequent ``lake.training.dataset(..., backend="enterprise")``
+    call will actually see -- including any ``lake.enterprise_training_capabilities``
+    override the caller has installed.
+
+    Returns ``(checks, blocking_reason)``. ``blocking_reason`` is set only when the
+    endpoint lacks the one capability the benchmark cannot run without at all
+    (remote scan); every other missing capability degrades only the specific
+    phases that depend on it instead of failing the whole format.
+    """
+    spec = getattr(lake, "connection_spec", None)
+    connection_kind = str(getattr(spec, "kind", "local_path") or "local_path")
+    base_capabilities = _training._lake_capabilities_dict(lake)
+    matrix = _training._enterprise_training_capabilities(
+        lake,
+        spec,
+        base_capabilities,
+        connection_kind=connection_kind,
+        resolved_backend="enterprise",
+        is_enterprise_connection=True,
+    )
+
+    checks: list[dict[str, Any]] = []
+    required_available = bool(matrix.get(_ENTERPRISE_REQUIRED_CAPABILITY))
+    checks.append(
+        {
+            "name": _ENTERPRISE_REQUIRED_CAPABILITY,
+            "required": True,
+            "available": required_available,
+            "status": "passed" if required_available else "unsupported",
+        }
+    )
+    blocking_reason = None
+    if not required_available:
+        blocking_reason = (
+            "live Enterprise endpoint lacks required capability "
+            f"{_ENTERPRISE_REQUIRED_CAPABILITY!r}; cannot run the enterprise-lance benchmark "
+            "against this endpoint"
+        )
+    for name in _ENTERPRISE_OPTIONAL_CAPABILITIES:
+        available = bool(matrix.get(name))
+        checks.append(
+            {
+                "name": name,
+                "required": False,
+                "available": available,
+                "status": "passed" if available else "degraded",
+            }
+        )
+    return checks, blocking_reason
 
 
 def _enterprise_benchmark_lake(
@@ -1787,19 +1998,42 @@ def _enterprise_benchmark_lake(
 ) -> tuple[Lake | None, dict[str, Any], str]:
     spec = getattr(lake, "connection_spec", None)
     connection_kind = str(getattr(spec, "kind", "local_path") or "local_path")
+    is_live_connection = connection_kind in ENTERPRISE_BENCHMARK_CONNECTION_KINDS
+
     if config.enterprise_fixture_uri:
+        if config.enterprise_live:
+            raise BenchmarkError(
+                "enterprise_live=True cannot be combined with enterprise_fixture_uri; "
+                "open a live Enterprise db:// or namespace lake instead of requesting the "
+                "fake-local fixture"
+            )
         fixture = _fake_enterprise_lake(lake, config)
-        endpoint = _enterprise_endpoint_report(fixture, profile="fake-local-db")
+        endpoint = _enterprise_endpoint_report(fixture, profile=FAKE_LOCAL_DB_PROFILE)
         return fixture, endpoint, ""
-    if connection_kind in ENTERPRISE_BENCHMARK_CONNECTION_KINDS:
-        endpoint = _enterprise_endpoint_report(lake, profile="live-db")
-        return lake, endpoint, ""
-    return (
-        None,
-        {},
-        "enterprise-lance requires an Enterprise db:// or namespace-backed lake; "
-        "pass enterprise_fixture_uri to run the fake-local db:// benchmark fixture",
-    )
+
+    if config.enterprise_live and not is_live_connection:
+        raise BenchmarkError(
+            "enterprise_live=True requires a lake opened with a live Enterprise db:// or "
+            f"namespace connection; got connection_kind={connection_kind!r}. Open the lake "
+            "with Lake.open('db://...') or a namespace URI, or omit enterprise_live to run "
+            "the fake-local db:// fixture instead."
+        )
+
+    if not is_live_connection:
+        return (
+            None,
+            {},
+            "enterprise-lance requires an Enterprise db:// or namespace-backed lake; pass "
+            "enterprise_fixture_uri to run the fake-local db:// benchmark fixture, or open a "
+            "live Enterprise lake and pass enterprise_live=True",
+        )
+
+    profile = _enterprise_live_profile(connection_kind)
+    checks, blocking_reason = _validate_enterprise_capabilities(lake)
+    if blocking_reason:
+        return None, {}, blocking_reason
+    endpoint = _enterprise_endpoint_report(lake, profile=profile, capability_checks=checks)
+    return lake, endpoint, ""
 
 
 def _fake_enterprise_lake(lake: Lake, config: BenchmarkRunConfig) -> Lake:
@@ -1831,18 +2065,40 @@ def _fake_enterprise_lake(lake: Lake, config: BenchmarkRunConfig) -> Lake:
     return Lake(lake._db, uri, connection_spec=spec)  # noqa: SLF001 - benchmark fixture wraps the same DB.
 
 
-def _enterprise_endpoint_report(lake: Lake, *, profile: str) -> dict[str, Any]:
+def _enterprise_endpoint_report(
+    lake: Lake,
+    *,
+    profile: str,
+    capability_checks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     spec = getattr(lake, "connection_spec", None)
     kwargs = dict(getattr(spec, "lancedb_connect_kwargs", {}) or {})
     capabilities = getattr(spec, "capabilities", None)
     capability_dict = capabilities.__dict__ if capabilities is not None else {}
+    checks = list(capability_checks or [])
+    degraded_capabilities = sorted(
+        str(check["name"]) for check in checks if check.get("status") == "degraded"
+    )
+    # Only region/host_override/cache_policy are read out of the connect kwargs --
+    # never the raw mapping -- so an api_key or other secret in
+    # ``lancedb_connect_kwargs`` can never reach the benchmark report.
     return {
         "uri": str(getattr(spec, "display_uri", lake.uri) or lake.uri),
         "profile": profile,
+        "confidence": ENTERPRISE_BENCHMARK_CONFIDENCE.get(profile, "unknown"),
         "connection_kind": str(getattr(spec, "kind", "local_path") or "local_path"),
         "region": kwargs.get("region"),
         "host_override": kwargs.get("host_override"),
+        "cache_policy": kwargs.get("cache_policy"),
         "capabilities": dict(capability_dict),
+        "capability_checks": checks,
+        "degraded_capabilities": degraded_capabilities,
+        "software_versions": {
+            "lancedb-robotics": __version__,
+            "lancedb": _package_version("lancedb"),
+            "pylance": _package_version("pylance"),
+        },
+        "hardware_class": os.environ.get(ENTERPRISE_INSTANCE_CLASS_ENV),
     }
 
 
@@ -1857,6 +2113,8 @@ def _run_enterprise_phase(
     cache_policy: str,
     prewarm: bool = False,
     cache_metrics: Mapping[str, Any] | None = None,
+    cache_metrics_available: bool = True,
+    prewarm_available: bool = True,
 ) -> dict[str, Any]:
     if cache_metrics is not None:
         lake.plan_executor_cache_metrics = cache_metrics
@@ -1874,6 +2132,11 @@ def _run_enterprise_phase(
         shuffle_seed=config.seed,
         epoch=epoch,
         prewarm_options={"wait": True},
+        # A live endpoint that is missing an optional capability (cache metrics,
+        # prewarm) should degrade with a reported fallback event, not hard-fail
+        # the whole benchmark phase; the preflight capability_checks already
+        # decided what "degraded" means for this run.
+        fallback="warn",
     )
     setup_seconds = _elapsed_seconds(start_ns)
     first_batch = _measure_enterprise_first_batch(dataset, config, setup_seconds)
@@ -1885,20 +2148,37 @@ def _run_enterprise_phase(
     ).to_dict()
     cache = report["metrics"]["cache"]
     prewarm_report = _enterprise_prewarm_report(dataset, report)
+
+    degraded_reasons: list[str] = []
+    if cache_metrics_available:
+        cache_block = {
+            "hits": int(cache.get("hits") or 0),
+            "misses": int(cache.get("misses") or 0),
+            "by_plan_executor": cache.get("by_plan_executor") or {},
+            "by_operation": cache.get("by_operation") or {},
+        }
+    else:
+        degraded_reasons.append(
+            "plan_executor_cache_metrics capability unavailable on this endpoint; "
+            "hits/misses are unavailable, not zero -- rely on latency deltas instead"
+        )
+        cache_block = {"hits": None, "misses": None, "by_plan_executor": {}, "by_operation": {}}
+    if phase == "prewarmed" and not prewarm_available:
+        degraded_reasons.append(
+            "page_cache_prewarm capability unavailable on this endpoint; the prewarm "
+            "request was rejected or degraded to lazy-cache"
+        )
+
     return {
-        "status": "completed",
+        "status": "degraded" if degraded_reasons else "completed",
+        "degraded_reasons": degraded_reasons,
         "phase": phase,
         "metrics": {
             "query_to_first_batch_latency": first_batch,
             "shuffled_epoch_throughput": throughput,
             METRIC_RANDOM_ACCESS_LATENCY: random_access,
         },
-        "cache": {
-            "hits": int(cache.get("hits") or 0),
-            "misses": int(cache.get("misses") or 0),
-            "by_plan_executor": cache.get("by_plan_executor") or {},
-            "by_operation": cache.get("by_operation") or {},
-        },
+        "cache": cache_block,
         "prewarm": prewarm_report,
         "loader_report": report,
         "dataset_manifest": dataset.manifest.to_dict(),
@@ -1948,6 +2228,7 @@ def _measure_enterprise_filter_change(
         cache_policy="none",
         shuffle=True,
         shuffle_seed=config.seed,
+        fallback="warn",
     )
     duration = _elapsed_seconds(start_ns)
     return {
@@ -1976,13 +2257,20 @@ def _measure_enterprise_storage(
     rows_hydrated = 0
     cache_hits = 0
     cache_misses = 0
+    cache_metrics_available = True
     for phase in phases.values():
         report = phase.get("loader_report") or {}
         metrics = report.get("metrics") or {}
         summary = metrics.get("summary") or {}
-        cache = metrics.get("cache") or {}
         payload_bytes_hydrated += int(summary.get("bytes_read") or 0)
         rows_hydrated += int(summary.get("rows_returned") or 0)
+        # Read the phase's already-corrected cache block, not the raw loader
+        # report, so a degraded phase contributes "unavailable" rather than a
+        # misleading zero to the rollup.
+        cache = phase.get("cache") or {}
+        if cache.get("hits") is None and cache.get("misses") is None:
+            cache_metrics_available = False
+            continue
         cache_hits += int(cache.get("hits") or 0)
         cache_misses += int(cache.get("misses") or 0)
     return {
@@ -1994,8 +2282,8 @@ def _measure_enterprise_storage(
             "materialized_bytes_written": 0,
             "payload_bytes_hydrated": payload_bytes_hydrated,
             "rows_hydrated": rows_hydrated,
-            "cache_hits": cache_hits,
-            "cache_misses": cache_misses,
+            "cache_hits": cache_hits if cache_metrics_available else None,
+            "cache_misses": cache_misses if cache_metrics_available else None,
             "fixed_quality": "source payload bytes; no training copy or transcoding",
         },
     }

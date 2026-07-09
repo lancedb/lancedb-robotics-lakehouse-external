@@ -14,13 +14,17 @@ from lancedb_robotics.benchmark import (
     DEFAULT_LEROBOT_BENCHMARK_DATASET_ID,
     DEFAULT_LEROBOT_BENCHMARK_SOURCE_URI,
     ENTERPRISE_LANCE_FORMAT,
+    FAKE_LOCAL_DB_PROFILE,
     LANCE_FORMAT,
     LEROBOT_DEFAULT_FORMAT,
     LEROBOT_NATIVE_FORMAT,
+    LIVE_DB_PROFILE,
+    LIVE_NAMESPACE_PROFILE,
     METRIC_RANDOM_FRAME_SAMPLING,
     PUBLIC_LEROBOT_CLAIMS_SCHEMA_VERSION,
     WEBDATASET_FORMAT,
     BenchmarkError,
+    compare_enterprise_benchmark_results,
     plan_public_lerobot_benchmark_capacity,
     prepare_lerobot_benchmark_dataset,
     publish_public_lerobot_benchmark,
@@ -29,9 +33,11 @@ from lancedb_robotics.benchmark import (
     validate_public_lerobot_benchmark_claims,
     write_benchmark_report,
 )
+from lancedb_robotics.connections import LakeCapabilities, LakeConnectionSpec
 from lancedb_robotics.dataset import create_snapshot
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.schemas import OBSERVATIONS_SCHEMA, RUNS_SCHEMA, SCENARIOS_SCHEMA
+from lancedb_robotics.training_report_schema import scan_report_secrets
 
 
 def benchmark_lake(path):
@@ -151,6 +157,52 @@ def benchmark_lake(path):
 @pytest.fixture
 def lake(tmp_path):
     return benchmark_lake(tmp_path / "robot.lance")
+
+
+def _apply_live_enterprise_connection(
+    lake,
+    *,
+    kind="lancedb_remote_db",
+    uri="db://robotics-live",
+    host_override="https://phalanx.acme.internal",
+    region="us-west-2",
+    api_key="super-secret-live-api-key",
+    server_side_query=True,
+    blob_fetch_remote=True,
+):
+    """Simulate a lake already opened against a live Enterprise endpoint.
+
+    Mirrors the connection-spec-swap trick ``_fake_enterprise_lake`` and
+    ``enterprise_conformance._apply_case`` use: the lake keeps reading its real
+    local Lance tables, but the benchmark harness sees a live ``db://`` or
+    namespace connection report -- exactly what backlog 0125's live-mode
+    preflight and profile labeling need to prove, without a real remote server.
+    """
+    lake.connection_spec = LakeConnectionSpec(
+        kind=kind,
+        uri=uri,
+        display_uri=uri,
+        lancedb_connect_kwargs={
+            "region": region,
+            "host_override": host_override,
+            "api_key": api_key,
+        },
+        auth_refs={"remote": "enterprise-prod"},
+        direct_object_io_allowed=False,
+        capabilities=LakeCapabilities(
+            server_side_query=server_side_query,
+            direct_object_io=False,
+            namespace_resolution=kind != "lancedb_remote_db",
+            geneva_worker_specs=False,
+            blob_fetch_remote=blob_fetch_remote,
+        ),
+    )
+    # Lake.__init__ normally derives `.capabilities` from the connection spec it
+    # was opened with; swapping `.connection_spec` on an already-open lake must
+    # update `.capabilities` too, or the real capability resolver
+    # (training._lake_capabilities_dict) keeps reading the stale local-lake value.
+    lake.capabilities = lake.connection_spec.capabilities
+    return lake
 
 
 def test_benchmark_runs_lance_metrics_and_lerobot_comparison(lake, tmp_path):
@@ -286,6 +338,202 @@ def test_enterprise_remote_benchmark_reports_cache_phases_and_filter_change(
     assert webdataset["metrics"]["storage_footprint"]["details"][
         "materialized_bytes_written"
     ] > 0
+
+
+def test_live_enterprise_benchmark_records_live_profile_without_credentials(lake):
+    _apply_live_enterprise_connection(lake)
+
+    report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[ENTERPRISE_LANCE_FORMAT],
+        sample_limit=2,
+        random_access_samples=2,
+        seed=11,
+        enterprise_live=True,
+    )
+
+    enterprise = report["formats"][ENTERPRISE_LANCE_FORMAT]
+    assert enterprise["status"] == "completed"
+    endpoint = enterprise["remote_endpoint"]
+    assert endpoint["profile"] == LIVE_DB_PROFILE
+    assert endpoint["confidence"] == "production-calibrated"
+    assert endpoint["region"] == "us-west-2"
+    assert endpoint["host_override"] == "https://phalanx.acme.internal"
+    assert endpoint["software_versions"]["lancedb-robotics"]
+    assert {check["name"] for check in endpoint["capability_checks"]} >= {
+        "remote_scan",
+        "plan_executor_cache_metrics",
+        "page_cache_prewarm",
+    }
+    assert endpoint["degraded_capabilities"] == []
+    assert enterprise["confidence"] == "production-calibrated"
+    assert enterprise["degraded_phases"] == []
+
+    # Credential-shaped endpoint data must never reach the benchmark report,
+    # even though the live connection's connect kwargs carry a real-looking key.
+    serialized = json.dumps(report)
+    assert "super-secret-live-api-key" not in serialized
+    assert "api_key" not in json.dumps(endpoint)
+    assert scan_report_secrets(report) == []
+
+
+def test_live_enterprise_benchmark_namespace_connection_labels_profile(lake):
+    _apply_live_enterprise_connection(
+        lake,
+        kind="rest_namespace_lancedb",
+        uri="namespace://robotics-live",
+        host_override=None,
+    )
+
+    report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[ENTERPRISE_LANCE_FORMAT],
+        sample_limit=2,
+        random_access_samples=2,
+        enterprise_live=True,
+    )
+
+    endpoint = report["formats"][ENTERPRISE_LANCE_FORMAT]["remote_endpoint"]
+    assert endpoint["profile"] == LIVE_NAMESPACE_PROFILE
+    assert endpoint["confidence"] == "production-calibrated"
+
+
+def test_live_enterprise_benchmark_missing_cache_metrics_marks_phases_degraded(lake):
+    _apply_live_enterprise_connection(lake)
+    lake.enterprise_training_capabilities = {"plan_executor_cache_metrics": False}
+
+    report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[ENTERPRISE_LANCE_FORMAT],
+        sample_limit=2,
+        random_access_samples=2,
+        enterprise_live=True,
+    )
+
+    enterprise = report["formats"][ENTERPRISE_LANCE_FORMAT]
+    assert enterprise["status"] == "completed"
+    assert "plan_executor_cache_metrics" in enterprise["remote_endpoint"]["degraded_capabilities"]
+    assert set(enterprise["degraded_phases"]) == {"cold_cache", "prewarmed", "warm_second_epoch"}
+    cold = enterprise["phases"]["cold_cache"]
+    assert cold["status"] == "degraded"
+    assert cold["cache"]["hits"] is None
+    assert cold["cache"]["misses"] is None
+    assert "unavailable, not zero" in cold["degraded_reasons"][0]
+    storage = enterprise["metrics"]["storage_footprint"]["details"]
+    assert storage["cache_hits"] is None
+    assert storage["cache_misses"] is None
+
+
+def test_live_enterprise_benchmark_missing_prewarm_marks_prewarmed_phase_degraded(lake):
+    _apply_live_enterprise_connection(lake)
+    lake.enterprise_training_capabilities = {"page_cache_prewarm": False}
+
+    report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[ENTERPRISE_LANCE_FORMAT],
+        sample_limit=2,
+        random_access_samples=2,
+        enterprise_live=True,
+    )
+
+    enterprise = report["formats"][ENTERPRISE_LANCE_FORMAT]
+    assert "page_cache_prewarm" in enterprise["remote_endpoint"]["degraded_capabilities"]
+    assert enterprise["phases"]["prewarmed"]["status"] == "degraded"
+    assert "rejected or degraded" in enterprise["phases"]["prewarmed"]["degraded_reasons"][0]
+
+
+def test_live_enterprise_benchmark_without_server_side_query_is_skipped(lake):
+    _apply_live_enterprise_connection(lake, server_side_query=False)
+
+    report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[ENTERPRISE_LANCE_FORMAT],
+        enterprise_live=True,
+    )
+
+    enterprise = report["formats"][ENTERPRISE_LANCE_FORMAT]
+    assert enterprise["status"] == "skipped"
+    assert "remote_scan" in enterprise["skip_reason"]
+
+
+def test_enterprise_live_without_live_connection_raises_helpful_diagnostic(lake):
+    with pytest.raises(BenchmarkError, match="enterprise_live=True requires"):
+        run_benchmark_suite(
+            lake,
+            "bench-v1",
+            formats=[ENTERPRISE_LANCE_FORMAT],
+            enterprise_live=True,
+        )
+
+
+def test_enterprise_live_cannot_combine_with_fixture(lake):
+    with pytest.raises(BenchmarkError, match="cannot be combined with enterprise_fixture_uri"):
+        run_benchmark_suite(
+            lake,
+            "bench-v1",
+            formats=[ENTERPRISE_LANCE_FORMAT],
+            enterprise_fixture_uri="db://robotics-benchmark",
+            enterprise_live=True,
+        )
+
+
+def test_compare_enterprise_benchmark_results_labels_confidence(lake):
+    fake_report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[ENTERPRISE_LANCE_FORMAT],
+        sample_limit=2,
+        random_access_samples=2,
+        seed=5,
+        enterprise_fixture_uri="db://robotics-benchmark",
+    )
+
+    live_lake = benchmark_lake(Path(lake.uri).parent / "robot-live.lance")
+    _apply_live_enterprise_connection(live_lake)
+    live_report = run_benchmark_suite(
+        live_lake,
+        "bench-v1",
+        formats=[ENTERPRISE_LANCE_FORMAT],
+        sample_limit=2,
+        random_access_samples=2,
+        seed=5,
+        enterprise_live=True,
+    )
+
+    calibration = compare_enterprise_benchmark_results(fake_report, live_report)
+    assert calibration["fake_local"]["profile"] == FAKE_LOCAL_DB_PROFILE
+    assert calibration["fake_local"]["confidence"] == "sdk-contract-only"
+    assert calibration["live"]["profile"] == LIVE_DB_PROFILE
+    assert calibration["live"]["confidence"] == "production-calibrated"
+    assert set(calibration["metrics"]) == {
+        "query_to_first_batch_latency",
+        "shuffled_epoch_throughput",
+        "random_access_latency",
+    }
+    for metric in calibration["metrics"].values():
+        assert "absolute_delta" in metric
+        assert metric["fake_local_value"] is not None
+        assert metric["live_value"] is not None
+    assert any("sdk-contract-only" in note for note in calibration["notes"])
+
+
+def test_compare_enterprise_benchmark_results_rejects_two_fake_reports(lake):
+    fake_report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[ENTERPRISE_LANCE_FORMAT],
+        sample_limit=2,
+        random_access_samples=2,
+        enterprise_fixture_uri="db://robotics-benchmark",
+    )
+
+    with pytest.raises(BenchmarkError, match="live_report must use a live Enterprise profile"):
+        compare_enterprise_benchmark_results(fake_report, fake_report)
 
 
 def test_absent_optional_formats_are_visible(lake, monkeypatch):
