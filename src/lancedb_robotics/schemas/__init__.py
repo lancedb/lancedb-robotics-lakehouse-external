@@ -281,6 +281,32 @@ KEYFRAME_MAP_ARTIFACTS_SCHEMA = _schema(
     ],
 )
 
+KEYFRAME_MAP_ARTIFACT_REFERRERS_SCHEMA = _schema(
+    "keyframe_map_artifact_referrers",
+    "1",
+    [
+        pa.field("referrer_id", pa.string()),
+        pa.field("artifact_id", pa.string()),
+        pa.field("keyframe_map_ref", pa.string()),
+        pa.field("content_sha256", pa.string()),
+        pa.field("referrer_kind", pa.string()),
+        pa.field("referrer_table", pa.string()),
+        pa.field("referrer_table_version", pa.int64()),
+        pa.field("source_video_fingerprint", pa.string()),
+        pa.field("inspection_id", pa.string()),
+        pa.field("source_uri", pa.string()),
+        pa.field("source_path", pa.string()),
+        pa.field("encoding_id", pa.string()),
+        pa.field("video_id", pa.string()),
+        pa.field("run_id", pa.string()),
+        pa.field("episode_id", pa.string()),
+        pa.field("episode_index", pa.int64()),
+        pa.field("camera_key", pa.string()),
+        pa.field("transform_id", pa.string()),
+        _CREATED_AT,
+    ],
+)
+
 ATTACHMENTS_SCHEMA = _schema(
     "attachments",
     # Backlog 0016: MCAP attachment records (embedded files travelling with the
@@ -914,9 +940,15 @@ TRANSFORM_RUNS_SCHEMA = _schema(
 
 LEROBOT_INGEST_CHECKPOINTS_SCHEMA = _schema(
     "lerobot_ingest_checkpoints",
-    "1",
+    "2",
     [
         pa.field("checkpoint_id", pa.string()),
+        # CAS gate only (backlog 0379): set exactly once, by whichever caller
+        # wins the race to supersede this row, via an `update(where=...)`
+        # gated on this being NULL. A concurrent loser's update matches zero
+        # rows because the winner already flipped it -- see
+        # `_lerobot_claim_cas_supersede` in ingest.py. Not app-facing state.
+        pa.field("superseded_by_checkpoint_id", pa.string()),
         pa.field("job_id", pa.string()),
         pa.field("source_id", pa.string()),
         pa.field("run_id", pa.string()),
@@ -1439,6 +1471,7 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
     "videos": VIDEOS_SCHEMA,
     "video_encodings": VIDEO_ENCODINGS_SCHEMA,
     "keyframe_map_artifacts": KEYFRAME_MAP_ARTIFACTS_SCHEMA,
+    "keyframe_map_artifact_referrers": KEYFRAME_MAP_ARTIFACT_REFERRERS_SCHEMA,
     "attachments": ATTACHMENTS_SCHEMA,
     "events": EVENTS_SCHEMA,
     "scenarios": SCENARIOS_SCHEMA,

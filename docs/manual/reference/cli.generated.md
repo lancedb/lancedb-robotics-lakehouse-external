@@ -693,6 +693,10 @@ Encode camera videos with GOP/keyframe metadata.
 
 Inspect codec-aware video encoding rows.
 
+### `video keyframe-map-referrers`
+
+List videos/encodings that reference keyframe-map artifacts.
+
 ## `writeback`
 
 Import labels, model outputs, and feedback into the closed loop.

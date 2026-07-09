@@ -267,4 +267,5 @@ Convenience namespace exposed as ``lake.video``.
 - `video.conform_source(samples: 'Iterable[Mapping[str, Any]]' = (), *, decoder: 'str' = 'auto', fail_on_mismatch: 'bool' = False, created_by: 'str' = 'lancedb-robotics') -> 'VideoConformanceReport'`
 - `video.encode(*, video_id: 'str | None' = None, episode_id: 'str | None' = None, camera_key: 'str | None' = None, codec: 'str' = 'lrb-gop-zlib', gop_size: 'int' = 2, resolution: 'str | None' = None, fps: 'float | None' = None, nvdec_compatible: 'bool' = False, created_by: 'str' = 'lancedb-robotics') -> 'VideoEncodingReport'`
 - `video.encodings(*, video_id: 'str | None' = None) -> 'tuple[dict[str, Any], ...]'`
+- `video.keyframe_map_referrers(ref_or_artifact_id: 'str | None' = None) -> 'tuple[dict[str, Any], ...]'` — Return videos/encodings that reference keyframe-map artifact bodies.
 - `video.seek(episode: 'str | int | Any', frame: 'int', *, camera_key: 'str | None' = None, encoding_id: 'str | None' = None, decoder: 'str' = 'auto') -> 'VideoFrame'`

@@ -43,6 +43,7 @@ _SOURCE_TABLES = (
     "episodes",
     "videos",
     "video_encodings",
+    "keyframe_map_artifacts",
     "runs",
     "observations",
     "curation_views",

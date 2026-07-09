@@ -42,6 +42,7 @@ from lancedb_robotics.evidence import (
     _stable_sha256,
     is_supported_evidence_schema,
 )
+from lancedb_robotics.keyframe_maps import KeyframeMapError, keyframe_map_entries_for_encoding
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.video import VIDEO_ENCODING_BLOB_COLUMN
 
@@ -119,9 +120,7 @@ def build_replay_bundle(
             f"expected one of {SUPPORTED_EVIDENCE_PACK_SCHEMAS}"
         )
     if not include_mcap and not include_video:
-        raise EvidencePackError(
-            "nothing to export: enable include_mcap and/or include_video"
-        )
+        raise EvidencePackError("nothing to export: enable include_mcap and/or include_video")
 
     parent_digest = _stable_sha256(manifest)
     destination = Path(output_dir)
@@ -129,9 +128,7 @@ def build_replay_bundle(
     # Plan first so a bad source or limit fails before any byte is written.
     mcap_plan = _plan_mcap_slices(manifest) if include_mcap else []
     video_plan = (
-        _plan_video_clips(lake, manifest, include_gops=include_gops)
-        if include_video
-        else []
+        _plan_video_clips(lake, manifest, include_gops=include_gops) if include_video else []
     )
     if not mcap_plan and not video_plan:
         raise EvidencePackError(
@@ -369,6 +366,7 @@ def _plan_video_clips(
     if not refs:
         return []
     table_version = _table_version(manifest, "video_encodings")
+    artifact_table_version = _table_version(manifest, "keyframe_map_artifacts")
     encoding_ids = [ref["encoding_id"] for ref in refs if ref.get("encoding_id")]
     rows = _encoding_rows(lake, encoding_ids, table_version)
     blobs = _fetch_encoding_blobs(lake, encoding_ids, table_version)
@@ -379,10 +377,18 @@ def _plan_video_clips(
         row = rows.get(str(encoding_id))
         blob = blobs.get(str(encoding_id))
         if row is None or not blob:
-            raise EvidencePackError(
-                f"missing source bytes for video encoding {encoding_id!r}"
+            raise EvidencePackError(f"missing source bytes for video encoding {encoding_id!r}")
+        ref_artifact_version = _keyframe_map_artifact_version(ref, artifact_table_version)
+        try:
+            keyframe_map = keyframe_map_entries_for_encoding(
+                lake,
+                row,
+                artifact_table_version=ref_artifact_version,
             )
-        keyframe_map = json.loads(row.get("keyframe_map_json") or "[]")
+        except (KeyframeMapError, json.JSONDecodeError) as exc:
+            raise EvidencePackError(
+                f"cannot resolve keyframe map for video encoding {encoding_id!r}: {exc}"
+            ) from exc
         gops = _plan_gops(keyframe_map, blob, encoding_id) if include_gops else []
         plans.append(
             {
@@ -392,6 +398,8 @@ def _plan_video_clips(
                 "gop_size": row.get("gop_size"),
                 "frame_count": row.get("frame_count"),
                 "table_version": table_version,
+                "keyframe_map_ref": row.get("keyframe_map_ref"),
+                "keyframe_map_artifact_table_version": ref_artifact_version,
                 "blob": blob,
                 "gops": gops,
                 "planned_bytes": len(blob) + sum(len(item["bytes"]) for item in gops),
@@ -480,6 +488,8 @@ def _write_video_clip(
         "frame_count": plan["frame_count"],
         "table_version": plan["table_version"],
         "column": VIDEO_ENCODING_BLOB_COLUMN,
+        "keyframe_map_ref": plan.get("keyframe_map_ref"),
+        "keyframe_map_artifact_table_version": plan.get("keyframe_map_artifact_table_version"),
         "clip": {
             "path": clip_record["path"],
             "bytes": clip_record["bytes"],
@@ -502,11 +512,7 @@ def _encoding_rows(
     if table_version is not None:
         table.checkout(int(table_version))
     try:
-        columns = [
-            name
-            for name in table.schema.names
-            if name != VIDEO_ENCODING_BLOB_COLUMN
-        ]
+        columns = [name for name in table.schema.names if name != VIDEO_ENCODING_BLOB_COLUMN]
         rows = table.to_lance().to_table(columns=columns).to_pylist()
     finally:
         if table_version is not None:
@@ -601,6 +607,18 @@ def _table_version(manifest: Mapping[str, Any], table_name: str) -> int | None:
     for row in manifest.get("table_versions") or []:
         if row.get("table") == table_name and row.get("version") is not None:
             return int(row["version"])
+    return None
+
+
+def _keyframe_map_artifact_version(
+    ref: Mapping[str, Any],
+    manifest_table_version: int | None,
+) -> int | None:
+    value = ref.get("keyframe_map_artifact_table_version")
+    if value is not None:
+        return int(value)
+    if ref.get("keyframe_map_storage") == "artifact":
+        return manifest_table_version
     return None
 
 

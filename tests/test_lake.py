@@ -59,6 +59,7 @@ def test_init_adds_post_v0_tables_to_existing_lake(lake_path):
             "evaluation_runs",
             "lineage_delivery_attempts",
             "lineage_audit_reports",
+            "keyframe_map_artifact_referrers",
         }:
             db.create_table(name, schema=schema, exist_ok=True)
 
@@ -78,6 +79,7 @@ def test_init_adds_post_v0_tables_to_existing_lake(lake_path):
     assert lake.table("evaluation_runs").count_rows() == 0
     assert lake.table("lineage_delivery_attempts").count_rows() == 0
     assert lake.table("lineage_audit_reports").count_rows() == 0
+    assert lake.table("keyframe_map_artifact_referrers").count_rows() == 0
 
 
 def test_schema_versions_inspectable_after_reopen(lake_path):

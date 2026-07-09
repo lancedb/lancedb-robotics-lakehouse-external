@@ -5,6 +5,7 @@ import struct
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -837,7 +838,8 @@ def test_ingest_lerobot_offloads_large_keyframe_maps_and_seek_resolves(tmp_path)
     _write_tiny_mp4(first_video, samples, keyframes=[0])
     _write_tiny_mp4(second_video, samples, keyframes=[0])
 
-    lake = Lake.init(tmp_path / "lake")
+    lake_path = tmp_path / "lake"
+    lake = Lake.init(lake_path)
     report = ingest_lerobot(
         lake,
         source,
@@ -848,6 +850,7 @@ def test_ingest_lerobot_offloads_large_keyframe_maps_and_seek_resolves(tmp_path)
     )
 
     assert report.rows_added["keyframe_map_artifacts"] == 1
+    assert report.rows_added["keyframe_map_artifact_referrers"] == 2
     encodings = sorted(
         lake.table("video_encodings").to_arrow().to_pylist(),
         key=lambda row: row["episode_index"],
@@ -864,6 +867,41 @@ def test_ingest_lerobot_offloads_large_keyframe_maps_and_seek_resolves(tmp_path)
     assert artifact["json_size_bytes"] > 1
     assert artifact["frame_count"] == 2
     assert read_mp4_frame_sample(first_video, artifact["keyframe_map_json"], 1) == b"front-frame-1"
+
+    referrers = sorted(
+        lake.table("keyframe_map_artifact_referrers").to_arrow().to_pylist(),
+        key=lambda row: row["episode_index"],
+    )
+    assert len(referrers) == 2
+    assert len({row["referrer_id"] for row in referrers}) == 2
+    assert all(row["artifact_id"] == artifact["artifact_id"] for row in referrers)
+    assert [row["encoding_id"] for row in referrers] == [row["encoding_id"] for row in encodings]
+    assert [row["video_id"] for row in referrers] == [row["video_id"] for row in encodings]
+    assert all(row["referrer_table"] == "video_encodings" for row in referrers)
+    assert all(row["referrer_table_version"] >= 1 for row in referrers)
+    assert [row["camera_key"] for row in referrers] == ["front", "front"]
+
+    api_referrers = lake.video.keyframe_map_referrers(artifact["artifact_id"])
+    assert [row["referrer_id"] for row in api_referrers] == [
+        row["referrer_id"] for row in referrers
+    ]
+    cli = runner.invoke(
+        app,
+        [
+            "video",
+            "keyframe-map-referrers",
+            "--lake",
+            str(lake_path),
+            "--artifact",
+            artifact["artifact_id"],
+            "--format",
+            "json",
+        ],
+    )
+    assert cli.exit_code == 0, cli.output
+    assert [row["referrer_id"] for row in json.loads(cli.output)["referrers"]] == [
+        row["referrer_id"] for row in referrers
+    ]
 
     decoded = lake.video.seek(encodings[0]["episode_id"], 1, camera_key="front")
     assert decoded.frame == b"front-frame-1"
@@ -882,6 +920,18 @@ def test_ingest_lerobot_offloads_large_keyframe_maps_and_seek_resolves(tmp_path)
         progress = json.loads(checkpoint["progress_json"])
         media_progress = _require_media_inspection(progress)
         assert all(not row.get("keyframe_map") for row in media_progress["videos"])
+
+    second = ingest_lerobot(
+        lake,
+        source,
+        compact=False,
+        prune_versions=False,
+        index_predicates=False,
+        keyframe_map_inline_threshold_bytes=1,
+    )
+    assert second.already_ingested is True
+    assert lake.table("keyframe_map_artifacts").count_rows() == 1
+    assert lake.table("keyframe_map_artifact_referrers").count_rows() == 2
 
 
 def test_lerobot_object_store_inspect_preserves_uris_and_etag_fingerprints(tmp_path, monkeypatch):
@@ -2753,6 +2803,42 @@ def test_lerobot_checkpoint_retention_plan_projects_synthetic_scale():
     }
 
 
+def test_lerobot_claim_recovery_chaos_rehearsal_detects_broken_cas(monkeypatch):
+    """The rehearsal must actually exercise the real CAS code, not model it.
+
+    Directly closes the original audit finding: the old simulator hardcoded
+    duplicate_rows to zero and never called the real recovery/CAS path, so
+    it could not have caught this even if the guard were completely
+    missing. Here we monkeypatch the CAS guard itself to a no-op (every
+    racer believes it won), and confirm checkpoint_duplicate_rows/`passed`
+    actually detect the resulting duplication. If the rehearsal didn't call
+    the real code, this monkeypatch would have no effect and the assertion
+    below would wrongly fail to catch it -- proving the wiring is real.
+    """
+    import lancedb_robotics.ingest as ingest_module
+
+    monkeypatch.setattr(
+        ingest_module,
+        "_lerobot_claim_cas_supersede",
+        lambda *args, **kwargs: None,  # every racer believes it won the race
+    )
+
+    report = simulate_lerobot_claim_recovery_chaos(
+        synthetic_sources=1,
+        synthetic_running_jobs_per_source=1,
+        synthetic_stale_running_fraction=1.0,
+        retry_owner_count=4,
+        seed=1,
+    )
+
+    recovery_points = [c for c in report.crash_points if c.recovery_required]
+    assert recovery_points
+    assert all(c.checkpoint_duplicate_rows == 3 for c in recovery_points)
+    assert all(c.accepted_recoveries == 4 for c in recovery_points)
+    assert all(c.cas_conflicts == 0 for c in recovery_points)
+    assert report.passed is False
+
+
 def test_lerobot_claim_recovery_simulator_is_deterministic_and_checks_duplicates():
     now = datetime(2026, 1, 15, 12, tzinfo=UTC)
 
@@ -3211,6 +3297,162 @@ def test_ingest_lerobot_claim_cas_rejects_stale_retry_observation(tmp_path):
     assert recovered.recovery_checkpoint_id in message
     assert "claim precondition failed" in message
     assert lake.table("lerobot_ingest_checkpoints").count_rows() == rows_after_recovery
+
+
+def test_lerobot_claim_recovery_cas_true_concurrent_race_has_single_winner(tmp_path, monkeypatch):
+    """Two operators race to recover the SAME claim with no explicit expected_*.
+
+    This is the scenario backlog 0379 names directly: "two operators or
+    automation loops... observe the same stale latest row and attempt
+    recovery." Neither caller supplies expected_latest_* (there is nothing
+    stale to compare against -- both are acting on a fresh, correct read),
+    so this exercises the CAS-supersede guard itself, not the older
+    explicit-precondition check covered above. A ``threading.Barrier``
+    forces both callers' underlying ``table.update(...)`` calls to execute
+    at the same instant rather than merely close together in wall-clock
+    time, verified separately to reliably yield exactly one winner (see the
+    0379 decision record).
+    """
+    import lancedb_robotics.ingest as ingest_module
+
+    source = _streaming_lerobot_fixture(tmp_path / "lerobot-recovery-race")
+    lake = Lake.init(tmp_path / "lake")
+    recovery_time = datetime(2026, 1, 15, 12, tzinfo=UTC)
+    job_id = _seed_lerobot_running_claim(
+        lake,
+        source,
+        job_id="job-recovery-race",
+        updated_at=recovery_time - timedelta(hours=2),
+        claim_expires_at=recovery_time - timedelta(minutes=30),
+        claim_token="token-recovery-race",
+    )
+
+    real_supersede = ingest_module._lerobot_claim_cas_supersede
+    barrier = threading.Barrier(2)
+
+    def synchronized_supersede(*args, **kwargs):
+        barrier.wait()
+        return real_supersede(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "_lerobot_claim_cas_supersede", synchronized_supersede)
+
+    results: dict[str, tuple[str, object]] = {}
+
+    def racer(owner: str) -> None:
+        try:
+            report = recover_lerobot_ingest_claim(
+                lake,
+                job_id,
+                action="steal",
+                new_owner=owner,
+                stale_after=timedelta(minutes=15),
+                now=recovery_time,
+            )
+            results[owner] = ("ok", report)
+        except LeRobotClaimPreconditionError as exc:
+            results[owner] = ("error", exc)
+
+    threads = [
+        threading.Thread(target=racer, args=(owner,)) for owner in ("operator-a", "operator-b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    outcomes = [status for status, _ in results.values()]
+    assert outcomes.count("ok") == 1, results
+    assert outcomes.count("error") == 1, results
+
+    # The loser's diagnostic names the winner's actual checkpoint, not a
+    # generic failure -- matching the backlog's "explain which newer
+    # checkpoint won the race" requirement.
+    winner_owner = next(owner for owner, (status, _) in results.items() if status == "ok")
+    loser_owner = next(owner for owner, (status, _) in results.items() if status == "error")
+    winning_report = results[winner_owner][1]
+    losing_error = results[loser_owner][1]
+    assert winning_report.recovery_checkpoint_id in str(losing_error)
+
+    # Exactly one recovery checkpoint landed -- not two, not zero.
+    history = get_lerobot_ingest_job(lake, job_id)["history"]
+    recovery_rows = [row for row in history if row["phase"] in ("claim-abandoned", "claim-stolen")]
+    assert len(recovery_rows) == 1
+    assert recovery_rows[0]["claim_owner"] == winner_owner
+
+
+def test_lerobot_claim_cas_supersede_rejects_second_writer_deterministically(tmp_path):
+    """Direct, repeated stress of the CAS primitive itself (not the full recovery flow).
+
+    ``_lerobot_claim_cas_supersede`` is the load-bearing guard behind both the
+    recovery and initial-claim paths. Run the actual race many times (not
+    once) so a test that only got lucky on one interleaving would still be
+    caught -- every trial must produce exactly one winner and zero duplicate
+    rows, never both-succeed (the failure mode a plain ``.add()`` or an
+    insert-only ``merge_insert`` both have, verified directly in the 0379
+    decision record).
+    """
+    from lancedb_robotics.ingest import LeRobotClaimPreconditionError as CasError
+    from lancedb_robotics.ingest import _lerobot_claim_cas_supersede
+
+    def racer(
+        owner: str, lake: Lake, job_id: str, barrier: threading.Barrier, outcomes: dict[str, str]
+    ) -> None:
+        barrier.wait()
+        try:
+            _lerobot_claim_cas_supersede(
+                lake,
+                job_id=job_id,
+                prior_checkpoint_id=f"{job_id}:00000000",
+                prior_claim_token="prior-token",
+                new_checkpoint_id=f"{job_id}:{owner}",
+                operation="recover",
+            )
+            outcomes[owner] = "ok"
+        except CasError:
+            outcomes[owner] = "error"
+
+    for trial in range(20):
+        lake = Lake.init(tmp_path / f"lake-cas-stress-{trial}")
+        job_id = f"job-cas-stress-{trial}"
+        row = {
+            "checkpoint_id": f"{job_id}:00000000",
+            "job_id": job_id,
+            "claim_token": "prior-token",
+            "checkpoint_index": 0,
+            "status": "running",
+            "phase": "claimed",
+            "claim_owner": "seed",
+            "created_by": "seed",
+            "started_at": datetime(2026, 1, 1, tzinfo=UTC),
+            "updated_at": datetime(2026, 1, 1, tzinfo=UTC),
+            "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        }
+        lake.table("lerobot_ingest_checkpoints").add(
+            pa.Table.from_pylist([row], schema=LEROBOT_INGEST_CHECKPOINTS_SCHEMA)
+        )
+
+        barrier = threading.Barrier(2)
+        outcomes: dict[str, str] = {}
+        threads = [
+            threading.Thread(target=racer, args=(o, lake, job_id, barrier, outcomes))
+            for o in ("A", "B")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert sorted(outcomes.values()) == ["error", "ok"], (trial, outcomes)
+        winning_rows = [
+            r
+            for r in lake.table("lerobot_ingest_checkpoints").to_arrow().to_pylist()
+            if r["checkpoint_id"] == f"{job_id}:00000000"
+        ]
+        assert len(winning_rows) == 1
+        assert winning_rows[0]["superseded_by_checkpoint_id"] in {
+            f"job-cas-stress-{trial}:A",
+            f"job-cas-stress-{trial}:B",
+        }
 
 
 def test_ingest_lerobot_failed_checkpoint_can_resume_without_duplicates(tmp_path, monkeypatch):

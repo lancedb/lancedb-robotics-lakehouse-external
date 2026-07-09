@@ -30,6 +30,9 @@ import inspect as inspect_module
 import json
 import math
 import shlex
+import shutil
+import tempfile
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -42,6 +45,7 @@ from lancedb_robotics.adapters import AdapterError, CorruptMcapError, get_adapte
 from lancedb_robotics.extract import LAYOUT_VERSION, extract
 from lancedb_robotics.keyframe_maps import (
     KeyframeMapError,
+    keyframe_map_artifact_referrer_row,
     keyframe_map_artifact_row,
     keyframe_map_entries_from_json,
     keyframe_map_ref,
@@ -73,6 +77,7 @@ from lancedb_robotics.schemas import (
     EPISODES_SCHEMA,
     EVENTS_SCHEMA,
     INTEGRATION_SOURCES_SCHEMA,
+    KEYFRAME_MAP_ARTIFACT_REFERRERS_SCHEMA,
     KEYFRAME_MAP_ARTIFACTS_SCHEMA,
     LEROBOT_CHECKPOINT_HOLDS_SCHEMA,
     LEROBOT_INGEST_CHECKPOINTS_SCHEMA,
@@ -536,6 +541,14 @@ def recover_lerobot_ingest_claim(
         "previous_owner": previous_owner,
         "previous_token": previous_token,
     }
+    _lerobot_claim_cas_supersede(
+        lake,
+        job_id=job_id,
+        prior_checkpoint_id=str(latest.get("checkpoint_id") or ""),
+        prior_claim_token=previous_token,
+        new_checkpoint_id=recovery_checkpoint_id,
+        operation="recover",
+    )
     _append_lerobot_recovery_checkpoint(
         lake,
         latest,
@@ -914,12 +927,29 @@ class LeRobotClaimRecoveryChaosCrashReport:
     rows_skipped_existing: int
     accepted_recoveries: int
     cas_conflicts: int
+    checkpoint_duplicate_rows: int
     duplicate_rows: dict[str, int]
     protections: dict[str, str]
 
     @property
     def passed(self) -> bool:
-        return all(int(count) == 0 for count in self.duplicate_rows.values())
+        """True only if BOTH axes are clean.
+
+        ``duplicate_rows`` (observations/episodes/videos/events/runs/
+        transform_runs) describes structural idempotency protections
+        (deterministic ids, merge_insert) that are exercised by real
+        end-to-end tests elsewhere (e.g.
+        ``test_ingest_lerobot_failed_checkpoint_can_resume_without_duplicates``),
+        not by this simulation call -- it is a claim about existing
+        production code, not something re-verified per invocation.
+        ``checkpoint_duplicate_rows`` is different: it is the REAL measured
+        outcome of racing ``retry_owner_count`` concurrent recovery attempts
+        against a real scratch lake (see
+        ``_lerobot_claim_chaos_real_rehearsal``), not a model.
+        """
+        return self.checkpoint_duplicate_rows == 0 and all(
+            int(count) == 0 for count in self.duplicate_rows.values()
+        )
 
     def to_params(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -1976,12 +2006,23 @@ def simulate_lerobot_claim_recovery_chaos(
 ) -> LeRobotClaimRecoveryChaosReport:
     """Simulate LeRobot stale-claim recovery behavior without mutating a lake.
 
-    The simulator is intentionally deterministic. It models the durable
-    checkpoint timeline and the idempotent retry contracts that real LeRobot
-    ingest uses: observations are skipped by deterministic ``observation_id`` and
-    metadata tables are upserted by canonical ids. Pass a lake for observed
-    checkpoint rows, pass ``checkpoint_rows`` for an offline export, or pass
-    ``synthetic_sources`` plus synthetic counts before a large backfill exists.
+    The workload/watchdog/retention modeling is deterministic. It models the
+    durable checkpoint timeline and the idempotent retry contracts that real
+    LeRobot ingest uses: observations are skipped by deterministic
+    ``observation_id`` and metadata tables are upserted by canonical ids. Pass
+    a lake for observed checkpoint rows, pass ``checkpoint_rows`` for an
+    offline export, or pass ``synthetic_sources`` plus synthetic counts before
+    a large backfill exists.
+
+    The CAS-race outcome is different: rather than modeling it, each call
+    actually races ``retry_owner_count`` concurrent recovery attempts against
+    a disposable scratch lake (never your ``lake``/``checkpoint_rows``/
+    ``synthetic_sources`` input -- see ``_lerobot_claim_chaos_real_rehearsal``)
+    and reports the real measured outcome. Exactly one winner and zero
+    checkpoint duplicates has been verified reliably across many trials, but
+    it is a property of the real CAS guard under real execution, not a
+    mathematical guarantee restated here -- a report can, in principle,
+    surface a duplicate if it ever happens.
     """
 
     input_count = sum(
@@ -2104,6 +2145,7 @@ def simulate_lerobot_claim_recovery_chaos(
         stale_after=stale_delta,
         heartbeat=heartbeat_delta,
         remote_latency_ms=normalized_latency_ms,
+        seed=int(seed),
     )
     recovery = _lerobot_claim_chaos_recovery_summary(
         watchdog,
@@ -2411,6 +2453,90 @@ def _lerobot_claim_chaos_from_synthetic(
     return workload, watchdog
 
 
+def _lerobot_claim_chaos_real_rehearsal(
+    *, retry_owner_count: int, seed: int
+) -> dict[str, int]:
+    """Race real concurrent recovery attempts against a scratch lake.
+
+    Verifies the backlog-0379 CAS guard by actually running it rather than
+    modeling it: creates a throwaway lake (never the caller's real
+    lake/checkpoint_rows/synthetic inputs -- this function's only inputs are
+    ``retry_owner_count`` and ``seed``), seeds one running claim, and starts
+    ``retry_owner_count`` threads racing ``recover_lerobot_ingest_claim``
+    against it behind a barrier that forces them to hit the underlying CAS
+    ``update(...)`` at the same instant. A plain append, or an insert-only
+    ``merge_insert``, can silently let more than one racer "win" under a
+    genuinely simultaneous race -- verified directly, see the 0379 decision
+    record -- so this reports the REAL observed outcome instead of assuming
+    exactly one winner.
+    """
+    scratch_root = Path(tempfile.mkdtemp(prefix="lerobot-claim-chaos-rehearsal-"))
+    try:
+        lake = Lake.init(scratch_root / "lake")
+        job_id = f"rehearsal-{seed}"
+        seeded_at = datetime(2026, 1, 1, tzinfo=UTC)
+        seed_row = {
+            "checkpoint_id": f"{job_id}:00000000",
+            "job_id": job_id,
+            "claim_token": "rehearsal-token",
+            "checkpoint_index": 0,
+            "status": "running",
+            "phase": "claimed",
+            "claim_owner": "rehearsal-seed",
+            "created_by": "rehearsal-seed",
+            "started_at": seeded_at,
+            "updated_at": seeded_at - timedelta(hours=1),
+            "created_at": seeded_at,
+        }
+        lake.table(_LEROBOT_CHECKPOINT_TABLE).add(
+            pa.Table.from_pylist([seed_row], schema=LEROBOT_INGEST_CHECKPOINTS_SCHEMA)
+        )
+
+        barrier = threading.Barrier(retry_owner_count)
+        outcomes: list[str] = []
+        outcomes_lock = threading.Lock()
+
+        def racer(owner: str) -> None:
+            barrier.wait()
+            try:
+                recover_lerobot_ingest_claim(
+                    lake,
+                    job_id,
+                    action="steal",
+                    new_owner=owner,
+                    stale_after=timedelta(seconds=1),
+                    now=seeded_at + timedelta(hours=2),
+                )
+                outcome = "accepted"
+            except LeRobotClaimPreconditionError:
+                outcome = "conflict"
+            with outcomes_lock:
+                outcomes.append(outcome)
+
+        threads = [
+            threading.Thread(target=racer, args=(f"rehearsal-owner-{i}",))
+            for i in range(retry_owner_count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        recovery_rows = [
+            candidate
+            for candidate in _lerobot_checkpoint_rows(lake)
+            if candidate.get("job_id") == job_id
+            and candidate.get("phase") in ("claim-abandoned", "claim-stolen")
+        ]
+        return {
+            "accepted_recoveries": outcomes.count("accepted"),
+            "cas_conflicts": outcomes.count("conflict"),
+            "checkpoint_duplicate_rows": max(0, len(recovery_rows) - 1),
+        }
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
+
+
 def _lerobot_claim_chaos_crash_points(
     *,
     frame_count: int,
@@ -2421,7 +2547,15 @@ def _lerobot_claim_chaos_crash_points(
     stale_after: timedelta,
     heartbeat: timedelta,
     remote_latency_ms: float,
+    seed: int,
 ) -> tuple[LeRobotClaimRecoveryChaosCrashReport, ...]:
+    # One real rehearsal covers every recovery-required crash point below: the
+    # race itself (retry_owner_count concurrent recoverers) doesn't depend on
+    # frame/episode/camera/batch counts, only on retry_owner_count, which is
+    # fixed for this call.
+    rehearsal = _lerobot_claim_chaos_real_rehearsal(
+        retry_owner_count=retry_owner_count, seed=seed
+    )
     frame_batches = max(1, (frame_count + batch_size - 1) // batch_size)
     partial_batches = max(1, frame_batches // 2)
     partial_frames = min(frame_count, partial_batches * batch_size)
@@ -2500,8 +2634,11 @@ def _lerobot_claim_chaos_crash_points(
                 observations_replayed=frame_count,
                 observations_written_after_retry=frame_count - observations_before_retry,
                 rows_skipped_existing=observations_before_retry,
-                accepted_recoveries=1 if recovery_required else 0,
-                cas_conflicts=max(0, retry_owner_count - 1) if recovery_required else 0,
+                accepted_recoveries=rehearsal["accepted_recoveries"] if recovery_required else 0,
+                cas_conflicts=rehearsal["cas_conflicts"] if recovery_required else 0,
+                checkpoint_duplicate_rows=(
+                    rehearsal["checkpoint_duplicate_rows"] if recovery_required else 0
+                ),
                 duplicate_rows=dict(duplicate_rows),
                 protections=dict(protections),
             )
@@ -3603,6 +3740,14 @@ def ingest_lerobot(
                 list(keyframe_map_plan["rows"]),
                 KEYFRAME_MAP_ARTIFACTS_SCHEMA,
             )
+        if keyframe_map_plan["referrers"]:
+            _upsert_lerobot_rows(
+                lake,
+                "keyframe_map_artifact_referrers",
+                "referrer_id",
+                _lerobot_keyframe_map_referrers_for_write(lake, keyframe_map_plan),
+                KEYFRAME_MAP_ARTIFACT_REFERRERS_SCHEMA,
+            )
         _record_lerobot_completed_checkpoint_if_needed(
             lake,
             dataset=dataset,
@@ -3674,15 +3819,30 @@ def ingest_lerobot(
         threshold_frames=keyframe_map_threshold_frames,
     )
     progress["keyframe_map_artifacts"] = _lerobot_keyframe_map_artifact_progress(keyframe_map_plan)
+    latest_before_claim = _latest_lerobot_ingest_job(lake, job_id)
     _assert_lerobot_claim_precondition(
         job_id,
-        _latest_lerobot_ingest_job(lake, job_id),
+        latest_before_claim,
         operation="claim",
         lake_uri=lake.uri,
         expected_latest_checkpoint_id=expected_latest_checkpoint_id,
         expected_latest_claim_token=expected_latest_claim_token,
         expected_checkpoint_index=expected_checkpoint_index,
     )
+    claim_checkpoint_id = f"{job_id}:{int(checkpoint_index):08d}"
+    if latest_before_claim is not None:
+        # An existing row to CAS against (retrying/re-claiming a job that has
+        # been ingested before -- e.g. after a prior abandon/steal). The very
+        # first claim on a brand-new job_id has no prior row to gate on; see
+        # the bootstrap path in ``_record_lerobot_ingest_checkpoint`` below.
+        _lerobot_claim_cas_supersede(
+            lake,
+            job_id=job_id,
+            prior_checkpoint_id=str(latest_before_claim.get("checkpoint_id") or ""),
+            prior_claim_token=latest_before_claim.get("claim_token"),
+            new_checkpoint_id=claim_checkpoint_id,
+            operation="claim",
+        )
     _record_lerobot_ingest_checkpoint(
         lake,
         dataset=dataset,
@@ -3699,6 +3859,7 @@ def ingest_lerobot(
         claim_owner=owner,
         source_arg=source,
         claim_token=claim_token,
+        enforce_bootstrap_cas=latest_before_claim is None,
     )
     checkpoint_index += 1
 
@@ -3883,6 +4044,9 @@ def ingest_lerobot(
     progress["rows_written"]["videos"] = len(video_rows)
     progress["rows_written"]["video_encodings"] = len(encoding_rows)
     progress["rows_written"]["keyframe_map_artifacts"] = len(keyframe_map_plan["rows"])
+    progress["rows_written"]["keyframe_map_artifact_referrers"] = len(
+        keyframe_map_plan["referrers"]
+    )
     progress["video_diagnostics"] = _lerobot_video_diagnostics(dataset.video_files)
     progress["keyframe_map_artifacts"] = _lerobot_keyframe_map_artifact_progress(keyframe_map_plan)
     progress["media_inspection"] = _lerobot_sanitized_media_inspection(
@@ -4006,6 +4170,8 @@ def ingest_lerobot(
         output_tables.append("video_encodings")
     if keyframe_map_plan["rows"]:
         output_tables.append("keyframe_map_artifacts")
+    if keyframe_map_plan["referrers"]:
+        output_tables.append("keyframe_map_artifact_referrers")
 
     ingest_finished = datetime.now(UTC)
     unmapped_feature_keys = sorted(
@@ -4099,6 +4265,13 @@ def ingest_lerobot(
             list(keyframe_map_plan["rows"]),
             KEYFRAME_MAP_ARTIFACTS_SCHEMA,
         )
+        _upsert_lerobot_rows(
+            lake,
+            "keyframe_map_artifact_referrers",
+            "referrer_id",
+            _lerobot_keyframe_map_referrers_for_write(lake, keyframe_map_plan),
+            KEYFRAME_MAP_ARTIFACT_REFERRERS_SCHEMA,
+        )
         _upsert_lerobot_rows(lake, "events", "event_id", event_rows, EVENTS_SCHEMA)
         _upsert_lerobot_rows(
             lake,
@@ -4173,6 +4346,7 @@ def ingest_lerobot(
             "videos": len(video_rows),
             "video_encodings": len(encoding_rows),
             "keyframe_map_artifacts": len(keyframe_map_plan["rows"]),
+            "keyframe_map_artifact_referrers": len(keyframe_map_plan["referrers"]),
             "events": len(event_rows),
             "transform_runs": len(transform_rows),
         },
@@ -4866,6 +5040,7 @@ def _empty_lerobot_keyframe_map_offload_plan(
 ) -> dict[str, Any]:
     return {
         "rows": [],
+        "referrers": [],
         "by_video": {},
         "threshold_bytes": threshold_bytes,
         "threshold_frames": threshold_frames,
@@ -4878,6 +5053,7 @@ def _empty_lerobot_keyframe_map_progress() -> dict[str, Any]:
         "inline_threshold_frames": None,
         "offloaded_video_count": 0,
         "artifact_count": 0,
+        "referrer_count": 0,
         "artifacts": [],
     }
 
@@ -4892,6 +5068,7 @@ def _lerobot_keyframe_map_offload_plan(
     threshold_frames: int | None,
 ) -> dict[str, Any]:
     rows_by_artifact: dict[str, dict[str, Any]] = {}
+    referrers_by_id: dict[str, dict[str, Any]] = {}
     by_video: dict[tuple[int, str], dict[str, Any]] = {}
     for video in dataset.video_files:
         keyframe_json = _lerobot_keyframe_map_json(video)
@@ -4920,18 +5097,29 @@ def _lerobot_keyframe_map_offload_plan(
             transform_id=transform_id,
             created_at=created_at,
         )
-        rows_by_artifact[str(artifact["artifact_id"])] = artifact
-        by_video[(episode_index, camera_key)] = _lerobot_keyframe_map_artifact_summary(artifact)
+        rows_by_artifact.setdefault(str(artifact["artifact_id"]), artifact)
+        referrer = keyframe_map_artifact_referrer_row(artifact)
+        referrers_by_id[str(referrer["referrer_id"])] = referrer
+        by_video[(episode_index, camera_key)] = _lerobot_keyframe_map_artifact_summary(
+            artifact,
+            referrer=referrer,
+        )
     return {
         "rows": list(rows_by_artifact.values()),
+        "referrers": list(referrers_by_id.values()),
         "by_video": by_video,
         "threshold_bytes": threshold_bytes,
         "threshold_frames": threshold_frames,
     }
 
 
-def _lerobot_keyframe_map_artifact_summary(row: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _lerobot_keyframe_map_artifact_summary(
+    row: dict[str, Any],
+    *,
+    referrer: dict[str, Any] | None = None,
+    referrer_count: int | None = None,
+) -> dict[str, Any]:
+    summary = {
         "keyframe_map_inline": False,
         "keyframe_map_ref": row["keyframe_map_ref"],
         "keyframe_map_artifact_id": row["artifact_id"],
@@ -4945,20 +5133,48 @@ def _lerobot_keyframe_map_artifact_summary(row: dict[str, Any]) -> dict[str, Any
         "episode_index": row.get("episode_index"),
         "camera_key": row.get("camera_key"),
     }
+    if referrer is not None:
+        summary["keyframe_map_referrer_id"] = referrer.get("referrer_id")
+    if referrer_count is not None:
+        summary["keyframe_map_referrer_count"] = referrer_count
+    return summary
 
 
 def _lerobot_keyframe_map_artifact_progress(plan: dict[str, Any]) -> dict[str, Any]:
     rows = [dict(row) for row in plan.get("rows") or []]
+    referrers = [dict(row) for row in plan.get("referrers") or []]
+    referrer_counts: dict[str, int] = {}
+    for referrer in referrers:
+        artifact_id = str(referrer.get("artifact_id") or "")
+        if artifact_id:
+            referrer_counts[artifact_id] = referrer_counts.get(artifact_id, 0) + 1
     return {
         "inline_threshold_bytes": plan.get("threshold_bytes"),
         "inline_threshold_frames": plan.get("threshold_frames"),
         "offloaded_video_count": len(plan.get("by_video") or {}),
         "artifact_count": len(rows),
+        "referrer_count": len(referrers),
         "artifacts": [
-            _lerobot_keyframe_map_artifact_summary(row)
+            _lerobot_keyframe_map_artifact_summary(
+                row,
+                referrer_count=referrer_counts.get(str(row.get("artifact_id") or ""), 0),
+            )
             for row in sorted(rows, key=lambda item: str(item.get("artifact_id") or ""))
         ],
     }
+
+
+def _lerobot_keyframe_map_referrers_for_write(
+    lake: Lake,
+    plan: dict[str, Any],
+) -> list[dict[str, Any]]:
+    referrers = [dict(row) for row in plan.get("referrers") or []]
+    if not referrers:
+        return []
+    table_version = int(lake.table("video_encodings").version)
+    for row in referrers:
+        row["referrer_table_version"] = table_version
+    return referrers
 
 
 def _lerobot_sanitized_media_inspection(
@@ -5112,6 +5328,7 @@ def _lerobot_progress_template(
             "videos": 0,
             "video_encodings": 0,
             "keyframe_map_artifacts": 0,
+            "keyframe_map_artifact_referrers": 0,
         },
         "rows_skipped_existing": 0,
         "bytes_scanned": 0,
@@ -6576,6 +6793,61 @@ def _next_lerobot_checkpoint_index(lake: Lake, job_id: str) -> int:
     return int(latest.get("checkpoint_index") or 0) + 1
 
 
+def _lerobot_claim_cas_supersede(
+    lake: Lake,
+    *,
+    job_id: str,
+    prior_checkpoint_id: str,
+    prior_claim_token: str | None,
+    new_checkpoint_id: str,
+    operation: str,
+) -> None:
+    """Atomically win the right to supersede ``prior_checkpoint_id``.
+
+    A plain append -- or an insert-only ``merge_insert`` -- never conflicts
+    under a genuinely concurrent race: Lance treats both as commutative
+    inserts and happily commits both, producing two rows with the same
+    intended-unique ``checkpoint_id`` (verified directly against this
+    lancedb/lance version; see the 0379 decision record). ``update(where=...)``
+    is different: Lance re-evaluates the ``where`` clause against the
+    freshest committed state on every internal retry, so gating on
+    ``superseded_by_checkpoint_id IS NULL`` (plus the caller's observed
+    ``checkpoint_id``/``claim_token``) means a concurrent loser's retried
+    filter matches zero rows once the winner has already flipped it --
+    ``rows_updated`` tells the loser it lost, deterministically, even under a
+    true simultaneous race. Only after this call succeeds is it safe to
+    append the new checkpoint row.
+
+    Raises ``LeRobotClaimPreconditionError`` if this caller lost the race.
+    """
+    table = lake.table(_LEROBOT_CHECKPOINT_TABLE)
+    where = (
+        f"checkpoint_id = {_lerobot_sql_literal(prior_checkpoint_id)} "
+        f"AND claim_token = {_lerobot_sql_literal(prior_claim_token or '')} "
+        "AND superseded_by_checkpoint_id IS NULL"
+    )
+    result = table.update(where=where, values={"superseded_by_checkpoint_id": new_checkpoint_id})
+    if int(result.rows_updated) == 1:
+        return
+    _raise_lerobot_claim_lost_race(
+        lake, job_id, operation=operation, checkpoint_id=new_checkpoint_id
+    )
+
+
+def _raise_lerobot_claim_lost_race(
+    lake: Lake, job_id: str, *, operation: str, checkpoint_id: str
+) -> None:
+    """Raise a clear diagnostic naming the checkpoint that actually won a CAS race."""
+    committed = _latest_lerobot_ingest_job(lake, job_id)
+    raise LeRobotClaimPreconditionError(
+        job_id,
+        operation=operation,
+        lake_uri=lake.uri,
+        expected={"checkpoint_id": checkpoint_id},
+        actual=_lerobot_claim_precondition_actual(committed),
+    )
+
+
 def _assert_lerobot_claim_precondition(
     job_id: str,
     latest: dict[str, Any] | None,
@@ -6744,6 +7016,9 @@ def _record_lerobot_completed_checkpoint_if_needed(
     progress["rows_written"]["keyframe_map_artifacts"] = int(
         lake.table("keyframe_map_artifacts").count_rows(f"run_id = '{run_id}'")
     )
+    progress["rows_written"]["keyframe_map_artifact_referrers"] = int(
+        lake.table("keyframe_map_artifact_referrers").count_rows(f"run_id = '{run_id}'")
+    )
     progress["video_diagnostics"] = _lerobot_video_diagnostics(dataset.video_files)
     progress["media_inspection"] = _lerobot_sanitized_media_inspection(
         dataset.media_inspection,
@@ -6847,6 +7122,7 @@ def _record_lerobot_ingest_checkpoint(
     source_arg: str | Path,
     claim_token: str,
     error: str | None = None,
+    enforce_bootstrap_cas: bool = False,
 ) -> None:
     now = datetime.now(UTC)
     progress["status"] = status
@@ -6904,9 +7180,30 @@ def _record_lerobot_ingest_checkpoint(
         "created_by": created_by,
         "created_at": now,
     }
-    lake.table(_LEROBOT_CHECKPOINT_TABLE).add(
-        pa.Table.from_pylist([row], schema=LEROBOT_INGEST_CHECKPOINTS_SCHEMA)
-    )
+    data = pa.Table.from_pylist([row], schema=LEROBOT_INGEST_CHECKPOINTS_SCHEMA)
+    if not enforce_bootstrap_cas:
+        lake.table(_LEROBOT_CHECKPOINT_TABLE).add(data)
+        return
+    # Bootstrap: the very first checkpoint ever written for this job_id has no
+    # prior row to CAS against (see _lerobot_claim_cas_supersede). Best-effort
+    # dedup via merge_insert, then a read-back check: it closes the realistic
+    # staggered-race window (one caller commits, the other's later, freshly
+    # read merge correctly no-ops), but -- verified directly -- cannot
+    # guarantee rejection of a truly simultaneous commit the way the
+    # supersede-gated CAS above does. Detect that rare case after the fact
+    # rather than silently accepting a duplicate first claim.
+    table = lake.table(_LEROBOT_CHECKPOINT_TABLE)
+    checkpoint_id = str(row["checkpoint_id"])
+    table.merge_insert("checkpoint_id").when_not_matched_insert_all().execute(data)
+    winners = [
+        candidate
+        for candidate in _lerobot_checkpoint_rows(lake)
+        if candidate.get("checkpoint_id") == checkpoint_id
+    ]
+    if len(winners) != 1 or str(winners[0].get("claim_token") or "") != claim_token:
+        _raise_lerobot_claim_lost_race(
+            lake, job_id, operation="claim", checkpoint_id=checkpoint_id
+        )
 
 
 def _append_lerobot_recovery_checkpoint(

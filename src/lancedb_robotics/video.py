@@ -22,6 +22,7 @@ from lancedb_robotics.keyframe_maps import (
     keyframe_map_entries_for_encoding,
     keyframe_map_json_for_encoding,
     keyframe_map_ref,
+    list_keyframe_map_referrers,
 )
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.lineage import emit_transform_lineage
@@ -170,6 +171,14 @@ class LakeVideo:
             rows = [row for row in rows if row["video_id"] == video_id]
         return tuple(sorted(rows, key=_encoding_sort_key))
 
+    def keyframe_map_referrers(
+        self,
+        ref_or_artifact_id: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return videos/encodings that reference keyframe-map artifact bodies."""
+
+        return list_keyframe_map_referrers(self._lake, ref_or_artifact_id)
+
     def conform_source(
         self,
         samples: Iterable[Mapping[str, Any]] = (),
@@ -206,7 +215,9 @@ def encode_videos(
     if codec != DEFAULT_CODEC:
         raise VideoError(f"unsupported codec {codec!r}; expected {DEFAULT_CODEC!r}")
 
-    videos = _select_video_rows(lake, video_id=video_id, episode_id=episode_id, camera_key=camera_key)
+    videos = _select_video_rows(
+        lake, video_id=video_id, episode_id=episode_id, camera_key=camera_key
+    )
     transform_id = "tfm-video-encode-" + _digest(
         {
             "video_ids": [row["video_id"] for row in videos],
@@ -351,8 +362,7 @@ def conform_source_mp4_frames(
     sample_rows = [dict(sample) for sample in samples] or _default_source_conformance_samples(lake)
     started = datetime.now(UTC)
     results = tuple(
-        _conform_source_mp4_sample(lake, sample, decoder=decoder)
-        for sample in sample_rows
+        _conform_source_mp4_sample(lake, sample, decoder=decoder) for sample in sample_rows
     )
     status_counts = _count_by(results, "status")
     codec_counts = _count_by(results, "codec")
@@ -842,7 +852,9 @@ def _select_video_rows(
         rows = [row for row in rows if row["episode_id"] == episode_id]
     if camera_key is not None:
         rows = [row for row in rows if row["camera_key"] == camera_key]
-    rows = sorted(rows, key=lambda row: (row.get("episode_index") or 0, row["camera_key"], row["video_id"]))
+    rows = sorted(
+        rows, key=lambda row: (row.get("episode_index") or 0, row["camera_key"], row["video_id"])
+    )
     if not rows:
         raise VideoError("no videos matched the requested selection")
     return rows
@@ -1050,9 +1062,7 @@ def _keyframe_entry(
     for entry in keyframe_entries:
         if int(entry["first_frame_index"]) <= frame_index <= int(entry["last_frame_index"]):
             return entry
-    raise VideoError(
-        f"encoding {row['encoding_id']!r} has no GOP containing frame {frame_index}"
-    )
+    raise VideoError(f"encoding {row['encoding_id']!r} has no GOP containing frame {frame_index}")
 
 
 def _seek_video_reference_frame(
@@ -1078,7 +1088,9 @@ def _seek_video_reference_frame(
         keyframe_json = keyframe_map_json_for_encoding(lake, row)
         sample = read_mp4_frame_sample(uri, keyframe_json, frame_index)
     except (OSError, Mp4MetadataError) as exc:
-        raise VideoError(f"cannot read source MP4 sample for {row['encoding_id']!r}: {exc}") from exc
+        raise VideoError(
+            f"cannot read source MP4 sample for {row['encoding_id']!r}: {exc}"
+        ) from exc
     start = int(frame_entry["byte_start"])
     end = int(frame_entry["byte_end"])
     return VideoFrame(
@@ -1110,7 +1122,9 @@ def _video_row_for_encoding(lake: Lake, row: dict[str, Any]) -> dict[str, Any]:
     for video in lake.table("videos").to_arrow().to_pylist():
         if video["video_id"] == row["video_id"]:
             return video
-    raise VideoError(f"encoding {row['encoding_id']!r} references missing video {row['video_id']!r}")
+    raise VideoError(
+        f"encoding {row['encoding_id']!r} references missing video {row['video_id']!r}"
+    )
 
 
 def _infer_fps(lake: Lake, video: dict[str, Any]) -> float:

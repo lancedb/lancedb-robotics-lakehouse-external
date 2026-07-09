@@ -1,5 +1,6 @@
 """Replay bundle exporter tests (backlog 0107)."""
 
+import copy
 import hashlib
 import json
 import struct
@@ -13,19 +14,24 @@ import pytest
 from mcap.reader import make_reader
 from typer.testing import CliRunner
 
+from lancedb_robotics.blob import fetch_blob
 from lancedb_robotics.cli import app
 from lancedb_robotics.dataset import create_snapshot
 from lancedb_robotics.evidence import EvidencePackError
 from lancedb_robotics.ingest import ingest_mcap
+from lancedb_robotics.keyframe_maps import keyframe_map_artifact_row
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.replay import REPLAY_BUNDLE_SCHEMA, build_replay_bundle
 from lancedb_robotics.scenarios import create_scenario_windows
 from lancedb_robotics.schemas import (
     EVENTS_SCHEMA,
+    KEYFRAME_MAP_ARTIFACTS_SCHEMA,
     OBSERVATIONS_SCHEMA,
     RUNS_SCHEMA,
     SCENARIOS_SCHEMA,
+    VIDEO_ENCODINGS_SCHEMA,
 )
+from lancedb_robotics.video import VIDEO_ENCODING_BLOB_COLUMN
 from lancedb_robotics.writeback import ingest_model_outputs
 
 runner = CliRunner()
@@ -309,9 +315,7 @@ def _video_lake(path, *, frame_count: int = 6):
             schema=SCENARIOS_SCHEMA,
         )
     )
-    lake.episodes.from_markers(
-        start_event_types=["teleop_start"], stop_event_types=["success"]
-    )
+    lake.episodes.from_markers(start_event_types=["teleop_start"], stop_event_types=["success"])
     return lake, frames
 
 
@@ -320,7 +324,9 @@ def _video_pack_lake(tmp_path, frame_count=6):
     video_id = lake.table("videos").to_arrow().to_pylist()[0]["video_id"]
     lake.video.encode(video_id=video_id, gop_size=2)
     scenario = lake.table("scenarios").to_arrow().to_pylist()[0]
-    manifest = create_snapshot(lake, name="vid-v1", tag="vid-tag", scenario_ids=[scenario["scenario_id"]])
+    manifest = create_snapshot(
+        lake, name="vid-v1", tag="vid-tag", scenario_ids=[scenario["scenario_id"]]
+    )
     ingest_model_outputs(
         lake,
         {
@@ -335,6 +341,83 @@ def _video_pack_lake(tmp_path, frame_count=6):
         source="trainer",
     )
     return lake, frames
+
+
+def _offloaded_video_pack_lake(tmp_path, frame_count=6):
+    lake, frames = _video_lake(tmp_path / "robot.lance", frame_count=frame_count)
+    video = lake.table("videos").to_arrow().to_pylist()[0]
+    lake.video.encode(video_id=video["video_id"], gop_size=2)
+    artifact = _offload_keyframe_map(lake, video)
+    scenario = lake.table("scenarios").to_arrow().to_pylist()[0]
+    manifest = create_snapshot(
+        lake, name="vid-v1", tag="vid-tag", scenario_ids=[scenario["scenario_id"]]
+    )
+    ingest_model_outputs(
+        lake,
+        {
+            "model_output_id": "out-vid",
+            "observation_id": scenario["observation_ids"][0],
+            "scenario_id": scenario["scenario_id"],
+            "dataset_id": manifest.dataset_id,
+            "model_version": "m@1",
+            "prediction": "x",
+            "producer_run_id": "ckpt-vid",
+        },
+        source="trainer",
+    )
+    return lake, frames, artifact
+
+
+def _offload_keyframe_map(lake, video):
+    row = lake.table("video_encodings").to_arrow().to_pylist()[0]
+    keyframe_json = row["keyframe_map_json"]
+    assert keyframe_json
+    artifact = keyframe_map_artifact_row(
+        keyframe_json,
+        source_video_fingerprint="synthetic-video-fingerprint",
+        inspection_id="inspection-video",
+        source_uri=video.get("raw_uri") or video.get("uri"),
+        source_path=None,
+        encoding_id=row["encoding_id"],
+        video_id=row["video_id"],
+        run_id=row.get("run_id"),
+        episode_id=row.get("episode_id"),
+        episode_index=row.get("episode_index"),
+        camera_key=row.get("camera_key"),
+        transform_id="tfm-keyframe-map-offload",
+        created_at=row["created_at"],
+    )
+    lake.table("keyframe_map_artifacts").add(
+        pa.Table.from_pylist([artifact], schema=KEYFRAME_MAP_ARTIFACTS_SCHEMA)
+    )
+    offloaded = dict(row)
+    offloaded["keyframe_map_json"] = None
+    offloaded[VIDEO_ENCODING_BLOB_COLUMN] = fetch_blob(
+        lake.table("video_encodings"),
+        VIDEO_ENCODING_BLOB_COLUMN,
+        row["encoding_id"],
+        id_column="encoding_id",
+    )
+    (
+        lake.table("video_encodings")
+        .merge_insert("encoding_id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(pa.Table.from_pylist([offloaded], schema=VIDEO_ENCODINGS_SCHEMA))
+    )
+    return artifact
+
+
+def _corrupt_keyframe_map_artifact_head(lake, artifact):
+    corrupt = dict(artifact)
+    corrupt["keyframe_map_json"] = "[]"
+    (
+        lake.table("keyframe_map_artifacts")
+        .merge_insert("artifact_id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(pa.Table.from_pylist([corrupt], schema=KEYFRAME_MAP_ARTIFACTS_SCHEMA))
+    )
 
 
 def test_replay_bundle_video_gops_reconstruct_and_account_hashes(tmp_path):
@@ -374,22 +457,79 @@ def test_replay_bundle_video_gops_reconstruct_and_account_hashes(tmp_path):
 def test_replay_bundle_video_gop_bytes_are_deterministic(tmp_path):
     lake, _ = _video_pack_lake(tmp_path)
     first = lake.lineage.replay_bundle(
-        "ckpt-vid", checkpoint=True, output_dir=str(tmp_path / "v1"),
-        include_mcap=False, include_video=True,
+        "ckpt-vid",
+        checkpoint=True,
+        output_dir=str(tmp_path / "v1"),
+        include_mcap=False,
+        include_video=True,
     )
     second = lake.lineage.replay_bundle(
-        "ckpt-vid", checkpoint=True, output_dir=str(tmp_path / "v2"),
-        include_mcap=False, include_video=True,
+        "ckpt-vid",
+        checkpoint=True,
+        output_dir=str(tmp_path / "v2"),
+        include_mcap=False,
+        include_video=True,
     )
     assert first.bundle_digest == second.bundle_digest
     assert [f["sha256"] for f in first.files] == [f["sha256"] for f in second.files]
 
 
+def test_replay_bundle_resolves_offloaded_keyframe_maps_at_pinned_artifact_version(tmp_path):
+    lake, frames, artifact = _offloaded_video_pack_lake(tmp_path)
+    pack = lake.lineage.trace_checkpoint("ckpt-vid").evidence_pack()
+    versions = {row["table"]: row["version"] for row in pack.manifest["table_versions"]}
+    pinned_version = versions["keyframe_map_artifacts"]
+    video_ref = pack.manifest["video_encoding_refs"][0]
+    assert video_ref["keyframe_map_ref"] == artifact["keyframe_map_ref"]
+    assert video_ref["keyframe_map_storage"] == "artifact"
+    assert video_ref["keyframe_map_artifact_id"] == artifact["artifact_id"]
+    assert video_ref["keyframe_map_artifact_table_version"] == pinned_version
+
+    _corrupt_keyframe_map_artifact_head(lake, artifact)
+    latest_version = int(lake.table("keyframe_map_artifacts").version)
+    assert latest_version > pinned_version
+
+    report = build_replay_bundle(
+        lake,
+        pack.manifest,
+        output_dir=str(tmp_path / "pinned"),
+        include_mcap=False,
+        include_video=True,
+    )
+    clip = report.manifest["video_clips"][0]
+    assert clip["keyframe_map_ref"] == artifact["keyframe_map_ref"]
+    assert clip["keyframe_map_artifact_table_version"] == pinned_version
+    bundle_dir = Path(report.output_dir)
+    recovered: list[bytes] = []
+    for gop in sorted(clip["gops"], key=lambda item: item["gop_index"]):
+        recovered.extend(_decode_gop((bundle_dir / gop["path"]).read_bytes()))
+    assert recovered == [frames[i] for i in range(len(frames))]
+
+    bad_manifest = copy.deepcopy(pack.manifest)
+    for row in bad_manifest["table_versions"]:
+        if row["table"] == "keyframe_map_artifacts":
+            row["version"] = latest_version
+    for ref in bad_manifest["video_encoding_refs"]:
+        ref["keyframe_map_artifact_table_version"] = latest_version
+    with pytest.raises(EvidencePackError, match="content mismatch"):
+        build_replay_bundle(
+            lake,
+            bad_manifest,
+            output_dir=str(tmp_path / "latest"),
+            include_mcap=False,
+            include_video=True,
+        )
+
+
 def test_replay_bundle_can_skip_per_gop_files(tmp_path):
     lake, _ = _video_pack_lake(tmp_path)
     report = lake.lineage.replay_bundle(
-        "ckpt-vid", checkpoint=True, output_dir=str(tmp_path / "vb"),
-        include_mcap=False, include_video=True, include_gops=False,
+        "ckpt-vid",
+        checkpoint=True,
+        output_dir=str(tmp_path / "vb"),
+        include_mcap=False,
+        include_video=True,
+        include_gops=False,
     )
     clip = report.manifest["video_clips"][0]
     assert clip["gops"] == []
@@ -414,8 +554,12 @@ def test_replay_bundle_enforces_max_bytes_without_partial_output(tmp_path):
     out = tmp_path / "bounded"
     with pytest.raises(EvidencePackError, match="max_bytes"):
         lake.lineage.replay_bundle(
-            "ckpt-vid", checkpoint=True, output_dir=str(out),
-            include_mcap=False, include_video=True, max_bytes=1,
+            "ckpt-vid",
+            checkpoint=True,
+            output_dir=str(out),
+            include_mcap=False,
+            include_video=True,
+            max_bytes=1,
         )
     assert not out.exists()
 
@@ -449,8 +593,11 @@ def test_replay_bundle_requires_at_least_one_exporter(tmp_path, fixtures_dir):
     pack = lake.lineage.trace_checkpoint("checkpoint-abc123").evidence_pack()
     with pytest.raises(EvidencePackError, match="nothing to export"):
         build_replay_bundle(
-            lake, pack.manifest, output_dir=str(tmp_path / "b"),
-            include_mcap=False, include_video=False,
+            lake,
+            pack.manifest,
+            output_dir=str(tmp_path / "b"),
+            include_mcap=False,
+            include_video=False,
         )
 
 

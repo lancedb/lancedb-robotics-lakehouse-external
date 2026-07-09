@@ -16,6 +16,16 @@ _CAMERA_KEY_OPTION = typer.Option(None, "--camera-key", help="Restrict to one ca
 _GOP_SIZE_OPTION = typer.Option(2, "--gop-size", min=1, help="Frames per GOP/keyframe interval.")
 _RESOLUTION_OPTION = typer.Option("unknown", "--resolution", help="Resolution label, e.g. 640x480.")
 _NVDEC_OPTION = typer.Option(False, "--nvdec-compatible", help="Mark encoding as NVDEC-compatible.")
+_KEYFRAME_MAP_ARTIFACT_OPTION = typer.Option(
+    None,
+    "--artifact",
+    help="Keyframe-map artifact id or sha256: ref. Omit to list all referrers.",
+)
+_KEYFRAME_MAP_REFERRER_FORMAT_OPTION = typer.Option(
+    "text",
+    "--format",
+    help="Output format: text, json, or jsonl.",
+)
 _CONFORM_SOURCE_SAMPLES_OPTION = typer.Option(
     None,
     "--samples",
@@ -116,6 +126,50 @@ def inspect(
         typer.echo(f"  encoded bytes: {row['encoded_size_bytes']}")
 
 
+@video_app.command("keyframe-map-referrers")
+def keyframe_map_referrers(
+    lake: str = _LAKE_OPTION,
+    artifact: str | None = _KEYFRAME_MAP_ARTIFACT_OPTION,
+    output_format: str = _KEYFRAME_MAP_REFERRER_FORMAT_OPTION,
+) -> None:
+    """List videos/encodings that reference keyframe-map artifacts."""
+    from lancedb_robotics.keyframe_maps import KeyframeMapError
+    from lancedb_robotics.lake import Lake, LakeError
+
+    output_format = output_format.lower()
+    if output_format not in {"text", "json", "jsonl"}:
+        typer.echo("error: --format must be text, json, or jsonl", err=True)
+        raise typer.Exit(code=1)
+    try:
+        opened = Lake.open(lake)
+        rows = opened.video.keyframe_map_referrers(artifact)
+    except (LakeError, KeyframeMapError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if output_format == "json":
+        typer.echo(json.dumps({"lake": lake, "artifact": artifact, "referrers": rows}, default=str))
+        return
+    if output_format == "jsonl":
+        for row in rows:
+            typer.echo(json.dumps(row, default=str))
+        return
+
+    typer.echo(f"lake: {lake}")
+    typer.echo(f"artifact: {artifact or '*'}")
+    typer.echo(f"referrers: {len(rows)}")
+    for row in rows:
+        typer.echo(f"referrer: {row['referrer_id']}")
+        typer.echo(f"  artifact: {row['artifact_id']}")
+        typer.echo(f"  encoding: {row['encoding_id']}")
+        typer.echo(f"  video: {row['video_id']}")
+        typer.echo(f"  run: {row['run_id']}")
+        typer.echo(f"  episode: {row['episode_index']}")
+        typer.echo(f"  camera: {row['camera_key']}")
+        typer.echo(f"  source fingerprint: {row['source_video_fingerprint']}")
+        typer.echo(f"  table: {row['referrer_table']}@{row['referrer_table_version']}")
+
+
 @video_app.command("conform-source")
 def conform_source(
     lake: str = _LAKE_OPTION,
@@ -163,7 +217,9 @@ def _load_conform_source_samples(path: Path | None) -> list[dict[str, Any]]:
     elif isinstance(payload, Mapping):
         return [dict(payload)]
     if not isinstance(payload, list):
-        raise ValueError("source conformance sample JSON must be a sample object, list, or object with samples")
+        raise ValueError(
+            "source conformance sample JSON must be a sample object, list, or object with samples"
+        )
     return [_coerce_sample_mapping(item, path=str(path)) for item in payload]
 
 

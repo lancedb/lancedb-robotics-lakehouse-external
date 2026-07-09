@@ -62,7 +62,7 @@ def test_create_snapshot_from_explicit_ids_records_manifest(lake):
     spec = json.loads(row["query_spec"])
     assert sorted(spec["scenario_ids"]) == ids
     tables = {tv["table"] for tv in row["table_versions"]}
-    assert {"scenarios", "runs", "observations"} <= tables
+    assert {"scenarios", "runs", "observations", "keyframe_map_artifacts"} <= tables
 
 
 def test_snapshot_records_transform_lineage(lake):

@@ -305,6 +305,25 @@ sizes, frame counts, and source video fingerprints instead of repeating the map
 body. That keeps long-clip job histories scan-friendly while preserving a
 single deduplicated map body per content hash.
 
+Dataset snapshots and evidence packs pin the `keyframe_map_artifacts` table
+version alongside `video_encodings` when an offloaded map is referenced. Replay
+bundles use that pinned version when they slice GOP bytes, so a later artifact
+catalog write cannot silently change the keyframe map used by an older
+regression bundle.
+
+When multiple videos share the same offloaded map body, the lake keeps one
+`keyframe_map_artifacts` row and writes one
+`keyframe_map_artifact_referrers` usage row per referencing video encoding. The
+artifact row is the deduplicated body; the referrer rows are the audit trail for
+which source video fingerprint, inspection, run, episode/camera, encoding, and
+table version points at that body. Inspect usage with:
+
+```bash
+lancedb-robotics video keyframe-map-referrers \
+  --lake ./robot.lance \
+  --artifact kfmap-<sha256>
+```
+
 Frame rows are streamed from LeRobot Parquet files by row group and record batch.
 If an ingest is interrupted after some `observations` were written, a retry skips
 the already-present deterministic `run:episode:frame` observation ids and
@@ -491,8 +510,20 @@ lancedb-robotics ingest lerobot ./koch_pick_place \
 
 This is a portable optimistic consistency model for local paths, object stores,
 and remote DB lakes; it does not assume unsupported cross-process transactions
-or locks. The guard prevents stale operators from acting on a row they no longer
-observe as latest, while LanceDB still owns the actual append commit.
+or locks. The `--expected-*` flags guard against a *stale* observation (an
+operator acting on a row they no longer observe as latest). Underneath, every
+claim/recovery transition is additionally protected by an internal
+compare-and-swap even when no `--expected-*` flags are given: verified
+directly against LanceDB, a plain append (or an insert-only `merge_insert`)
+never conflicts with a concurrent append, so two truly simultaneous recovery
+attempts could otherwise both "succeed" and silently duplicate the claim.
+The guard instead uses `table.update(where=...)` gated on the prior
+checkpoint's `superseded_by_checkpoint_id` still being unset -- LanceDB
+re-evaluates that `where` clause against the freshest committed state on
+every internal retry, so a losing writer's retried filter matches zero rows
+once the winner has already claimed it. Exactly one caller wins; every other
+caller gets the same "which checkpoint won the race" diagnostic as a stale
+`--expected-*` mismatch.
 
 Before a long backfill, simulate claim recovery chaos against either the current
 checkpoint catalog or synthetic corpus assumptions:
@@ -519,15 +550,23 @@ lancedb-robotics ingest lerobot-claim-recovery-simulate \
   --format json
 ```
 
-The simulator does not mutate the lake. It models crashes before claim, after
-claim, during media inspection, during frame batches, and after metadata-ready
-checkpoints. The report includes stale/live/inactive claim counts, CAS conflict
-estimates when multiple operators recover the same observed row, recovery
-latency, checkpoint-row growth, duplicate-protection checks for observations,
-episodes, videos, events, runs, and transform rows, and recommended
-lease/heartbeat/watchdog defaults for the selected profile. Use it before
-scheduling the watchdog so local smoke tests, CI lakes, mid-corpus runs, and
-full public-corpus backfills start with realistic claim windows.
+The simulator does not mutate your lake, `checkpoint_rows` export, or synthetic
+input. It models crashes before claim, after claim, during media inspection,
+during frame batches, and after metadata-ready checkpoints. For the CAS
+guarantee specifically, it does not just estimate an outcome: it actually
+races `--retry-owner-count` concurrent recovery attempts against a disposable
+scratch lake it creates and discards internally, and reports the measured
+`accepted_recoveries`/`cas_conflicts`/`checkpoint_duplicate_rows` from that
+real execution. A crash report only reports `passed: true` if that rehearsal
+produced zero checkpoint duplicates. The report also includes stale/live/
+inactive claim counts, recovery latency, checkpoint-row growth,
+duplicate-protection checks for observations, episodes, videos, events, runs,
+and transform rows (structural protections such as deterministic ids and
+`merge_insert`, exercised end-to-end elsewhere in the test suite rather than
+by this simulation call), and recommended lease/heartbeat/watchdog defaults
+for the selected profile. Use it before scheduling the watchdog so local
+smoke tests, CI lakes, mid-corpus runs, and full public-corpus backfills start
+with realistic claim windows.
 
 High-volume HF backfills can append one checkpoint row per inspected media phase
 and frame batch. Before a multi-day run, use the non-mutating scale planner to
@@ -746,6 +785,9 @@ behind `video_encodings.keyframe_map_ref` in `keyframe_map_artifacts`.
 `lake.video.seek(...)` resolves either form and fetches the exact source sample
 bytes for a frame. A later explicit video encoding job can still materialize
 Lance-native GOP blobs when a training policy opts into that storage tradeoff.
+Snapshots, evidence packs, and replay bundles also preserve the relevant
+`keyframe_map_artifacts` table version for offloaded maps, so historical replay
+uses the catalog row that was current when the evidence was produced.
 
 When decoded pixels matter, for example validating a new decoder stack before a
 training run, `lake.video.conform_source(...)` reads selected source MP4 frames

@@ -58,6 +58,11 @@ from lancedb_robotics.indexing import (
     build_aligned_training_predicate_indexes,
     describe_scalar_indexes,
 )
+from lancedb_robotics.keyframe_maps import (
+    KeyframeMapError,
+    keyframe_map_entries_for_encoding,
+    keyframe_map_json_for_encoding,
+)
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.materialization import (
     ProjectionAccounting,
@@ -228,6 +233,8 @@ def _lake_hook(lake: Any, *names: str) -> Any:
         if value is not None:
             return value
     return None
+
+
 DEFAULT_ALIGNED_TRAINING_COLUMNS = (
     "alignment_id",
     "tick_index",
@@ -829,9 +836,7 @@ class LanceTrainingManifest:
             "total_frames": self.total_frames,
             "selected_frames": self.selected_frames,
             "fps": self.fps,
-            "time_windows": {
-                key: list(deltas) for key, deltas in self.time_windows.items()
-            },
+            "time_windows": {key: list(deltas) for key, deltas in self.time_windows.items()},
             "row_plan_id": self.row_plan_id,
             "epoch_plan_id": self.epoch_plan_id,
             "epoch": self.epoch,
@@ -1329,9 +1334,7 @@ class QueryNodeClient(Protocol):
     hermetic Lance-backed path used by the 0071 fake remote.
     """
 
-    def execute(
-        self, request: QueryNodeRequest
-    ) -> "QueryNodeResponse | Mapping[str, Any]": ...
+    def execute(self, request: QueryNodeRequest) -> "QueryNodeResponse | Mapping[str, Any]": ...
 
 
 def _coerce_query_node_response(
@@ -1354,9 +1357,7 @@ def _coerce_query_node_response(
             pe_addrs=tuple(str(addr) for addr in pe_addrs),
             bytes_read=value.get("bytes_read"),
         )
-    raise TypeError(
-        f"plan-executor client returned an unsupported response type: {type(value)!r}"
-    )
+    raise TypeError(f"plan-executor client returned an unsupported response type: {type(value)!r}")
 
 
 def _lance_take_rows(
@@ -1378,8 +1379,7 @@ def _lance_take_rows(
         if version is not None:
             table.checkout_latest()
     return [
-        {**dict(row), ROW_ID_COLUMN: int(row_id)}
-        for row_id, row in zip(row_ids, rows, strict=True)
+        {**dict(row), ROW_ID_COLUMN: int(row_id)} for row_id, row in zip(row_ids, rows, strict=True)
     ]
 
 
@@ -1521,9 +1521,7 @@ class RemoteQueryNodeClient:
             bytes_read=telemetry["bytes_read"],
         )
 
-    def _telemetry(
-        self, request: QueryNodeRequest, fallback_request_id: str
-    ) -> dict[str, Any]:
+    def _telemetry(self, request: QueryNodeRequest, fallback_request_id: str) -> dict[str, Any]:
         source = self.metrics_source
         cache: Mapping[str, Any] | None = None
         if callable(source):
@@ -1635,9 +1633,7 @@ class _QueryNodeHydrationStats:
 
         if request_id is not None:
             self.request_ids.append(request_id)
-            entry = self.per_request.setdefault(
-                request_id, {"hits": 0, "misses": 0}
-            )
+            entry = self.per_request.setdefault(request_id, {"hits": 0, "misses": 0})
             entry["hits"] += normalized_metrics["hits"]
             entry["misses"] += normalized_metrics["misses"]
         if manifest_etag is not None:
@@ -1738,9 +1734,8 @@ class _QueryNodeHydrationExecutor:
         self.live_client = _lake_hook(lake, "query_node_client", "plan_executor_client")
         self._etag_source = getattr(lake, "manifest_etags", None)
         self._request_seq = 0
-        self.enabled = (
-            backend_report.resolved_backend == "enterprise"
-            and bool(backend_report.plan_executor.get("available"))
+        self.enabled = backend_report.resolved_backend == "enterprise" and bool(
+            backend_report.plan_executor.get("available")
         )
         self.stats = _QueryNodeHydrationStats()
 
@@ -1771,10 +1766,7 @@ class _QueryNodeHydrationExecutor:
         )
         response = self._execute(request)
         rows_list = response.rows or []
-        result = {
-            int(row_id): row
-            for row_id, row in zip(unique_row_ids, rows_list, strict=True)
-        }
+        result = {int(row_id): row for row_id, row in zip(unique_row_ids, rows_list, strict=True)}
         self._record_response(
             request,
             response,
@@ -1808,10 +1800,7 @@ class _QueryNodeHydrationExecutor:
         )
         response = self._execute(request)
         blobs = response.blobs or []
-        result = {
-            int(row_id): value
-            for row_id, value in zip(unique_row_ids, blobs, strict=True)
-        }
+        result = {int(row_id): value for row_id, value in zip(unique_row_ids, blobs, strict=True)}
         self._record_response(
             request,
             response,
@@ -1881,16 +1870,12 @@ class _QueryNodeHydrationExecutor:
         embedded = self._table_etags.get(table_name)
         return str(embedded) if embedded is not None else None
 
-    def _guard_metadata_only(
-        self, operation: str, table_name: str, columns: Sequence[str]
-    ) -> None:
+    def _guard_metadata_only(self, operation: str, table_name: str, columns: Sequence[str]) -> None:
         if not self.metadata_only:
             return
         blocked = [column for column in columns if _is_remote_payload_column(column)]
         if blocked:
-            raise MetadataOnlyViolationError(
-                operation=operation, table=table_name, columns=blocked
-            )
+            raise MetadataOnlyViolationError(operation=operation, table=table_name, columns=blocked)
 
     def _build_request(
         self,
@@ -2072,21 +2057,16 @@ def _normalize_plan_executor_cache_metrics(
 ) -> dict[str, Any]:
     if not metrics:
         return {"hits": 0, "misses": 0, "per_addr": {}}
-    per_addr_raw = (
-        metrics.get("per_addr") or metrics.get("by_addr") or metrics.get("by_pe") or {}
-    )
+    per_addr_raw = metrics.get("per_addr") or metrics.get("by_addr") or metrics.get("by_pe") or {}
     per_addr: dict[str, dict[str, int]] = {}
     if isinstance(per_addr_raw, Mapping):
         for addr, values in per_addr_raw.items():
             if not isinstance(values, Mapping):
                 continue
             per_addr[str(addr)] = {
-                "hits": int(
-                    _first_present(values, "hits", "cache_hits", "x-cache-hits") or 0
-                ),
+                "hits": int(_first_present(values, "hits", "cache_hits", "x-cache-hits") or 0),
                 "misses": int(
-                    _first_present(values, "misses", "cache_misses", "x-cache-misses")
-                    or 0
+                    _first_present(values, "misses", "cache_misses", "x-cache-misses") or 0
                 ),
             }
     hits = _first_present(metrics, "hits", "cache_hits", "x-cache-hits")
@@ -2273,8 +2253,7 @@ class _PageCachePrewarmExecutor:
                 policy=str((req or {}).get("policy") or ""),
                 database=None,
                 applicable=False,
-                reason=(req or {}).get("reason")
-                or "cache policy does not request prewarm",
+                reason=(req or {}).get("reason") or "cache policy does not request prewarm",
                 tables=(),
             )
         database = resolve_prewarm_database(
@@ -2401,10 +2380,10 @@ class _PageCachePrewarmExecutor:
 
     def _build_coordinator(self) -> PrewarmJobCoordinator:
         source = _lake_hook(self.lake, "page_cache_prewarm", "plan_executor_prewarm")
-        status_source = _lake_hook(self.lake, "page_cache_prewarm_status", "plan_executor_prewarm_status")
-        submit_fn = (
-            (lambda req: self._call_submit(source, req)) if source is not None else None
+        status_source = _lake_hook(
+            self.lake, "page_cache_prewarm_status", "plan_executor_prewarm_status"
         )
+        submit_fn = (lambda req: self._call_submit(source, req)) if source is not None else None
         status_fn = (
             (lambda **kw: self._call_status(status_source, **kw))
             if status_source is not None
@@ -2571,8 +2550,7 @@ class _PageCachePrewarmExecutor:
         self._update_status(status)
         if options.on_error == "raise":
             raise PrewarmUnavailableError(
-                "Enterprise cache prewarm failed: "
-                f"{status.get('reason') or status.get('status')}",
+                f"Enterprise cache prewarm failed: {status.get('reason') or status.get('status')}",
                 missing_capabilities=("page_cache_prewarm",),
                 remediation="Use prewarm_options={'on_error': 'warn'} or fallback='warn' when lazy-cache execution is acceptable.",
             )
@@ -2770,9 +2748,7 @@ def _aligned_prewarm_request(
         if tick_plan.row_ids[index] is not None
     )
     source_row_ids = tuple(
-        int(row_id)
-        for index in plan_indices
-        for row_id in tick_plan.source_row_ids[index]
+        int(row_id) for index in plan_indices for row_id in tick_plan.source_row_ids[index]
     )
     aligned_table = str(tick_plan.scan.get("table") or "aligned_frames")
     aligned_version = _version_from_table_versions(tick_plan.read_table_versions, aligned_table)
@@ -2839,11 +2815,7 @@ def _aligned_prewarm_request(
         }
     )
     projected_columns = tuple(
-        dict.fromkeys(
-            column
-            for table in tables
-            for column in table["projected_columns"]
-        )
+        dict.fromkeys(column for table in tables for column in table["projected_columns"])
     )
     request = {
         "kind": "lancedb-robotics/training-prewarm/v1",
@@ -3122,11 +3094,7 @@ class _TrainingMediaResolver:
                 handle = self._handle_for_column(ref, column, columns)
                 if handle is not None and handle.kind == "payload_blob":
                     handles.append(handle)
-        row_ids = [
-            int(handle.row_id)
-            for handle in handles
-            if handle.row_id is not None
-        ]
+        row_ids = [int(handle.row_id) for handle in handles if handle.row_id is not None]
         if not row_ids:
             return
         payloads = self.hydration_executor.take_blobs(
@@ -3138,9 +3106,7 @@ class _TrainingMediaResolver:
         for handle in handles:
             if handle.row_id is None:
                 continue
-            self._prefetched_bytes[self._cache_key(handle)] = payloads.get(
-                int(handle.row_id)
-            )
+            self._prefetched_bytes[self._cache_key(handle)] = payloads.get(int(handle.row_id))
 
     def clear_prefetch(self) -> None:
         self._prefetched_bytes.clear()
@@ -3233,8 +3199,14 @@ class _TrainingMediaResolver:
             raw_channel=obs.get("raw_channel"),
             raw_sequence=obs.get("raw_sequence"),
             episode_id=obs.get("episode_id") or ref.episode.episode_id,
-            episode_index=int(obs.get("episode_index") if obs.get("episode_index") is not None else ref.episode.index),
-            frame_index=int(obs.get("frame_index") if obs.get("frame_index") is not None else ref.frame_index),
+            episode_index=int(
+                obs.get("episode_index")
+                if obs.get("episode_index") is not None
+                else ref.episode.index
+            ),
+            frame_index=int(
+                obs.get("frame_index") if obs.get("frame_index") is not None else ref.frame_index
+            ),
             camera_key=_camera_key(obs) if _is_camera_observation(obs) else None,
             decoder=self.decoder,
             _resolver=self,
@@ -3255,7 +3227,12 @@ class _TrainingMediaResolver:
             for row in getattr(self.context, "video_encodings", {}).values()
             if row.get("episode_id") == episode_id
             and row.get("camera_key") == camera_key
-            and _encoding_contains_frame(row, frame_index)
+            and _encoding_contains_frame(
+                row,
+                frame_index,
+                lake=self.lake,
+                context=self.context,
+            )
         ]
         if not candidates:
             return None
@@ -3263,7 +3240,7 @@ class _TrainingMediaResolver:
             candidates,
             key=lambda item: (item.get("created_at"), item.get("encoding_id")),
         )[-1]
-        entry = _encoding_frame_entry(row, frame_index)
+        entry = _encoding_frame_entry(row, frame_index, lake=self.lake, context=self.context)
         return TrainingMediaHandle(
             media_id=f"media-{_stable_digest({'encoding_id': row['encoding_id'], 'frame': frame_index})}",
             field="video_frame",
@@ -3304,6 +3281,11 @@ class _TrainingMediaResolver:
             if row is None:
                 return self._fallback_payload_bytes(handle)
             try:
+                row = _training_encoding_row_with_keyframe_map(
+                    self.lake,
+                    self.context,
+                    row,
+                )
                 decoded = decode_frame_from_encoding(
                     row,
                     encoded,
@@ -3580,11 +3562,7 @@ class _AlignedFeatureResolver:
         for offset in range(max(len(row_ids), len(observation_ids))):
             row_id = row_ids[offset] if offset < len(row_ids) else None
             observation_id = observation_ids[offset] if offset < len(observation_ids) else None
-            metadata = (
-                metadata_by_row_id.get(row_id)
-                if row_id is not None
-                else None
-            ) or (
+            metadata = (metadata_by_row_id.get(row_id) if row_id is not None else None) or (
                 metadata_by_observation_id.get(observation_id)
                 if observation_id is not None
                 else None
@@ -3656,7 +3634,7 @@ class _AlignedFeatureResolver:
             for row in self._video_encoding_rows().values()
             if row.get("episode_id") == episode_id
             and row.get("camera_key") == camera_key
-            and _encoding_contains_frame(row, int(frame_index))
+            and _encoding_contains_frame(row, int(frame_index), lake=self.lake)
         ]
         if not candidates:
             return None
@@ -3664,7 +3642,7 @@ class _AlignedFeatureResolver:
             candidates,
             key=lambda item: (item.get("created_at"), item.get("encoding_id")),
         )[-1]
-        entry = _encoding_frame_entry(row, int(frame_index))
+        entry = _encoding_frame_entry(row, int(frame_index), lake=self.lake)
         return {
             "row_id": row_id,
             "observation_id": metadata.get("observation_id"),
@@ -3760,9 +3738,7 @@ class _AlignedFeatureResolver:
 
         fallback_refs.extend(ref for ref in refs if ref.get("row_id") is None)
         fallback_ids = [
-            str(ref["observation_id"])
-            for ref in fallback_refs
-            if ref.get("observation_id")
+            str(ref["observation_id"]) for ref in fallback_refs if ref.get("observation_id")
         ]
         by_observation_id = self._fetch_payloads_by_observation_id(fallback_ids)
         for ref in fallback_refs:
@@ -3791,6 +3767,7 @@ class _AlignedFeatureResolver:
         if row is None:
             return None
         try:
+            row = _training_encoding_row_with_keyframe_map(self.lake, None, row)
             decoded = decode_frame_from_encoding(
                 row,
                 encoded,
@@ -3850,10 +3827,7 @@ class _AlignedFeatureResolver:
         return None if array is None else torch.as_tensor(array)
 
     def _fetch_payloads_by_row_id(self, row_ids: Sequence[int]) -> dict[int, bytes]:
-        if (
-            self.hydration_executor is not None
-            and self.hydration_executor.enabled
-        ):
+        if self.hydration_executor is not None and self.hydration_executor.enabled:
             return {
                 row_id: value or b""
                 for row_id, value in self.hydration_executor.take_blobs(
@@ -3899,10 +3873,7 @@ class _AlignedFeatureResolver:
         wanted = {int(row_id) for row_id in row_ids}
         if not wanted:
             return {}
-        if (
-            self.hydration_executor is not None
-            and self.hydration_executor.enabled
-        ):
+        if self.hydration_executor is not None and self.hydration_executor.enabled:
             return self.hydration_executor.take_rows(
                 "observations",
                 sorted(wanted),
@@ -3935,10 +3906,7 @@ class _AlignedFeatureResolver:
         if not ids:
             return {}
         predicate = _sql_predicate("observation_id", ids)
-        if (
-            self.hydration_executor is not None
-            and self.hydration_executor.enabled
-        ):
+        if self.hydration_executor is not None and self.hydration_executor.enabled:
             rows = self.hydration_executor.filtered_read(
                 "observations",
                 columns=_ALIGNED_OBSERVATION_FEATURE_COLUMNS,
@@ -4100,7 +4068,9 @@ class LanceTrainingDataset:
             num_workers=self.num_workers,
             resume_from=self.resume_from,
         )
-        self._frame_refs = tuple(self._planned_refs[index] for index in self.epoch_plan.sample_indices)
+        self._frame_refs = tuple(
+            self._planned_refs[index] for index in self.epoch_plan.sample_indices
+        )
 
         # Backlog 0117: an Enterprise dataset can express its epoch order as a
         # server-side row-plan artifact -- a version-pinned handle the query node
@@ -4125,8 +4095,7 @@ class LanceTrainingDataset:
             selected_scenario_count=len(self._context.scenario_ids),
             selected_observation_count=self.num_frames,
             payload_bytes_referenced=sum(
-                payload_size(ref.observation.get("payload_blob"))
-                for ref in self._frame_refs
+                payload_size(ref.observation.get("payload_blob")) for ref in self._frame_refs
             ),
             payload_bytes_copied=0,
             metadata_bytes_written=0,
@@ -4244,8 +4213,7 @@ class LanceTrainingDataset:
         sample = _sample_for_ref(self._context, ref, self.columns, self._media_resolver)
         if self.time_windows:
             sample["windows"] = {
-                key: self._window(ref, key, deltas)
-                for key, deltas in self.time_windows.items()
+                key: self._window(ref, key, deltas) for key, deltas in self.time_windows.items()
             }
         return sample
 
@@ -4366,9 +4334,7 @@ class LanceTrainingDataset:
         plan = self._build_query_warm_plan(
             chunk_size=chunk_size, include_heavy=include_heavy, columns=columns
         )
-        result = warm_query_cache(
-            self.lake, plan, row_limit_per_query=row_limit_per_query
-        )
+        result = warm_query_cache(self.lake, plan, row_limit_per_query=row_limit_per_query)
         result["plan"] = plan.to_dict()
         return result
 
@@ -4406,9 +4372,7 @@ class LanceTrainingDataset:
             "worker_id": self.worker_id,
             "num_workers": self.num_workers,
             "resume_from": self.resume_from,
-            "time_windows": {
-                key: list(deltas) for key, deltas in self.time_windows.items()
-            },
+            "time_windows": {key: list(deltas) for key, deltas in self.time_windows.items()},
             "media": self.media_policy,
             "decoder": self.decoder,
             "media_cache": self.media_cache,
@@ -4770,9 +4734,7 @@ class AlignedFrameTrainingDataset:
             }
             for _, _, tick_index in plans
         ]
-        hydrated_batches = self._feature_resolver.hydrate_stream_batches(
-            stream_sample_batches
-        )
+        hydrated_batches = self._feature_resolver.hydrate_stream_batches(stream_sample_batches)
         return [
             _aligned_sample_from_streams(
                 self._job,
@@ -5300,9 +5262,7 @@ class LakeTraining:
             allow_fallback=allow_fallback,
             fallback=fallback,
         )
-        return dataset.query_warm_plan(
-            chunk_size=chunk_size, include_heavy=include_heavy
-        )
+        return dataset.query_warm_plan(chunk_size=chunk_size, include_heavy=include_heavy)
 
     def row_plan_page(
         self,
@@ -5444,7 +5404,9 @@ class LakeTraining:
         store = open_prewarm_job_store(self._lake)
         if store is None:
             return []
-        return [record.to_dict() for record in store.list(status=status, policy=policy, limit=limit)]
+        return [
+            record.to_dict() for record in store.list(status=status, policy=policy, limit=limit)
+        ]
 
     def prewarm_job(self, prewarm_id: str) -> dict[str, Any] | None:
         """Return a single durable prewarm JobRun by id (with full status history)."""
@@ -5492,13 +5454,13 @@ class LakeTraining:
                 "lake.prewarm_job_store or set lake.prewarm_jobs_durable=True"
             )
         source = _lake_hook(self._lake, "page_cache_prewarm", "plan_executor_prewarm")
-        status_source = _lake_hook(self._lake, "page_cache_prewarm_status", "plan_executor_prewarm_status")
+        status_source = _lake_hook(
+            self._lake, "page_cache_prewarm_status", "plan_executor_prewarm_status"
+        )
         return PrewarmJobCoordinator(
             store,
             submit_fn=(lambda req: source(request=dict(req))) if callable(source) else None,
-            status_fn=(
-                (lambda **kw: status_source(**kw)) if callable(status_source) else None
-            ),
+            status_fn=((lambda **kw: status_source(**kw)) if callable(status_source) else None),
             ttl_s=getattr(self._lake, "prewarm_job_ttl_s", DEFAULT_PREWARM_JOB_TTL_S),
         )
 
@@ -6322,11 +6284,7 @@ def _connection_loader_config(lake: Lake) -> dict[str, Any]:
     result: dict[str, Any] = {
         "kind": getattr(spec, "kind", None),
         "display_uri": getattr(spec, "display_uri", lake.uri),
-        "auth_refs": {
-            key: value
-            for key, value in getattr(spec, "auth_refs", {}).items()
-            if value
-        },
+        "auth_refs": {key: value for key, value in getattr(spec, "auth_refs", {}).items() if value},
     }
     if spec.kind == "lancedb_remote_db":
         kwargs = dict(getattr(spec, "lancedb_connect_kwargs", {}) or {})
@@ -6842,7 +6800,9 @@ def _collate_aligned_streams(
     ]
     for stream in stream_names:
         per_stream = [
-            dict(streams.get(stream, {})) if streams and isinstance(streams.get(stream), Mapping) else {}
+            dict(streams.get(stream, {}))
+            if streams and isinstance(streams.get(stream), Mapping)
+            else {}
             for streams in streams_by_sample
         ]
         field_names: list[str] = []
@@ -6875,7 +6835,9 @@ def _collate_aligned_streams(
             elif field_name in {"source_observation_ids", "source_row_ids", "quality_flags"}:
                 stream_batch[field_name] = [list(value or []) for value in values]
             elif field_name == "feature":
-                stream_batch[field_name] = [dict(value) if isinstance(value, Mapping) else value for value in values]
+                stream_batch[field_name] = [
+                    dict(value) if isinstance(value, Mapping) else value for value in values
+                ]
             else:
                 stream_batch[field_name] = values
 
@@ -7076,10 +7038,7 @@ def _collate_aligned_lineage(lineages: Sequence[Mapping[str, Any]]) -> dict[str,
         "tick_indices": [lineage.get("tick_index") for lineage in lineages],
         "quality_policy": first.get("quality_policy"),
         "aligned_frame_ids": {
-            stream: [
-                (lineage.get("aligned_frame_ids") or {}).get(stream)
-                for lineage in lineages
-            ]
+            stream: [(lineage.get("aligned_frame_ids") or {}).get(stream) for lineage in lineages]
             for stream in stream_names
         },
         "source_observation_ids": {
@@ -7181,9 +7140,7 @@ def _torchify_aligned_masks(masks: Mapping[str, Any], torch: Any) -> dict[str, A
             converted[mask_name] = by_stream
             continue
         converted[mask_name] = {
-            stream: torch.tensor(values, dtype=torch.bool)
-            if isinstance(values, list)
-            else values
+            stream: torch.tensor(values, dtype=torch.bool) if isinstance(values, list) else values
             for stream, values in by_stream.items()
         }
     return converted
@@ -7259,11 +7216,7 @@ def _remote_training_snapshot_context(lake: Lake, snapshot_name: str) -> _Snapsh
         )
 
     episode_ids = sorted(
-        {
-            str(obs["episode_id"])
-            for obs in observation_rows
-            if obs.get("episode_id")
-        }
+        {str(obs["episode_id"]) for obs in observation_rows if obs.get("episode_id")}
     )
     episode_rows = (
         _scan_remote_rows_by_values(
@@ -7831,7 +7784,9 @@ def _planned_observation_scan(
         "version": _table_version(context, "observations"),
         "columns": scan_columns,
         "filter_predicate": where_sql,
-        "logical_predicates": [_logical_predicate(key, expected) for key, expected in filters.items()],
+        "logical_predicates": [
+            _logical_predicate(key, expected) for key, expected in filters.items()
+        ],
         "pushed_filters": pushed_filters,
         "candidate_frame_ids": list(candidate_ids),
         "row_count": len(rows),
@@ -7855,8 +7810,7 @@ def _logical_candidate_refs(
         ref
         for ref in refs
         if all(
-            _filter_matches(_column_value(context, ref, key), filters[key])
-            for key in logical_only
+            _filter_matches(_column_value(context, ref, key), filters[key]) for key in logical_only
         )
     )
 
@@ -7984,8 +7938,7 @@ def _server_side_plan_inputs(dataset: Any) -> dict[str, Any] | None:
         ordered_frame_ids.append(str(frame_ids[index]))
     report = dataset.backend_report
     capabilities = {
-        key: bool(report.capabilities.get(key))
-        for key in _SERVER_SIDE_PLAN_CAPABILITY_KEYS
+        key: bool(report.capabilities.get(key)) for key in _SERVER_SIDE_PLAN_CAPABILITY_KEYS
     }
     scan = row_plan.scan or {}
     return {
@@ -8295,10 +8248,14 @@ def _persist_lancedb_epoch_permutation(
         epoch=epoch,
     )
     table = _create_or_reuse_epoch_permutation_table(db, permutation_table, ordered_row_ids)
-    row_id_to_index = {int(row_id): index for index, row_id in enumerate(row_ids) if row_id is not None}
+    row_id_to_index = {
+        int(row_id): index for index, row_id in enumerate(row_ids) if row_id is not None
+    }
     ordered_indices = _indices_from_lancedb_permutation_table(table, row_id_to_index)
     if ordered_indices != global_order:
-        raise TrainingError("LanceDB permutation table returned an order different from the row plan")
+        raise TrainingError(
+            "LanceDB permutation table returned an order different from the row plan"
+        )
     descriptor = EpochExecutionBackend(
         kind=EPOCH_BACKEND_LANCEDB_PERMUTATION,
         execution_mode="lancedb-permutation-table",
@@ -8397,9 +8354,7 @@ def _resolve_alignment_job(
             selected = [row for row in jobs if row["name"] == alignment]
     if name is not None and alignment_id is not None:
         selected = [
-            row
-            for row in selected
-            if row["alignment_id"] == alignment_id and row["name"] == name
+            row for row in selected if row["alignment_id"] == alignment_id and row["name"] == name
         ]
     if not selected:
         target = alignment_id or name or alignment
@@ -8552,8 +8507,7 @@ def _build_aligned_frame_pivot_plan(
         tuple(
             row_id
             for stream in streams
-            for row_id in rows_by_tick.get(tick, {}).get(stream, {}).get("source_row_ids")
-            or []
+            for row_id in rows_by_tick.get(tick, {}).get(stream, {}).get("source_row_ids") or []
         )
         for tick in tick_indices
     )
@@ -8670,8 +8624,7 @@ def _build_aligned_ticks_jsonb_plan(
         tuple(
             row_id
             for stream in streams
-            for row_id in rows_by_tick.get(tick, {}).get(stream, {}).get("source_row_ids")
-            or []
+            for row_id in rows_by_tick.get(tick, {}).get(stream, {}).get("source_row_ids") or []
         )
         for tick in tick_indices
     )
@@ -8784,9 +8737,7 @@ def _aligned_tick_diagnostic_index_columns(
     columns: list[str] = []
     if quality_policy.get("min_confidence") is not None:
         columns.append("min_confidence")
-    if quality_policy.get("require_streams") or not bool(
-        quality_policy.get("allow_missing", True)
-    ):
+    if quality_policy.get("require_streams") or not bool(quality_policy.get("allow_missing", True)):
         columns.append("has_missing")
     return tuple(columns)
 
@@ -8820,10 +8771,7 @@ def _planned_aligned_tick_scan(
         }
     where_sql = _sql_predicate("alignment_id", alignment_id)
     query = (
-        table.search()
-        .select(list(_ALIGNED_TICK_SCAN_COLUMNS))
-        .where(where_sql)
-        .with_row_id(True)
+        table.search().select(list(_ALIGNED_TICK_SCAN_COLUMNS)).where(where_sql).with_row_id(True)
     )
     rows: list[dict[str, Any]] = []
     for batch in query.to_batches(batch_size=4096):
@@ -8940,16 +8888,11 @@ def _aligned_tick_storage_row_from_frame_rows(
     created_at: datetime,
 ) -> dict[str, Any]:
     stream_samples = {
-        stream: _aligned_stream_sample(stream, rows_by_stream.get(stream))
-        for stream in streams
+        stream: _aligned_stream_sample(stream, rows_by_stream.get(stream)) for stream in streams
     }
     masks = _aligned_masks(stream_samples)
     quality_flags = sorted(
-        {
-            flag
-            for sample in stream_samples.values()
-            for flag in sample.get("quality_flags") or []
-        }
+        {flag for sample in stream_samples.values() for flag in sample.get("quality_flags") or []}
     )
     stream_detail: dict[str, dict[str, Any]] = {}
     stream_values: dict[str, Any] = {}
@@ -8959,17 +8902,11 @@ def _aligned_tick_storage_row_from_frame_rows(
         "source_row_ids": {},
     }
     for stream, sample in stream_samples.items():
-        detail = {
-            key: value
-            for key, value in sample.items()
-            if key not in {"feature", "value"}
-        }
+        detail = {key: value for key, value in sample.items() if key not in {"feature", "value"}}
         stream_detail[stream] = detail
         stream_values[stream] = sample.get("value")
         lineage["aligned_frame_ids"][stream] = sample.get("aligned_frame_id")
-        lineage["source_observation_ids"][stream] = list(
-            sample.get("source_observation_ids") or []
-        )
+        lineage["source_observation_ids"][stream] = list(sample.get("source_observation_ids") or [])
         lineage["source_row_ids"][stream] = list(sample.get("source_row_ids") or [])
     missing_streams = [
         stream for stream in streams if bool((masks.get("missing") or {}).get(stream))
@@ -8978,9 +8915,7 @@ def _aligned_tick_storage_row_from_frame_rows(
         stream for stream in streams if bool((masks.get("interpolated") or {}).get(stream))
     ]
     out_of_tolerance_streams = [
-        stream
-        for stream in streams
-        if bool((masks.get("out_of_tolerance") or {}).get(stream))
+        stream for stream in streams if bool((masks.get("out_of_tolerance") or {}).get(stream))
     ]
     confidences = [float(sample.get("confidence") or 0.0) for sample in stream_samples.values()]
     return {
@@ -8992,9 +8927,7 @@ def _aligned_tick_storage_row_from_frame_rows(
         "run_id": _aligned_tick_run_id(stream_samples),
         "tick_index": int(tick_index),
         "timestamp_ns": _aligned_tick_timestamp(stream_samples),
-        "available_streams": [
-            stream for stream in streams if stream not in set(missing_streams)
-        ],
+        "available_streams": [stream for stream in streams if stream not in set(missing_streams)],
         "missing_streams": missing_streams,
         "interpolated_streams": interpolated_streams,
         "out_of_tolerance_streams": out_of_tolerance_streams,
@@ -9017,8 +8950,7 @@ def _aligned_metadata_signature(
     streams: tuple[str, ...],
 ) -> dict[str, Any]:
     stream_samples = {
-        stream: _aligned_stream_sample(stream, rows_by_stream.get(stream))
-        for stream in streams
+        stream: _aligned_stream_sample(stream, rows_by_stream.get(stream)) for stream in streams
     }
     return {
         "tick_index": int(tick_index),
@@ -9060,9 +8992,7 @@ def _aligned_tick_stream_detail(row: Mapping[str, Any]) -> dict[str, dict[str, A
             )
         stream_row = dict(payload)
         stream_row.setdefault("stream", stream)
-        stream_row["source_observation_ids"] = list(
-            stream_row.get("source_observation_ids") or []
-        )
+        stream_row["source_observation_ids"] = list(stream_row.get("source_observation_ids") or [])
         stream_row["source_row_ids"] = [
             int(row_id) for row_id in stream_row.get("source_row_ids") or []
         ]
@@ -9152,9 +9082,7 @@ def _aligned_tick_stream_matches_policy(
 ) -> bool:
     if statuses and row.get("status") not in statuses:
         return False
-    if min_confidence is not None and float(row.get("confidence") or 0.0) < float(
-        min_confidence
-    ):
+    if min_confidence is not None and float(row.get("confidence") or 0.0) < float(min_confidence):
         return False
     return True
 
@@ -9225,7 +9153,9 @@ def _filtered_aligned_ticks(
     required = require_streams or (() if allow_missing else streams)
     for tick in all_tick_indices:
         rows_by_stream = rows_by_tick.get(tick, {})
-        if required and any(not _aligned_stream_is_valid(rows_by_stream.get(stream)) for stream in required):
+        if required and any(
+            not _aligned_stream_is_valid(rows_by_stream.get(stream)) for stream in required
+        ):
             filtered.add(tick)
     return filtered
 
@@ -9257,8 +9187,7 @@ def _aligned_sample_for_tick(
     feature_resolver: _AlignedFeatureResolver | None = None,
 ) -> dict[str, Any]:
     stream_samples = {
-        stream: _aligned_stream_sample(stream, rows_by_stream.get(stream))
-        for stream in streams
+        stream: _aligned_stream_sample(stream, rows_by_stream.get(stream)) for stream in streams
     }
     if feature_resolver is not None:
         stream_samples = feature_resolver.hydrate_streams(stream_samples)
@@ -9466,8 +9395,7 @@ def _aligned_sample_lineage(
         "tick_index": tick_index,
         "quality_policy": _jsonable(quality_policy),
         "aligned_frame_ids": {
-            stream: sample.get("aligned_frame_id")
-            for stream, sample in stream_samples.items()
+            stream: sample.get("aligned_frame_id") for stream, sample in stream_samples.items()
         },
         "source_observation_ids": {
             stream: list(sample.get("source_observation_ids") or [])
@@ -9571,8 +9499,7 @@ def _alignment_table_version(job: Mapping[str, Any], table: str) -> int | None:
 
 def _current_table_versions(lake: Lake, tables: Sequence[str]) -> tuple[dict[str, Any], ...]:
     return tuple(
-        {"table": table, "version": int(lake.table(table).version), "tag": ""}
-        for table in tables
+        {"table": table, "version": int(lake.table(table).version), "tag": ""} for table in tables
     )
 
 
@@ -9779,8 +9706,7 @@ def _validate_enterprise_fallback_policy(
     selected = aliases.get(selected, selected)
     if selected not in ENTERPRISE_FALLBACK_POLICIES:
         raise TrainingError(
-            "fallback must be one of "
-            f"{', '.join(ENTERPRISE_FALLBACK_POLICIES)}; got {fallback!r}"
+            f"fallback must be one of {', '.join(ENTERPRISE_FALLBACK_POLICIES)}; got {fallback!r}"
         )
     return selected
 
@@ -9825,7 +9751,9 @@ def _native_required_enterprise_capabilities(
     materializes_heavy = media_policy in DECODED_MEDIA_POLICIES or media_policy == "bytes"
     if materializes_heavy and any(column in _HEAVY_MEDIA_COLUMNS for column in columns):
         required.update({"remote_take", "blob_or_video_remote_hydration"})
-    return tuple(capability for capability in ENTERPRISE_TRAINING_CAPABILITIES if capability in required)
+    return tuple(
+        capability for capability in ENTERPRISE_TRAINING_CAPABILITIES if capability in required
+    )
 
 
 def _aligned_required_enterprise_capabilities(
@@ -9842,7 +9770,9 @@ def _aligned_required_enterprise_capabilities(
     required.update(_cache_required_enterprise_capabilities(selected_cache_policy))
     if feature_policy in _ALIGNED_PAYLOAD_POLICIES:
         required.update({"remote_take", "blob_or_video_remote_hydration"})
-    return tuple(capability for capability in ENTERPRISE_TRAINING_CAPABILITIES if capability in required)
+    return tuple(
+        capability for capability in ENTERPRISE_TRAINING_CAPABILITIES if capability in required
+    )
 
 
 def _cache_required_enterprise_capabilities(cache_policy: str) -> set[str]:
@@ -9968,9 +9898,8 @@ def _epoch_backend_capability(
     else:
         lancedb_reason = "lancedb.permutation and table creation APIs are available"
 
-    direct_lance_supported = (
-        importlib.util.find_spec("lance") is not None
-        and bool(capabilities.get("direct_object_io"))
+    direct_lance_supported = importlib.util.find_spec("lance") is not None and bool(
+        capabilities.get("direct_object_io")
     )
     direct_lance_reason = (
         "pylance and direct object IO are available"
@@ -10015,9 +9944,7 @@ def _lancedb_permutation_module() -> Any | None:
         import lancedb.permutation as permutation
     except Exception:
         return None
-    if not hasattr(permutation, "Permutation") or not hasattr(
-        permutation, "permutation_builder"
-    ):
+    if not hasattr(permutation, "Permutation") or not hasattr(permutation, "permutation_builder"):
         return None
     return permutation
 
@@ -10071,9 +9998,7 @@ def _training_backend_report(
                 "reason": f"lake connection kind {connection_kind!r} is not Enterprise remote",
             }
             fallback_events.append(fallback)
-            warnings.append(
-                "enterprise backend request fell back to local Lance-native execution"
-            )
+            warnings.append("enterprise backend request fell back to local Lance-native execution")
         elif fallback_policy == "direct" and _direct_fallback_allowed(
             spec,
             capabilities,
@@ -10220,9 +10145,7 @@ def _training_backend_report(
         "host_override": host_override,
         "region": connect_kwargs.get("region"),
         "all_requests_use_host_override": bool(
-            resolved == "enterprise"
-            and connection_kind == "lancedb_remote_db"
-            and host_override
+            resolved == "enterprise" and connection_kind == "lancedb_remote_db" and host_override
         ),
     }
     resolved_plan_id = plan_id or (row_plan.plan_id if row_plan is not None else None)
@@ -10290,8 +10213,7 @@ def _enterprise_training_capabilities(
         "page_cache_prewarm": bool(remote and server_side_query and blob_fetch_remote),
         "page_cache_status": bool(remote and server_side_query and blob_fetch_remote),
         "namespace_direct_object_io": bool(
-            connection_kind in {"rest_namespace_lancedb", "namespace_lancedb"}
-            and direct_object_io
+            connection_kind in {"rest_namespace_lancedb", "namespace_lancedb"} and direct_object_io
         ),
         "managed_versioning": bool(
             getattr(spec, "managed_versioning", False)
@@ -10418,9 +10340,7 @@ def _negotiate_missing_enterprise_capabilities(
         prewarm_missing = [
             item for item in missing if item in {"page_cache_prewarm", "page_cache_status"}
         ]
-        metrics_missing = [
-            item for item in missing if item == "plan_executor_cache_metrics"
-        ]
+        metrics_missing = [item for item in missing if item == "plan_executor_cache_metrics"]
         if prewarm_missing:
             cache_policy = "lazy"
             event = {
@@ -10502,9 +10422,7 @@ def _negotiate_missing_enterprise_capabilities(
             "resolved_backend": "local",
             "cache_policy": selected_cache_policy,
             "fallback_events": [event],
-            "warnings": [
-                "Enterprise training fell back to explicit local test/dev execution"
-            ],
+            "warnings": ["Enterprise training fell back to explicit local test/dev execution"],
         }
 
     if fallback_policy == "warn" and not cache_only:
@@ -10835,9 +10753,7 @@ def _cache_counts_for_epoch(
 
 def _fallback_events(backend: Mapping[str, Any]) -> list[dict[str, Any]]:
     events = [
-        dict(event)
-        for event in backend.get("fallback_events") or []
-        if isinstance(event, Mapping)
+        dict(event) for event in backend.get("fallback_events") or [] if isinstance(event, Mapping)
     ]
     if events:
         return events
@@ -10851,9 +10767,7 @@ def _disabled_capabilities(backend: Mapping[str, Any]) -> list[str]:
     disabled.update(str(key) for key, value in capabilities.items() if value is False)
     plan_executor = _mapping_dict(backend.get("plan_executor"))
     disabled.update(
-        f"plan_executor.{key}"
-        for key, value in plan_executor.items()
-        if value is False
+        f"plan_executor.{key}" for key, value in plan_executor.items() if value is False
     )
     return sorted(disabled)
 
@@ -11121,21 +11035,88 @@ def _video_frame(context: Any, ref: _TrainingFrameRef) -> bytes | None:
     return decode_frame_from_encoding(row, encoded, frame_index, decoder="auto").frame
 
 
-def _encoding_contains_frame(row: dict[str, Any], frame_index: int) -> bool:
+def _encoding_contains_frame(
+    row: dict[str, Any],
+    frame_index: int,
+    *,
+    lake: Lake | None = None,
+    context: Any | None = None,
+) -> bool:
     try:
-        _encoding_frame_entry(row, frame_index)
+        _encoding_frame_entry(row, frame_index, lake=lake, context=context)
     except TrainingError:
         return False
     return True
 
 
-def _encoding_frame_entry(row: dict[str, Any], frame_index: int) -> dict[str, Any]:
-    for entry in json.loads(row.get("keyframe_map_json") or "[]"):
+def _encoding_frame_entry(
+    row: dict[str, Any],
+    frame_index: int,
+    *,
+    lake: Lake | None = None,
+    context: Any | None = None,
+) -> dict[str, Any]:
+    for entry in _training_keyframe_map_entries(lake, context, row):
         if int(entry["first_frame_index"]) <= frame_index <= int(entry["last_frame_index"]):
             return entry
     raise TrainingError(
         f"encoding {row.get('encoding_id')!r} has no GOP containing frame {frame_index}"
     )
+
+
+def _training_keyframe_map_entries(
+    lake: Lake | None,
+    context: Any | None,
+    row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if lake is None:
+        return [dict(entry) for entry in json.loads(row.get("keyframe_map_json") or "[]")]
+    try:
+        return keyframe_map_entries_for_encoding(
+            lake,
+            row,
+            artifact_table_version=_training_artifact_table_version(context, row),
+        )
+    except (KeyframeMapError, json.JSONDecodeError) as exc:
+        raise TrainingError(
+            f"cannot resolve keyframe map for video encoding {row.get('encoding_id')!r}: {exc}"
+        ) from exc
+
+
+def _training_encoding_row_with_keyframe_map(
+    lake: Lake,
+    context: Any | None,
+    row: dict[str, Any],
+) -> dict[str, Any]:
+    if row.get("keyframe_map_json"):
+        return row
+    if not row.get("keyframe_map_ref"):
+        return row
+    try:
+        keyframe_json = keyframe_map_json_for_encoding(
+            lake,
+            row,
+            artifact_table_version=_training_artifact_table_version(context, row),
+        )
+    except KeyframeMapError as exc:
+        raise TrainingError(
+            f"cannot resolve keyframe map for video encoding {row.get('encoding_id')!r}: {exc}"
+        ) from exc
+    return {**row, "keyframe_map_json": keyframe_json}
+
+
+def _training_artifact_table_version(context: Any | None, row: dict[str, Any]) -> int | None:
+    if row.get("keyframe_map_json") or not row.get("keyframe_map_ref"):
+        return None
+    if context is None:
+        return None
+    version = _table_version(context, "keyframe_map_artifacts")
+    if version is None:
+        raise TrainingError(
+            "snapshot table_versions do not pin keyframe_map_artifacts required by "
+            f"offloaded keyframe map on video encoding {row.get('encoding_id')!r}"
+        )
+    return version
 
 
 def _sql_predicate(column: str, expected: Any) -> str:

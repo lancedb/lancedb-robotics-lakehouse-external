@@ -26,6 +26,7 @@ EXPECTED_TABLES = [
     "videos",
     "video_encodings",
     "keyframe_map_artifacts",
+    "keyframe_map_artifact_referrers",
     "attachments",
     "events",
     "scenarios",
@@ -76,6 +77,7 @@ ID_COLUMNS = {
     "videos": "video_id",
     "video_encodings": "encoding_id",
     "keyframe_map_artifacts": "artifact_id",
+    "keyframe_map_artifact_referrers": "referrer_id",
     "attachments": "attachment_id",
     "events": "event_id",
     "scenarios": "scenario_id",
@@ -125,6 +127,7 @@ LINEAGE_TABLES = [
     "videos",
     "video_encodings",
     "keyframe_map_artifacts",
+    "keyframe_map_artifact_referrers",
     "attachments",
     "events",
     "scenarios",
@@ -300,6 +303,24 @@ def test_video_encodings_codec_aware_fields():
     assert schema.field("encoded_size_bytes").type == pa.int64()
     assert schema.field("data").type == pa.large_binary()
     assert schema.field("data").metadata == {b"lance-encoding:blob": b"true"}
+
+
+def test_keyframe_map_artifact_referrer_fields():
+    schema = TABLE_SCHEMAS["keyframe_map_artifact_referrers"]
+    assert schema.field("artifact_id").type == pa.string()
+    assert schema.field("keyframe_map_ref").type == pa.string()
+    assert schema.field("content_sha256").type == pa.string()
+    assert schema.field("referrer_kind").type == pa.string()
+    assert schema.field("referrer_table").type == pa.string()
+    assert schema.field("referrer_table_version").type == pa.int64()
+    assert schema.field("source_video_fingerprint").type == pa.string()
+    assert schema.field("inspection_id").type == pa.string()
+    assert schema.field("encoding_id").type == pa.string()
+    assert schema.field("video_id").type == pa.string()
+    assert schema.field("run_id").type == pa.string()
+    assert schema.field("episode_id").type == pa.string()
+    assert schema.field("episode_index").type == pa.int64()
+    assert schema.field("camera_key").type == pa.string()
 
 
 def test_alignment_jobs_fields():

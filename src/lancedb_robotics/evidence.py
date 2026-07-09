@@ -23,6 +23,7 @@ from lancedb_robotics.blob import (
     PAYLOAD_BLOB_COLUMN,
     fetch_blobs,
 )
+from lancedb_robotics.keyframe_maps import keyframe_map_artifact_id
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.video import VIDEO_ENCODING_BLOB_COLUMN
 
@@ -143,10 +144,12 @@ def evidence_pack_from_trace(
 
     table_versions = _table_versions_by_name(trace.table_versions)
     row_ids = _row_ids_from_trace(trace)
+    media_refs = _media_refs(lake, row_ids, table_versions)
+    table_versions = _with_required_media_table_versions(lake, table_versions, media_refs)
+    media_refs = _pin_media_refs(media_refs, table_versions)
     rows = _collect_rows(lake, row_ids, table_versions)
     writeback = _related_writeback_rows(lake, row_ids)
     _merge_rows(rows, writeback)
-    media_refs = _media_refs(lake, row_ids, table_versions)
 
     manifest = {
         "schema_version": EVIDENCE_PACK_SCHEMA,
@@ -202,10 +205,12 @@ def evidence_pack_from_graph(
 
     table_versions = _table_versions_from_graph(graph)
     row_ids = _row_ids_from_graph(graph)
+    media_refs = _media_refs(lake, row_ids, table_versions)
+    table_versions = _with_required_media_table_versions(lake, table_versions, media_refs)
+    media_refs = _pin_media_refs(media_refs, table_versions)
     rows = _collect_rows(lake, row_ids, table_versions)
     writeback = _related_writeback_rows(lake, row_ids)
     _merge_rows(rows, writeback)
-    media_refs = _media_refs(lake, row_ids, table_versions)
 
     manifest = {
         "schema_version": EVIDENCE_PACK_SCHEMA,
@@ -224,7 +229,9 @@ def evidence_pack_from_graph(
         "rows": _sorted_rows_map(rows),
         "model_outputs": _sorted_rows(rows.get("model_outputs", ()), "model_output_id"),
         "model_artifacts": _sorted_rows(rows.get("model_artifacts", ()), "model_artifact_id"),
-        "training_run": _first_or_none(_sorted_rows(rows.get("training_runs", ()), "training_run_id")),
+        "training_run": _first_or_none(
+            _sorted_rows(rows.get("training_runs", ()), "training_run_id")
+        ),
         "lineage_graph": graph.as_dict(),
         "lineage_executions": _sorted_rows(list(graph.executions), "execution_id"),
         "transform_runs": _sorted_rows(rows.get("transform_runs", ()), "transform_id"),
@@ -349,7 +356,11 @@ def _materialize_payloads(
         if not payload:
             continue
         path = output_dir / "payloads" / f"{_safe_name(row_id)}.bin"
-        files.append(_write_materialized_file(path, payload, kind="payload", table="observations", row_id=row_id))
+        files.append(
+            _write_materialized_file(
+                path, payload, kind="payload", table="observations", row_id=row_id
+            )
+        )
     return files
 
 
@@ -375,7 +386,11 @@ def _materialize_attachments(
         if not payload:
             continue
         path = output_dir / "attachments" / f"{_safe_name(row_id)}.bin"
-        files.append(_write_materialized_file(path, payload, kind="attachment", table="attachments", row_id=row_id))
+        files.append(
+            _write_materialized_file(
+                path, payload, kind="attachment", table="attachments", row_id=row_id
+            )
+        )
     return files
 
 
@@ -529,7 +544,9 @@ def _related_writeback_rows(
     labels = [
         row
         for row in _rows_as_of(lake, "labels", None)
-        if _matches_any(row, observation_ids=observation_ids, scenario_ids=scenario_ids, run_ids=run_ids)
+        if _matches_any(
+            row, observation_ids=observation_ids, scenario_ids=scenario_ids, run_ids=run_ids
+        )
         or str(row.get("label_id")) in label_ids
     ]
     if labels:
@@ -539,7 +556,9 @@ def _related_writeback_rows(
     model_outputs = [
         row
         for row in _rows_as_of(lake, "model_outputs", None)
-        if _matches_any(row, observation_ids=observation_ids, scenario_ids=scenario_ids, run_ids=run_ids)
+        if _matches_any(
+            row, observation_ids=observation_ids, scenario_ids=scenario_ids, run_ids=run_ids
+        )
         or str(row.get("model_output_id")) in model_output_ids
     ]
     if model_outputs:
@@ -551,7 +570,9 @@ def _related_writeback_rows(
     feedback = [
         row
         for row in _rows_as_of(lake, "feedback", None)
-        if _matches_any(row, observation_ids=observation_ids, scenario_ids=scenario_ids, run_ids=run_ids)
+        if _matches_any(
+            row, observation_ids=observation_ids, scenario_ids=scenario_ids, run_ids=run_ids
+        )
         or str(row.get("model_output_id")) in model_output_ids
         or str(row.get("label_id")) in label_ids
         or str(row.get("feedback_id")) in row_ids.get("feedback", set())
@@ -575,12 +596,16 @@ def _matches_any(
     )
 
 
-def _merge_rows(target: dict[str, list[dict[str, Any]]], extra: Mapping[str, list[dict[str, Any]]]) -> None:
+def _merge_rows(
+    target: dict[str, list[dict[str, Any]]], extra: Mapping[str, list[dict[str, Any]]]
+) -> None:
     for table_name, incoming in extra.items():
         id_column = _ID_COLUMNS.get(table_name)
         if not id_column:
             continue
-        merged = {str(row[id_column]): row for row in target.get(table_name, []) if row.get(id_column)}
+        merged = {
+            str(row[id_column]): row for row in target.get(table_name, []) if row.get(id_column)
+        }
         merged.update({str(row[id_column]): row for row in incoming if row.get(id_column)})
         target[table_name] = _sorted_rows(merged.values(), id_column)
 
@@ -615,7 +640,10 @@ def _media_refs(
     ]
     return {
         "attachments": sorted(attachments, key=lambda row: row["attachment_id"]),
-        "videos": [_video_ref(row, table_versions.get("videos")) for row in _sorted_rows(videos, "video_id")],
+        "videos": [
+            _video_ref(row, table_versions.get("videos"))
+            for row in _sorted_rows(videos, "video_id")
+        ],
         "video_encodings": [
             _video_encoding_ref(row, table_versions.get("video_encodings"))
             for row in _sorted_rows(encodings, "encoding_id")
@@ -654,17 +682,62 @@ def _video_ref(row: dict[str, Any], table_version: int | None) -> dict[str, Any]
 
 
 def _video_encoding_ref(row: dict[str, Any], table_version: int | None) -> dict[str, Any]:
-    return {
+    keyframe_map_ref = row.get("keyframe_map_ref")
+    has_inline_keyframe_map = row.get("keyframe_map_json") not in (None, "")
+    offloaded_keyframe_map = bool(keyframe_map_ref) and not has_inline_keyframe_map
+    ref = {
         "table": "video_encodings",
         "table_version": table_version,
         "encoding_id": row["encoding_id"],
         "video_id": row.get("video_id"),
         "codec": row.get("codec"),
         "gop_size": row.get("gop_size"),
-        "keyframe_map_ref": row.get("keyframe_map_ref"),
+        "keyframe_map_ref": keyframe_map_ref,
+        "keyframe_map_storage": (
+            "artifact"
+            if offloaded_keyframe_map
+            else "inline"
+            if has_inline_keyframe_map
+            else "none"
+        ),
         "encoded_size_bytes": row.get("encoded_size_bytes"),
         "column": VIDEO_ENCODING_BLOB_COLUMN,
     }
+    if offloaded_keyframe_map:
+        content_sha = str(keyframe_map_ref).removeprefix("sha256:")
+        ref["keyframe_map_artifact_id"] = keyframe_map_artifact_id(content_sha)
+    return ref
+
+
+def _with_required_media_table_versions(
+    lake: Lake,
+    table_versions: Mapping[str, int],
+    media_refs: Mapping[str, list[dict[str, Any]]],
+) -> dict[str, int]:
+    versions = dict(table_versions)
+    if any(
+        ref.get("keyframe_map_storage") == "artifact"
+        for ref in media_refs.get("video_encodings", ())
+    ):
+        versions.setdefault(
+            "keyframe_map_artifacts",
+            int(lake.table("keyframe_map_artifacts").version),
+        )
+    return versions
+
+
+def _pin_media_refs(
+    media_refs: Mapping[str, list[dict[str, Any]]],
+    table_versions: Mapping[str, int],
+) -> dict[str, list[dict[str, Any]]]:
+    artifact_version = table_versions.get("keyframe_map_artifacts")
+    refs = {key: [dict(row) for row in value] for key, value in media_refs.items()}
+    if artifact_version is None:
+        return refs
+    for ref in refs.get("video_encodings", []):
+        if ref.get("keyframe_map_storage") == "artifact":
+            ref["keyframe_map_artifact_table_version"] = int(artifact_version)
+    return refs
 
 
 def _payload_refs(
@@ -731,7 +804,13 @@ def _source_coordinates_from_graph(graph: LineageGraph) -> list[dict[str, Any]]:
             "observation_ids": sorted({str(value) for value in linked_observation_ids if value}),
         }
         row["coordinate_hash"] = _stable_sha256(row)
-        key = (row["uri"], row["channel"], row["offset"], row["log_time_ns"], tuple(row["observation_ids"]))
+        key = (
+            row["uri"],
+            row["channel"],
+            row["offset"],
+            row["log_time_ns"],
+            tuple(row["observation_ids"]),
+        )
         coords_by_key[key] = row
     return [
         coords_by_key[key]
@@ -752,9 +831,7 @@ def _rows_as_of(
         table.checkout(int(version))
     try:
         columns = [
-            name
-            for name in table.schema.names
-            if name not in _BLOB_COLUMNS.get(table_name, set())
+            name for name in table.schema.names if name not in _BLOB_COLUMNS.get(table_name, set())
         ]
         return table.to_lance().to_table(columns=columns).to_pylist()
     finally:
@@ -806,8 +883,7 @@ def _verification(manifest: dict[str, Any], files: list[dict[str, Any]]) -> dict
     return {
         "source_coordinate_hashes": source_hashes,
         "materialized_file_hashes": [
-            {"path": row["path"], "sha256": row["sha256"], "bytes": row["bytes"]}
-            for row in files
+            {"path": row["path"], "sha256": row["sha256"], "bytes": row["bytes"]} for row in files
         ],
     }
 
@@ -816,7 +892,9 @@ def _sorted_row_ids(row_ids: Mapping[str, set[str]]) -> dict[str, list[str]]:
     return {table: sorted(ids) for table, ids in sorted(row_ids.items()) if ids}
 
 
-def _sorted_rows_map(rows: Mapping[str, Iterable[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+def _sorted_rows_map(
+    rows: Mapping[str, Iterable[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
     result = {}
     for table_name, table_rows in sorted(rows.items()):
         id_column = _ID_COLUMNS.get(table_name, "")
