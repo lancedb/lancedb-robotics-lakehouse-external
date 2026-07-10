@@ -13,7 +13,7 @@ train/eval snapshots, and traceable relabeling loops.
 
 ```mermaid
 flowchart TB
-    SRC["Raw logs · fleet data · sim outputs<br/>MCAP · ROS bags · video · lidar · S3 / GCS / Azure / NAS"]
+    SRC["Raw logs · fleet data · sim outputs<br/>MCAP · ROS bags · LeRobot datasets · video · lidar · S3 / GCS / Azure / NAS"]
 
     subgraph LAKE["LanceDB robotics layer — episode quality + eval reproducibility"]
         direction TB
@@ -141,6 +141,12 @@ episode quality and evaluation reproducibility first-class concepts:
   projection, filters, deterministic shuffle, temporal windows, and PyTorch
   adapters, with boundary projections (LeRobot / RLDS / WebDataset) only when an
   external tool needs that shape.
+- **LeRobot as a first-class ingest source, not just an export target** —
+  `ingest lerobot` maps an existing LeRobot dataset directory or HF Hub repo id
+  straight into canonical `episodes` and frame-grain `observations` (LeRobot is
+  already episode/frame-shaped, so this skips the MCAP/ROS decoder registry
+  entirely), with durable, resumable job tracking (checkpoints, claim/heartbeat
+  leases, watchdog recovery).
 - **Lineage that crosses machines** — content-addressed IDs so a bad checkpoint
   traces back to its exact training slice and source log.
 - **Swappable implementations** behind stable interfaces: Lance/LanceDB OSS,
@@ -184,7 +190,7 @@ uv sync --extra object-store  # open s3:// / gs:// / az:// lakes and raw logs
 uv sync --extra embeddings    # real sentence-transformers / CLIP providers
 uv sync --extra media         # image/array media materialization helpers
 uv sync --extra torch         # PyTorch previews, datasets, dataloaders
-uv sync --extra lerobot       # native LeRobot projection validation/loading
+uv sync --extra lerobot       # native LeRobot ingest + projection validation/loading
 uv sync --extra rlds          # RLDS / TF / TFDS / Reverb (Linux x86_64, Py 3.11/3.12)
 uv sync --extra webdataset    # WebDataset projection export/loading
 ```
@@ -310,6 +316,13 @@ whole product vision is finished. Status legend: **✅ shipped · 🚧 evolving 
   [typed field extraction](docs/narratives/feature-set-typed-field-extraction.md))
 - ✅ **ROS bag ingest** (ROS 1 `.bag`, ROS 2 sqlite `.db3`); split, summary-less,
   and unindexed MCAP, attachments, metadata records, and compressed chunks.
+- ✅ **LeRobot dataset ingest** — a local/object-store LeRobot dataset directory
+  or HF Hub repo id maps directly into canonical `episodes` and frame-grain
+  `observations` (no MCAP/ROS decoding needed); per-camera MP4 streams are
+  recorded as `videos` / `video_encodings` references without re-encoding or
+  copying bytes. Durable, resumable job tracking — checkpoints, claim/heartbeat
+  leases, stale-claim recovery — plus object-store source validation and
+  concurrent media inspection.
 - ✅ **Object-store & remote lakes** — `s3://` / `gs://` / `az://` / `db://` and
   namespace-routed connections; credentials resolved at runtime, never persisted.
 - 🔭 Automotive ingest (ASAM MDF4); more capture formats via the adapter registry.
@@ -463,7 +476,8 @@ regenerate with `UPDATE_SNAPSHOTS=1 uv run pytest` and commit the updated
 ## Relationship to `mcap-lancedb`
 
 `mcap-lancedb` stays a focused MCAP/ROS log ingest/conversion engine.
-`lancedb-robotics` orchestrates domain workflows *across* MCAP, ROS bags, object
-storage, labels, model outputs, simulation feedback, training snapshots, and
-boundary projections (LeRobot / RLDS / WebDataset / Foxglove / Rerun) — using
-`mcap-lancedb`-class engines as one ingest path among many.
+`lancedb-robotics` orchestrates domain workflows *across* MCAP, ROS bags,
+LeRobot datasets, object storage, labels, model outputs, simulation feedback,
+training snapshots, and boundary projections (LeRobot / RLDS / WebDataset /
+Foxglove / Rerun) — using `mcap-lancedb`-class engines as one ingest path among
+several, with LeRobot ingest as another first-class one.
