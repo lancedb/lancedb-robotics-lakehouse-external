@@ -37,6 +37,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from lancedb_robotics import __version__
@@ -125,6 +127,27 @@ LEROBOT_NATIVE_DECODE_POLICY = (
 )
 WEBDATASET_FORMAT = "webdataset"
 DEEPLAKE_FORMAT = "deeplake"
+
+# Backlog 0126: analytics-lakehouse baselines. Parquet is dependency-light
+# (pyarrow is already required); Iceberg is optional and gated on pyiceberg plus a
+# reachable catalog. Both materialize the same logical observation set the Lance
+# and WebDataset arms read, so the comparison is fair and explicit about what is
+# metadata/table-scan cost versus Python/PyTorch payload hydration cost.
+PARQUET_FORMAT = "parquet"
+ICEBERG_FORMAT = "iceberg"
+PARQUET_ANALYTICS_LAYOUT_VERSION = "parquet-analytics-table-v0"
+ICEBERG_ANALYTICS_LAYOUT_VERSION = "iceberg-analytics-table-v0"
+ICEBERG_MODULE = "pyiceberg"
+ICEBERG_INSTALL_HINT = "pip install 'pyiceberg[sql-sqlite,pyarrow]'"
+# A live catalog is configured either by the standard pyiceberg env config or by
+# pointing these repo-specific variables at a catalog URI / warehouse directory.
+ICEBERG_CATALOG_URI_ENV = "LANCEDB_ROBOTICS_ICEBERG_CATALOG_URI"
+ICEBERG_WAREHOUSE_ENV = "LANCEDB_ROBOTICS_ICEBERG_WAREHOUSE"
+ICEBERG_NAMESPACE = "lancedb_robotics_bench"
+# Payload placement vocabulary recorded on every materialized analytics baseline.
+PAYLOAD_PLACEMENT_INLINE = "inline"
+PAYLOAD_PLACEMENT_REFERENCED = "referenced"
+PAYLOAD_PLACEMENT_COPIED = "copied"
 ENTERPRISE_BENCHMARK_CONNECTION_KINDS = frozenset(
     {"lancedb_remote_db", "rest_namespace_lancedb", "namespace_lancedb"}
 )
@@ -168,15 +191,36 @@ DEFAULT_BENCHMARK_FORMATS = (
 )
 SUPPORTED_BENCHMARK_FORMATS = DEFAULT_BENCHMARK_FORMATS + (
     LEROBOT_NATIVE_FORMAT,
+    PARQUET_FORMAT,
+    ICEBERG_FORMAT,
     "lerobot",
     "lerobot-v3",
 )
+# Analytics baselines are opt-in (not in DEFAULT_BENCHMARK_FORMATS) so existing
+# reports and the public LeRobot default stay stable; researchers request them
+# explicitly with --formats parquet,iceberg.
+ANALYTICS_BENCHMARK_FORMATS = (PARQUET_FORMAT, ICEBERG_FORMAT)
 
 METRIC_DATALOADER_THROUGHPUT = "dataloader_throughput"
 METRIC_RANDOM_ACCESS_LATENCY = "random_access_latency"
 METRIC_RANDOM_FRAME_SAMPLING = "random_frame_sampling"
 METRIC_QUERY_TO_DATASET_CURATION = "query_to_dataset_curation"
 METRIC_STORAGE_FOOTPRINT = "storage_footprint"
+# Analytics-baseline-specific metrics (backlog 0126). These sit alongside the
+# five shared BENCHMARK_METRICS on parquet/iceberg entries and separate table
+# metadata-scan cost from Python/PyTorch payload hydration cost. The shuffled and
+# filter-change metric names match the enterprise-lance report keys so the two
+# families read consistently.
+METRIC_METADATA_SCAN_LATENCY = "metadata_scan_latency"
+METRIC_ROW_HYDRATION_LATENCY = "row_hydration_latency"
+METRIC_SHUFFLED_EPOCH_THROUGHPUT = "shuffled_epoch_throughput"
+METRIC_SUBSET_FILTER_CHANGE = "subset_filter_change"
+ANALYTICS_BASELINE_METRICS = (
+    METRIC_METADATA_SCAN_LATENCY,
+    METRIC_ROW_HYDRATION_LATENCY,
+    METRIC_SHUFFLED_EPOCH_THROUGHPUT,
+    METRIC_SUBSET_FILTER_CHANGE,
+)
 BENCHMARK_METRICS = (
     METRIC_DATALOADER_THROUGHPUT,
     METRIC_RANDOM_ACCESS_LATENCY,
@@ -359,6 +403,20 @@ def run_benchmark_suite(
             )
         elif fmt == WEBDATASET_FORMAT:
             report["formats"][fmt] = _run_webdataset_format(
+                lake,
+                snapshot,
+                config=config,
+                artifact_root=artifact_root,
+            )
+        elif fmt == PARQUET_FORMAT:
+            report["formats"][fmt] = _run_parquet_format(
+                lake,
+                snapshot,
+                config=config,
+                artifact_root=artifact_root,
+            )
+        elif fmt == ICEBERG_FORMAT:
+            report["formats"][fmt] = _run_iceberg_format(
                 lake,
                 snapshot,
                 config=config,
@@ -1648,10 +1706,14 @@ def _normalize_formats(formats: tuple[str, ...] | list[str]) -> tuple[str, ...]:
             fmt = LEROBOT_DEFAULT_FORMAT
         if fmt in {"lerobot-v3", "official-lerobot"}:
             fmt = LEROBOT_NATIVE_FORMAT
+        if fmt in {"apache-iceberg", "iceberg-table"}:
+            fmt = ICEBERG_FORMAT
+        if fmt in {"parquet-table", "analytics-parquet"}:
+            fmt = PARQUET_FORMAT
         if fmt not in SUPPORTED_BENCHMARK_FORMATS:
             raise BenchmarkError(
                 f"unknown benchmark format {raw!r}; choose from "
-                f"{', '.join(DEFAULT_BENCHMARK_FORMATS + (LEROBOT_NATIVE_FORMAT,))}"
+                f"{', '.join(DEFAULT_BENCHMARK_FORMATS + (LEROBOT_NATIVE_FORMAT,) + ANALYTICS_BENCHMARK_FORMATS)}"
             )
         if fmt not in normalized:
             normalized.append(fmt)
@@ -3451,6 +3513,593 @@ def _measure_projection_storage(out_dir: Path, data_files: tuple[str, ...]) -> d
     }
 
 
+# ---------------------------------------------------------------------------
+# Analytics-lakehouse baselines (backlog 0126): Parquet and optional Iceberg.
+#
+# Both materialize the snapshot's observation rows -- the same logical sample set
+# the Lance/enterprise-lance and WebDataset arms read -- into a columnar analytics
+# table with payloads stored INLINE at fixed source quality. The metrics separate
+# table metadata-scan cost from Python/PyTorch payload hydration cost, and the
+# subset-filter-change metric records the rewrite/repack an analytics table needs
+# when the filter changes, in contrast to Lance's version-pinned row plan.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_analytics_table(lake: Lake, snapshot: dict[str, Any]) -> pa.Table:
+    """Select the snapshot's observation rows as an analytics table.
+
+    Payloads are kept inline (``payload_blob`` binary column) at fixed source
+    quality; nothing is transcoded. Row order is the deterministic observations
+    table order filtered to the observation ids reachable from the snapshot's
+    scenarios, so re-materializing the same snapshot yields the same table.
+    """
+    scenario_ids = set(snapshot["scenario_ids"])
+    observation_ids: list[str] = []
+    seen: set[str] = set()
+    for row in lake.table("scenarios").to_arrow().to_pylist():
+        if str(row["scenario_id"]) not in scenario_ids:
+            continue
+        for oid in row.get("observation_ids") or []:
+            key = str(oid)
+            if key not in seen:
+                seen.add(key)
+                observation_ids.append(key)
+    observations = lake.table("observations").to_arrow()
+    if not observation_ids:
+        return observations.slice(0, 0)
+    mask = pc.is_in(
+        observations["observation_id"],
+        value_set=pa.array(observation_ids, type=pa.string()),
+    )
+    return observations.filter(mask)
+
+
+def _analytics_row_group_size(num_rows: int) -> int:
+    """Pick a row-group size that yields multiple row groups when possible.
+
+    Multiple row groups make the metadata-scan vs payload-hydration split and the
+    row-group-bounded random-access penalty observable even on small fixtures.
+    """
+    if num_rows <= 1:
+        return 1
+    return max(1, math.ceil(num_rows / 8))
+
+
+def _write_analytics_parquet(table: pa.Table, path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        table,
+        path,
+        row_group_size=_analytics_row_group_size(table.num_rows),
+    )
+    return table.num_rows
+
+
+def _run_parquet_format(
+    lake: Lake,
+    snapshot: dict[str, Any],
+    *,
+    config: BenchmarkRunConfig,
+    artifact_root: Path | None,
+) -> dict[str, Any]:
+    if artifact_root is None:
+        with tempfile.TemporaryDirectory(prefix="lancedb-robotics-bench-") as tmp:
+            return _run_parquet_in_dir(
+                lake,
+                snapshot,
+                config=config,
+                out_dir=Path(tmp) / PARQUET_FORMAT,
+                ephemeral=True,
+            )
+    return _run_parquet_in_dir(
+        lake,
+        snapshot,
+        config=config,
+        out_dir=artifact_root / PARQUET_FORMAT,
+        ephemeral=False,
+    )
+
+
+def _run_parquet_in_dir(
+    lake: Lake,
+    snapshot: dict[str, Any],
+    *,
+    config: BenchmarkRunConfig,
+    out_dir: Path,
+    ephemeral: bool,
+) -> dict[str, Any]:
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    table_path = out_dir / "table.parquet"
+
+    start_materialize_ns = time.perf_counter_ns()
+    table = _snapshot_analytics_table(lake, snapshot)
+    row_count = _write_analytics_parquet(table, table_path)
+    materialize_seconds = _elapsed_seconds(start_materialize_ns)
+
+    metadata_scan = _measure_parquet_metadata_scan(table_path)
+    rows, hydration = _measure_parquet_hydration(table_path, config)
+    throughput = _measure_rows_throughput(rows, config)
+    random_access = _measure_parquet_random_access(table_path, config)
+    random_frame_sampling = _measure_rows_random_frame_sampling(rows, config)
+    shuffled = _measure_rows_shuffled_epoch(rows, config)
+    # Storage footprint reflects only the primary materialized table; it is
+    # measured before the filter-change rewrite so the transient repack artifact
+    # does not inflate the stored-bytes metric.
+    storage = _measure_projection_storage(out_dir, ("table.parquet",))
+    storage["details"]["payload_placement"] = PAYLOAD_PLACEMENT_INLINE
+    filter_change = _measure_parquet_filter_change(table, out_dir, config)
+
+    curation = {
+        "status": "completed",
+        "value": materialize_seconds * 1000.0,
+        "unit": "ms",
+        "details": {
+            "operation": "materialize_parquet_analytics_table",
+            "snapshot_name": snapshot["snapshot_name"],
+            "dataset_id": snapshot["dataset_id"],
+            "rows": row_count,
+            "row_group_size": _analytics_row_group_size(row_count),
+            "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+        },
+    }
+
+    return {
+        "status": "completed",
+        "format": PARQUET_FORMAT,
+        "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+        "metrics": {
+            METRIC_DATALOADER_THROUGHPUT: throughput,
+            METRIC_RANDOM_ACCESS_LATENCY: random_access,
+            METRIC_RANDOM_FRAME_SAMPLING: random_frame_sampling,
+            METRIC_QUERY_TO_DATASET_CURATION: curation,
+            METRIC_STORAGE_FOOTPRINT: storage,
+            METRIC_METADATA_SCAN_LATENCY: metadata_scan,
+            METRIC_ROW_HYDRATION_LATENCY: hydration,
+            METRIC_SHUFFLED_EPOCH_THROUGHPUT: shuffled,
+            METRIC_SUBSET_FILTER_CHANGE: filter_change,
+        },
+        "notes": [
+            "Parquet analytics baseline materializes the snapshot's observation "
+            "rows into a single columnar table with payloads stored inline.",
+            "Metadata scan reads only the Parquet footer/row-group statistics; "
+            "hydration reads and materializes payload bytes for the sampled rows.",
+            "A subset-filter change rewrites/repacks a new Parquet table, whereas "
+            "Lance creates a new version-pinned row plan without rewriting payloads.",
+            "Baseline is not penalized for missing robotics loader features it does "
+            "not claim; it measures analytics table-scan plus Python/PyTorch hydration.",
+        ],
+        "table_manifest": {
+            "layout": PARQUET_ANALYTICS_LAYOUT_VERSION,
+            "table_path": None if ephemeral else str(table_path),
+            "rows": row_count,
+            "row_group_size": _analytics_row_group_size(row_count),
+            "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+            "columns": list(table.schema.names),
+        },
+    }
+
+
+def _measure_parquet_metadata_scan(table_path: Path) -> dict[str, Any]:
+    start_ns = time.perf_counter_ns()
+    metadata = pq.read_metadata(table_path)
+    schema = pq.read_schema(table_path)
+    duration_ms = _elapsed_seconds(start_ns) * 1000.0
+    return {
+        "status": "completed",
+        "value": duration_ms,
+        "unit": "ms",
+        "details": {
+            "operation": "read_parquet_footer_metadata",
+            "num_rows": metadata.num_rows,
+            "num_row_groups": metadata.num_row_groups,
+            "num_columns": metadata.num_columns,
+            "column_names": list(schema.names),
+            "read_payload": False,
+        },
+    }
+
+
+def _measure_parquet_hydration(
+    table_path: Path,
+    config: BenchmarkRunConfig,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    start_ns = time.perf_counter_ns()
+    table = pq.read_table(table_path)
+    rows = table.to_pylist()
+    duration_seconds = _elapsed_seconds(start_ns)
+    count = min(len(rows), config.sample_limit)
+    payload_bytes = sum(_row_materialized_bytes(row) for row in rows[:count])
+    per_sample_ms = (duration_seconds * 1000.0 / count) if count else 0.0
+    return rows, {
+        "status": "completed",
+        "value": per_sample_ms,
+        "unit": "ms/sample",
+        "details": {
+            "operation": "read_table_and_hydrate_payload",
+            "samples": count,
+            "rows_loaded": len(rows),
+            "duration_seconds": duration_seconds,
+            "payload_bytes_materialized": int(payload_bytes),
+            "access_path": "full-table-read-then-index",
+        },
+    }
+
+
+def _measure_parquet_random_access(
+    table_path: Path,
+    config: BenchmarkRunConfig,
+) -> dict[str, Any]:
+    parquet_file = pq.ParquetFile(table_path)
+    metadata = parquet_file.metadata
+    num_rows = metadata.num_rows
+    indices = _random_indices(num_rows, config.random_access_samples, config.seed)
+    row_group_rows = [
+        metadata.row_group(rg).num_rows for rg in range(metadata.num_row_groups)
+    ]
+    offsets: list[int] = []
+    running = 0
+    for count in row_group_rows:
+        offsets.append(running)
+        running += count
+    latencies_ms: list[float] = []
+    for index in indices:
+        target_rg = 0
+        for rg in range(len(offsets)):
+            if index >= offsets[rg]:
+                target_rg = rg
+        start_ns = time.perf_counter_ns()
+        # Analytics random access must read the whole row group holding the row.
+        parquet_file.read_row_group(target_rg)
+        latencies_ms.append(_elapsed_seconds(start_ns) * 1000.0)
+    return {
+        "status": "completed",
+        "value": statistics.mean(latencies_ms) if latencies_ms else 0.0,
+        "unit": "ms/sample",
+        "details": {
+            "samples": len(indices),
+            "indices": indices[:16],
+            "num_row_groups": metadata.num_row_groups,
+            "mean_ms": statistics.mean(latencies_ms) if latencies_ms else 0.0,
+            "p50_ms": _percentile(latencies_ms, 0.50),
+            "p95_ms": _percentile(latencies_ms, 0.95),
+            "max_ms": max(latencies_ms) if latencies_ms else 0.0,
+            "access_path": "read-row-group-per-sample",
+        },
+    }
+
+
+def _measure_rows_shuffled_epoch(
+    rows: list[dict[str, Any]],
+    config: BenchmarkRunConfig,
+) -> dict[str, Any]:
+    order = list(range(len(rows)))
+    random.Random(config.seed + 101).shuffle(order)
+    start_ns = time.perf_counter_ns()
+    materialized = 0
+    for index in order:
+        materialized += _row_materialized_bytes(rows[index])
+    duration = _elapsed_seconds(start_ns)
+    return {
+        "status": "completed",
+        "value": _rate(len(order), duration),
+        "unit": "samples/s",
+        "details": {
+            "samples": len(order),
+            "duration_seconds": duration,
+            "payload_bytes_materialized": int(materialized),
+            "shuffle_seed": config.seed + 101,
+        },
+    }
+
+
+def _measure_parquet_filter_change(
+    table: pa.Table,
+    out_dir: Path,
+    config: BenchmarkRunConfig,
+) -> dict[str, Any]:
+    selected_rows = max(1, table.num_rows // 2) if table.num_rows else 0
+    filtered = table.slice(0, selected_rows)
+    repack_path = out_dir / "table-filtered.parquet"
+    start_ns = time.perf_counter_ns()
+    _write_analytics_parquet(filtered, repack_path)
+    duration_ms = _elapsed_seconds(start_ns) * 1000.0
+    rewritten_bytes = _path_size(repack_path) or 0
+    return {
+        "status": "completed",
+        "value": duration_ms,
+        "unit": "ms",
+        "details": {
+            "operation": "rewrite_parquet_table_for_filter_change",
+            "selected_rows": selected_rows,
+            "base_rows": table.num_rows,
+            "rewritten_bytes": int(rewritten_bytes),
+            "materialized_bytes_written": int(rewritten_bytes),
+            "requires_full_rewrite": True,
+            "contrast": (
+                "Lance re-plans a new version-pinned row plan over the same "
+                "payloads; the Parquet analytics table must rewrite/repack a new "
+                "table artifact for the changed subset filter."
+            ),
+        },
+    }
+
+
+def _run_iceberg_format(
+    lake: Lake,
+    snapshot: dict[str, Any],
+    *,
+    config: BenchmarkRunConfig,
+    artifact_root: Path | None,
+) -> dict[str, Any]:
+    if not _module_available(ICEBERG_MODULE):
+        return _skip_iceberg(
+            f"optional dependency {ICEBERG_MODULE!r} is not installed; "
+            f"install it with `{ICEBERG_INSTALL_HINT}` and configure a catalog "
+            f"({ICEBERG_CATALOG_URI_ENV} or standard pyiceberg config) to run the "
+            "Iceberg analytics baseline",
+        )
+    catalog_config, catalog_reason = _iceberg_catalog_config(artifact_root)
+    if catalog_config is None:
+        return _skip_iceberg(catalog_reason, catalog=None)
+    if artifact_root is None:
+        with tempfile.TemporaryDirectory(prefix="lancedb-robotics-iceberg-") as tmp:
+            return _run_iceberg_in_dir(
+                lake,
+                snapshot,
+                config=config,
+                out_dir=Path(tmp) / ICEBERG_FORMAT,
+                catalog_config=catalog_config,
+                ephemeral=True,
+            )
+    return _run_iceberg_in_dir(
+        lake,
+        snapshot,
+        config=config,
+        out_dir=artifact_root / ICEBERG_FORMAT,
+        catalog_config=catalog_config,
+        ephemeral=False,
+    )
+
+
+def _iceberg_catalog_config(
+    artifact_root: Path | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Resolve an Iceberg catalog configuration for the benchmark.
+
+    Priority: an explicit catalog URI env var, otherwise a local SQLite catalog
+    rooted in the artifact directory (only usable when artifacts are retained --
+    an ephemeral run with no configured catalog is a structured skip so a report
+    can never imply Iceberg coverage it did not actually produce).
+    """
+    catalog_uri = os.environ.get(ICEBERG_CATALOG_URI_ENV)
+    warehouse = os.environ.get(ICEBERG_WAREHOUSE_ENV)
+    if catalog_uri:
+        return (
+            {
+                "kind": "configured",
+                "uri": catalog_uri,
+                "warehouse": warehouse,
+                "source": ICEBERG_CATALOG_URI_ENV,
+            },
+            "",
+        )
+    if artifact_root is None:
+        return (
+            None,
+            "no Iceberg catalog configured; set "
+            f"{ICEBERG_CATALOG_URI_ENV} or run with --artifacts so a local SQLite "
+            "catalog can be created for the benchmark",
+        )
+    return (
+        {
+            "kind": "local-sqlite",
+            "warehouse": str(artifact_root / ICEBERG_FORMAT / "warehouse"),
+            "source": "artifact-local-default",
+        },
+        "",
+    )
+
+
+def _run_iceberg_in_dir(
+    lake: Lake,
+    snapshot: dict[str, Any],
+    *,
+    config: BenchmarkRunConfig,
+    out_dir: Path,
+    catalog_config: dict[str, Any],
+    ephemeral: bool,
+) -> dict[str, Any]:
+    try:
+        return _run_iceberg_materialized(
+            lake,
+            snapshot,
+            config=config,
+            out_dir=out_dir,
+            catalog_config=catalog_config,
+            ephemeral=ephemeral,
+        )
+    except Exception as exc:  # pragma: no cover - depends on optional pyiceberg stack.
+        return _skip_iceberg(
+            f"Iceberg analytics baseline could not run end to end: {exc}",
+            catalog=catalog_config,
+        )
+
+
+def _run_iceberg_materialized(
+    lake: Lake,
+    snapshot: dict[str, Any],
+    *,
+    config: BenchmarkRunConfig,
+    out_dir: Path,
+    catalog_config: dict[str, Any],
+    ephemeral: bool,
+) -> dict[str, Any]:  # pragma: no cover - exercised only with pyiceberg installed.
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    warehouse = Path(catalog_config.get("warehouse") or (out_dir / "warehouse"))
+    warehouse.mkdir(parents=True, exist_ok=True)
+    catalog_uri = catalog_config.get("uri") or f"sqlite:///{warehouse / 'catalog.db'}"
+    catalog = SqlCatalog(
+        "lancedb_robotics_bench",
+        uri=catalog_uri,
+        warehouse=f"file://{warehouse}",
+    )
+
+    start_materialize_ns = time.perf_counter_ns()
+    table = _snapshot_analytics_table(lake, snapshot)
+    try:
+        catalog.create_namespace(ICEBERG_NAMESPACE)
+    except Exception:  # noqa: BLE001 - namespace may already exist.
+        pass
+    identifier = f"{ICEBERG_NAMESPACE}.observations"
+    try:
+        catalog.drop_table(identifier)
+    except Exception:  # noqa: BLE001 - table may not exist yet.
+        pass
+    iceberg_table = catalog.create_table(identifier, schema=table.schema)
+    iceberg_table.append(table)
+    materialize_seconds = _elapsed_seconds(start_materialize_ns)
+
+    start_meta_ns = time.perf_counter_ns()
+    scan = iceberg_table.scan()
+    planned_files = list(scan.plan_files())
+    metadata_ms = _elapsed_seconds(start_meta_ns) * 1000.0
+
+    start_hydration_ns = time.perf_counter_ns()
+    scanned = scan.to_arrow()
+    rows = scanned.to_pylist()
+    hydration_seconds = _elapsed_seconds(start_hydration_ns)
+    count = min(len(rows), config.sample_limit)
+    payload_bytes = sum(_row_materialized_bytes(row) for row in rows[:count])
+
+    metadata_scan = {
+        "status": "completed",
+        "value": metadata_ms,
+        "unit": "ms",
+        "details": {
+            "operation": "iceberg_plan_files",
+            "planned_data_files": len(planned_files),
+            "read_payload": False,
+        },
+    }
+    hydration = {
+        "status": "completed",
+        "value": (hydration_seconds * 1000.0 / count) if count else 0.0,
+        "unit": "ms/sample",
+        "details": {
+            "operation": "iceberg_scan_to_arrow_and_hydrate",
+            "samples": count,
+            "rows_loaded": len(rows),
+            "duration_seconds": hydration_seconds,
+            "payload_bytes_materialized": int(payload_bytes),
+        },
+    }
+    throughput = _measure_rows_throughput(rows, config)
+    random_access = _measure_rows_random_access(rows, config)
+    random_frame_sampling = _measure_rows_random_frame_sampling(rows, config)
+    shuffled = _measure_rows_shuffled_epoch(rows, config)
+
+    filtered = table.slice(0, max(1, table.num_rows // 2) if table.num_rows else 0)
+    start_filter_ns = time.perf_counter_ns()
+    iceberg_table.overwrite(filtered)
+    filter_ms = _elapsed_seconds(start_filter_ns) * 1000.0
+    storage = _measure_projection_storage(out_dir, ("warehouse",))
+    storage["details"]["payload_placement"] = PAYLOAD_PLACEMENT_INLINE
+
+    curation = {
+        "status": "completed",
+        "value": materialize_seconds * 1000.0,
+        "unit": "ms",
+        "details": {
+            "operation": "materialize_iceberg_table",
+            "rows": table.num_rows,
+            "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+        },
+    }
+    filter_change = {
+        "status": "completed",
+        "value": filter_ms,
+        "unit": "ms",
+        "details": {
+            "operation": "iceberg_overwrite_for_filter_change",
+            "selected_rows": filtered.num_rows,
+            "base_rows": table.num_rows,
+            "requires_new_snapshot": True,
+            "contrast": (
+                "Lance re-plans a new version-pinned row plan; the Iceberg table "
+                "writes a new snapshot with rewritten data files for the filter."
+            ),
+        },
+    }
+    return {
+        "status": "completed",
+        "format": ICEBERG_FORMAT,
+        "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+        "metrics": {
+            METRIC_DATALOADER_THROUGHPUT: throughput,
+            METRIC_RANDOM_ACCESS_LATENCY: random_access,
+            METRIC_RANDOM_FRAME_SAMPLING: random_frame_sampling,
+            METRIC_QUERY_TO_DATASET_CURATION: curation,
+            METRIC_STORAGE_FOOTPRINT: storage,
+            METRIC_METADATA_SCAN_LATENCY: metadata_scan,
+            METRIC_ROW_HYDRATION_LATENCY: hydration,
+            METRIC_SHUFFLED_EPOCH_THROUGHPUT: shuffled,
+            METRIC_SUBSET_FILTER_CHANGE: filter_change,
+        },
+        "notes": [
+            "Iceberg analytics baseline materializes the snapshot's observation "
+            "rows into an Iceberg table with payloads stored inline.",
+            "A subset-filter change writes a new Iceberg snapshot with rewritten "
+            "data files, whereas Lance creates a new version-pinned row plan.",
+        ],
+        "catalog": {
+            "kind": catalog_config.get("kind"),
+            "uri": catalog_uri,
+            "warehouse": str(warehouse),
+            "namespace": ICEBERG_NAMESPACE,
+            "identifier": identifier,
+        },
+        "table_manifest": {
+            "layout": ICEBERG_ANALYTICS_LAYOUT_VERSION,
+            "rows": table.num_rows,
+            "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+            "columns": list(table.schema.names),
+        },
+    }
+
+
+def _skip_iceberg(
+    reason: str,
+    *,
+    catalog: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "format": ICEBERG_FORMAT,
+        "metrics": {metric: _skipped_metric(reason) for metric in BENCHMARK_METRICS},
+        "skip_reason": reason,
+        "iceberg": {
+            "module": ICEBERG_MODULE,
+            "available": _module_available(ICEBERG_MODULE),
+            "install": ICEBERG_INSTALL_HINT,
+            "catalog_env": ICEBERG_CATALOG_URI_ENV,
+            "warehouse_env": ICEBERG_WAREHOUSE_ENV,
+            "catalog": dict(catalog or {}),
+        },
+        "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+        "notes": [
+            reason,
+            "Skipped explicitly so reports without an Iceberg catalog cannot be "
+            "read as Iceberg coverage.",
+        ],
+    }
+
+
 def _skip_optional_format(fmt: str) -> dict[str, Any]:
     if fmt == DEEPLAKE_FORMAT:
         module = "deeplake"
@@ -4657,6 +5306,23 @@ def _format_versions() -> dict[str, Any]:
             "layout": WEBDATASET_FORMAT_VERSION,
             "native_loader": native_loader_status("webdataset"),
         },
+        PARQUET_FORMAT: {
+            "layout": PARQUET_ANALYTICS_LAYOUT_VERSION,
+            "pyarrow": _package_version("pyarrow"),
+            "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+            "note": "Dependency-light analytics baseline; pyarrow is already required.",
+        },
+        ICEBERG_FORMAT: {
+            "layout": ICEBERG_ANALYTICS_LAYOUT_VERSION,
+            "pyiceberg": _package_version(ICEBERG_MODULE),
+            "available": _module_available(ICEBERG_MODULE),
+            "payload_placement": PAYLOAD_PLACEMENT_INLINE,
+            "install_policy": {
+                "install": ICEBERG_INSTALL_HINT,
+                "catalog_env": ICEBERG_CATALOG_URI_ENV,
+                "warehouse_env": ICEBERG_WAREHOUSE_ENV,
+            },
+        },
         DEEPLAKE_FORMAT: {
             "deeplake": _package_version("deeplake"),
             "available": _module_available("deeplake"),
@@ -4739,6 +5405,25 @@ def _methodology() -> dict[str, Any]:
             "enterprise-lance measures backend='enterprise' native training over a "
             "db:// or namespace-backed lake; enterprise_fixture_uri enables a "
             "fake-local db:// fixture for reproducible CI reports."
+        ),
+        "analytics_baselines": (
+            "parquet and iceberg are opt-in analytics-lakehouse baselines over the "
+            "same logical observation set. They separate metadata/table-scan latency "
+            "(metadata_scan_latency) from Python/PyTorch payload hydration latency "
+            "(row_hydration_latency), and report a shuffled-epoch throughput and a "
+            "subset-filter-change rewrite cost. They are not penalized for robotics "
+            "loader features they do not claim."
+        ),
+        "analytics_filter_change": (
+            "For analytics baselines a changed subset filter forces a table "
+            "rewrite/repack (Parquet) or a new snapshot with rewritten data files "
+            "(Iceberg), recorded with materialized_bytes_written; Lance instead "
+            "creates a new version-pinned row plan without rewriting payload bytes."
+        ),
+        "payload_placement": (
+            "Analytics baselines record whether payloads are inline, referenced, or "
+            "copied; the parquet/iceberg baselines store payload bytes inline at "
+            "fixed source quality."
         ),
     }
 

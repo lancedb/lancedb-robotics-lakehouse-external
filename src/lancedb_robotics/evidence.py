@@ -461,7 +461,9 @@ def _fetch_blobs_as_of(
     if table_version is not None:
         table.checkout(int(table_version))
     try:
-        return fetch_blobs(table, column, ids, id_column=id_column)
+        return fetch_blobs(
+            table, column, ids, id_column=id_column, connection_spec=lake.connection_spec
+        )
     finally:
         if table_version is not None:
             table.checkout_latest()

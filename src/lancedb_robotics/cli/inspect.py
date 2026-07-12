@@ -267,6 +267,142 @@ def inspect_lerobot_object_store_conformance(
         raise typer.Exit(code=3)
 
 
+_INVOCATION_CONFORMANCE_MODE_OPTION = typer.Option(
+    "contract-test",
+    "--mode",
+    help="Backend to probe: 'contract-test' (fakes, no credentials) or 'live'.",
+)
+_INVOCATION_CONFORMANCE_PER_CLASS_OPTION = typer.Option(
+    6,
+    "--per-class",
+    min=1,
+    help="Representative audit rows sampled per 0076 support class.",
+)
+_INVOCATION_CONFORMANCE_FORMAT_OPTION = typer.Option(
+    "text", "--format", help="Output format: json, text, or markdown."
+)
+_INVOCATION_CONFORMANCE_REPORT_OUT_OPTION = typer.Option(
+    None,
+    "--report-out",
+    help="Write the JSON compatibility report to this path (for CI artifacts).",
+)
+_INVOCATION_CONFORMANCE_STRICT_OPTION = typer.Option(
+    False,
+    "--strict",
+    help="Exit 3 when any sampled row is non-conformant with its audit support class.",
+)
+
+
+@inspect_app.command("invocation-conformance")
+def inspect_invocation_conformance(
+    mode: str = _INVOCATION_CONFORMANCE_MODE_OPTION,
+    per_class: int = _INVOCATION_CONFORMANCE_PER_CLASS_OPTION,
+    format: str = _INVOCATION_CONFORMANCE_FORMAT_OPTION,
+    report_out: Path | None = _INVOCATION_CONFORMANCE_REPORT_OUT_OPTION,
+    strict: bool = _INVOCATION_CONFORMANCE_STRICT_OPTION,
+) -> None:
+    """Probe representative 0076-audit rows against a backend and report compatibility.
+
+    Samples representative rows from each 0076 invocation-audit support class and
+    exercises the real 0128 capability gates and 0129 namespace-direct adapter,
+    reporting supported/unsupported/skipped per row linked back to the audit id.
+    The default contract-test mode needs no live credentials; ``--mode live``
+    reads the ``LANCEDB_ROBOTICS_CONFORMANCE_*`` endpoint/auth-ref vars and marks
+    the live subset skipped (never failed) when they are absent.
+    """
+    from lancedb_robotics import invocation_conformance as ic
+
+    if format not in ("json", "text", "markdown"):
+        typer.echo(f"error: unknown format {format!r}; expected json, text, or markdown", err=True)
+        raise typer.Exit(code=1)
+    if mode not in (ic.MODE_CONTRACT_TEST, ic.MODE_LIVE):
+        typer.echo(
+            f"error: unknown mode {mode!r}; expected "
+            f"{ic.MODE_CONTRACT_TEST!r} or {ic.MODE_LIVE!r}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    report = ic.run_conformance(mode=mode, per_class=per_class)
+    payload = report.to_dict()
+
+    if report_out is not None:
+        report_out.parent.mkdir(parents=True, exist_ok=True)
+        report_out.write_text(report.to_json())
+
+    if format == "json":
+        typer.echo(report.to_json())
+    elif format == "markdown":
+        typer.echo(_invocation_conformance_markdown(payload))
+    else:
+        _print_invocation_conformance_report(payload)
+
+    if strict and not report.ok():
+        raise typer.Exit(code=3)
+
+
+def _print_invocation_conformance_report(report: dict) -> None:
+    summary = report["summary"]
+    typer.echo(
+        f"invocation conformance ({report['mode']}): "
+        f"{summary['conformant']}/{summary['total_samples']} conformant, "
+        f"{summary['non_conformant']} non-conformant"
+    )
+    typer.echo(f"  audit schema: {report['audit_schema_version']}")
+    for support_class in report["per_class_sampled"]:
+        sampled = report["per_class_sampled"][support_class]
+        total = report["per_class_total"].get(support_class, 0)
+        typer.echo(f"  {support_class}: sampled {sampled}/{total}")
+    if report.get("skipped_live"):
+        typer.echo(f"  skipped (live): {'; '.join(report['skipped_live'])}")
+    for probe in report["probes"]:
+        flag = "ok" if probe["conformant"] else "MISMATCH"
+        backends = " ".join(
+            f"{bp['backend_role']}:{bp['capability_status']}" for bp in probe["backend_probes"]
+        )
+        typer.echo(f"  [{flag}] {probe['audit_id']} {probe['support_class']}: {backends}")
+        if not probe["conformant"] and probe.get("mismatch"):
+            typer.echo(f"        {probe['mismatch']}")
+
+
+def _invocation_conformance_markdown(report: dict) -> str:
+    summary = report["summary"]
+    lines = [
+        "# LanceDB invocation remote-compatibility conformance",
+        "",
+        f"- Mode: `{report['mode']}`",
+        f"- Audit schema: `{report['audit_schema_version']}`",
+        f"- Conformant: {summary['conformant']}/{summary['total_samples']} "
+        f"({summary['non_conformant']} non-conformant)",
+    ]
+    if report.get("skipped_live"):
+        lines.append(f"- Skipped (live credentials absent): {'; '.join(report['skipped_live'])}")
+    lines += [
+        "",
+        "| Support class | Sampled | Total |",
+        "| --- | --- | --- |",
+    ]
+    for support_class in report["per_class_sampled"]:
+        sampled = report["per_class_sampled"][support_class]
+        total = report["per_class_total"].get(support_class, 0)
+        lines.append(f"| `{support_class}` | {sampled} | {total} |")
+    lines += [
+        "",
+        "| Audit id | Support class | Conformant | Backends |",
+        "| --- | --- | --- | --- |",
+    ]
+    for probe in report["probes"]:
+        backends = "<br>".join(
+            f"{bp['backend_role']}: {bp['capability_status']}"
+            for bp in probe["backend_probes"]
+        )
+        conformant = "yes" if probe["conformant"] else "**no**"
+        lines.append(
+            f"| `{probe['audit_id']}` | `{probe['support_class']}` | {conformant} | {backends} |"
+        )
+    return "\n".join(lines)
+
+
 def _print_report(report: dict, *, format: str) -> None:
     if format == "json":
         typer.echo(json.dumps(report, indent=2, sort_keys=False))

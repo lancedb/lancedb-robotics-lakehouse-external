@@ -395,6 +395,8 @@ def test_lake_training_dataset_reads_native_samples_and_manifest(lake):
     assert backend["requested_backend"] == "auto"
     assert backend["resolved_backend"] == "local"
     assert backend["execution_mode"] == "local-lance-native"
+    # 0129: the report records which data-plane served the run.
+    assert backend["data_plane"] == "local"
     assert backend["metrics"]["rows_planned"] == 3
     assert dataset.manifest.to_dict()["epoch_backend"]["kind"] == "python"
     assert dataset.manifest.to_dict()["epoch_backend"]["execution_mode"] == (

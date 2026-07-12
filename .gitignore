@@ -33,7 +33,11 @@ docs/research/*call*.md
 docs/research/*interview*.md
 docs/research/ai-researcher-*.md
 docs/product/*reframe*.md
-# Added by code-review-graph
-.code-review-graph/
+
+# Local agent / tooling scaffolding — never tracked, and must stay out of the
+# external mirror (the mirror's .gitignore is overwritten from this file each
+# sync, so these rules have to live here to take effect there).
 .claude/
 .mcp.json
+.code-review-graph/
+.rtk/

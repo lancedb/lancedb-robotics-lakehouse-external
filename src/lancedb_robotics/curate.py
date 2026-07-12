@@ -19,6 +19,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from lancedb_robotics.capability_gates import VERSIONING, require_lake_capability
 from lancedb_robotics.comparison_plugins import (
     ComparisonMetricContext,
     ComparisonMetricPlugin,
@@ -11657,6 +11658,7 @@ def _validate_replay_table_versions(lake: Lake, snapshot: dict[str, Any]) -> dic
         raise CurationError(
             f"snapshot {snapshot['name']!r} does not pin required replay tables: {missing}"
         )
+    require_lake_capability(lake, VERSIONING, operation="snapshot version replay validation")
     checked = []
     for table_name, pinned_version in sorted(versions.items()):
         try:
@@ -11698,6 +11700,7 @@ def _rows_at_version(
     table = lake.table(table_name)
     if version is None:
         return table.to_arrow().to_pylist()
+    require_lake_capability(lake, VERSIONING, operation="as-of table version checkout")
     table.checkout(int(version))
     try:
         return table.to_arrow().to_pylist()

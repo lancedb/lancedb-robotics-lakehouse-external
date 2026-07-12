@@ -7654,6 +7654,15 @@ def _finalize_ingest(
     """
     if not compact and not prune_versions and not index_predicates:
         return None
+    # Post-ingest compaction/index/prune is a best-effort optimization that drops
+    # to the LanceDataset (compact_files/cleanup_old_versions). On a backend without
+    # direct object IO (e.g. a db:// remote DB) the rows were still written above;
+    # skip the local optimization with a note instead of failing the whole ingest.
+    # A user-invoked `lake maintain` still fails fast with capability guidance.
+    from lancedb_robotics.capability_gates import MAINTENANCE, backend_supports
+
+    if not backend_supports(getattr(lake, "connection_spec", None), MAINTENANCE):
+        return {"skipped_reason": "backend does not support local maintenance; deferred compaction/index/prune"}
     # Local import: the maintenance -> lineage subgraph is heavier than ingest
     # needs at import time, and only this once-per-ingest finalize uses it.
     # maintain_lake runs compact -> refresh/build indexes -> cleanup in that order,

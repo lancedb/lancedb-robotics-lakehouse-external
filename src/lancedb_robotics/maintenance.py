@@ -10,6 +10,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from lancedb_robotics.capability_gates import MAINTENANCE, require_lake_capability
 from lancedb_robotics.indexing import (
     build_fts_index,
     build_predicate_indexes_for_table,
@@ -27,6 +28,7 @@ from lancedb_robotics.lineage import (
     retention_pin_rows,
     snapshot_retention_pin_details,
 )
+from lancedb_robotics.pylance_execution import require_namespace_write_supported
 from lancedb_robotics.schemas import CANONICAL_TABLES, TRANSFORM_RUNS_SCHEMA
 
 MAINTENANCE_TRANSFORM_KIND = "maintenance"
@@ -270,6 +272,17 @@ def maintain_lake(
     unknown = [table for table in selected if table not in CANONICAL_TABLES]
     if unknown:
         raise LakeError(f"unknown canonical table(s) for maintenance: {unknown}")
+
+    # Maintenance drops to the underlying LanceDataset (get_fragments, compact_files,
+    # cleanup_old_versions, version tags). Fail fast before any lineage refresh or
+    # compaction when the backend cannot support it (e.g. a db:// remote DB).
+    require_lake_capability(lake, MAINTENANCE, operation="lake maintenance")
+
+    # Compaction/version-cleanup create new table versions. On a namespace-backed
+    # lake whose namespace manages versions, refuse rather than fork the managed
+    # version history behind the server (0129). No-op for local/object-store/db://.
+    for table in selected:
+        require_namespace_write_supported(lake.connection_spec, table)
 
     if protect_lineage and refresh_lineage:
         try:

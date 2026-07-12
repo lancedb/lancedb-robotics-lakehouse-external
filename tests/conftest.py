@@ -20,6 +20,7 @@ _REQUIRE_VIDEO_DECODE_ENV = "LANCEDB_ROBOTICS_REQUIRE_VIDEO_DECODE"
 _REQUIRE_LEROBOT_NATIVE_BENCHMARK_ENV = (
     "LANCEDB_ROBOTICS_REQUIRE_LEROBOT_NATIVE_BENCHMARK"
 )
+_REQUIRE_INVOCATION_CONFORMANCE_ENV = "LANCEDB_ROBOTICS_REQUIRE_INVOCATION_CONFORMANCE"
 
 
 @pytest.fixture
@@ -149,6 +150,29 @@ def require_start_method(method: str) -> None:
             f"multiprocessing start method {method!r} is unavailable on "
             f"{sys.platform} (available: {', '.join(available)})"
         )
+
+
+def require_invocation_conformance_live() -> None:
+    """Gate a live 0076-audit invocation conformance test on live credentials.
+
+    The contract-test mode needs no credentials and always runs; a *live* probe
+    needs the ``LANCEDB_ROBOTICS_CONFORMANCE_*`` db:///namespace endpoint and
+    auth-ref vars. When they are absent the live subset skips cleanly, so the
+    default lane stays green (backlog 0130 acceptance: "run in contract-test mode
+    when live credentials are absent"). A dedicated live lane sets
+    ``LANCEDB_ROBOTICS_REQUIRE_INVOCATION_CONFORMANCE=1`` so a *misconfigured*
+    live run fails loudly instead of silently skipping the endpoint it exists to
+    exercise.
+    """
+    from lancedb_robotics import invocation_conformance as ic
+
+    available, missing = ic.live_credentials_available()
+    if available:
+        return
+    reason = "live invocation-conformance credentials absent; set " + ", ".join(missing)
+    if os.environ.get(_REQUIRE_INVOCATION_CONFORMANCE_ENV) == "1":
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 def assert_matches_snapshot(name: str, actual: str) -> None:

@@ -99,6 +99,7 @@ class Lake:
         namespace_client_impl: str | None = None,
         namespace_client_properties: dict[str, Any] | None = None,
         namespace_client_pushdown_operations: list[str] | tuple[str, ...] | None = None,
+        remote_capabilities: dict[str, bool] | None = None,
     ) -> "Lake":
         """Create the canonical tables at ``uri``, leaving existing ones intact.
 
@@ -120,6 +121,7 @@ class Lake:
                 namespace_client_impl=namespace_client_impl,
                 namespace_client_properties=namespace_client_properties,
                 namespace_client_pushdown_operations=namespace_client_pushdown_operations,
+                remote_capabilities=remote_capabilities,
             )
         except (ConnectionResolverError, StorageConfigError) as exc:
             raise LakeError(str(exc)) from exc
@@ -156,6 +158,7 @@ class Lake:
         namespace_client_impl: str | None = None,
         namespace_client_properties: dict[str, Any] | None = None,
         namespace_client_pushdown_operations: list[str] | tuple[str, ...] | None = None,
+        remote_capabilities: dict[str, bool] | None = None,
     ) -> "Lake":
         """Attach to an existing lake. Raises :class:`LakeError` if ``uri`` does
         not contain the canonical tables; never creates or modifies anything."""
@@ -173,6 +176,7 @@ class Lake:
                 namespace_client_impl=namespace_client_impl,
                 namespace_client_properties=namespace_client_properties,
                 namespace_client_pushdown_operations=namespace_client_pushdown_operations,
+                remote_capabilities=remote_capabilities,
             )
         except (ConnectionResolverError, StorageConfigError) as exc:
             raise LakeError(str(exc)) from exc

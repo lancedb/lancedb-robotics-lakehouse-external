@@ -35,8 +35,10 @@ from datetime import UTC, datetime
 import pyarrow as pa
 
 from lancedb_robotics.blob import PAYLOAD_BLOB_COLUMN, fetch_blobs
+from lancedb_robotics.capability_gates import SCHEMA, require_lake_capability
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.lineage import emit_transform_lineage
+from lancedb_robotics.pylance_execution import require_namespace_write_supported
 from lancedb_robotics.schemas import TRANSFORM_RUNS_SCHEMA
 
 DEFAULT_EMBEDDING_COLUMN = "embedding"
@@ -436,6 +438,7 @@ def _camera_observations_by_scenario(
             PAYLOAD_BLOB_COLUMN,
             image_rows,
             id_column="observation_id",
+            connection_spec=lake.connection_spec,
         )
         if include_payloads
         else {}
@@ -650,6 +653,17 @@ def _enrich_once(
         from lancedb_robotics.indexing import has_vector_index
 
         had_index = has_vector_index(scenarios_table, embedding_column)
+        # Materializing an embedding column adds/drops a Lance column (schema
+        # evolution). Gate before mutating so a remote backend that does not
+        # advertise schema support fails with guidance, not a late engine error.
+        require_lake_capability(
+            lake, SCHEMA, operation="embedding column materialization"
+        )
+        # On a namespace-backed lake whose namespace manages table versions, a
+        # direct additive column write would fork the managed version history
+        # behind the server (0129). Refuse loudly here rather than silently
+        # desync versions; a no-op for local/object-store/db:// backends.
+        require_namespace_write_supported(lake.connection_spec, scenarios_table.name)
         replaced = _ensure_embedding_column(
             scenarios_table,
             embedding_column,

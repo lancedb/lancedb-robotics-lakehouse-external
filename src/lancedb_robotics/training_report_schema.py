@@ -153,6 +153,9 @@ TRAINING_LOADER_REPORT_SCHEMA: dict[str, Any] = {
                 "display_uri": _nullable("string"),
                 "backend_kind": _nullable("string"),
                 "connection_kind": _nullable("string"),
+                # 0129: how IO reached storage (local / object_store /
+                # namespace_direct / remote_db / unclassified). Optional/additive.
+                "data_plane": _nullable("string"),
                 "execution_mode": _nullable("string"),
                 "request_routing": {"type": "object"},
             },
@@ -207,6 +210,7 @@ TRAINING_LOADER_REPORT_SCHEMA: dict[str, Any] = {
                 "resolved_backend": _nullable("string"),
                 "execution_mode": _nullable("string"),
                 "connection_kind": _nullable("string"),
+                "data_plane": _nullable("string"),
                 "display_uri": _nullable("string"),
                 "capabilities": {"type": "object"},
                 "plan_executor": {"type": "object"},

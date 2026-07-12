@@ -41,6 +41,7 @@ from lancedb_robotics.blob import (
     PAYLOAD_BLOB_COLUMN,
     fetch_blobs_by_row_id,
 )
+from lancedb_robotics.capability_gates import BLOB, require_lake_capability
 from lancedb_robotics.evidence import (
     SUPPORTED_EVIDENCE_PACK_SCHEMAS,
     EvidencePackError,
@@ -958,6 +959,7 @@ def _fetch_chunk_blobs(
     if version is not None:
         handle.checkout(int(version))
     try:
+        require_lake_capability(lake, BLOB, operation="blob hydration")
         dataset = handle.to_lance()
         index = dataset.to_table(columns=[id_column], with_row_id=True)
         rowid_by_id = dict(

@@ -234,4 +234,12 @@ markers = [
     # LANCEDB_ROBOTICS_REQUIRE_LEROBOT_NATIVE_BENCHMARK=1 so dependency/import,
     # sample-access, DataLoader, decode-backend, and metric-key gaps fail.
     "lerobot_native_benchmark: exercises the real official LeRobotDataset benchmark arm",
+    # 0076-audit invocation conformance (backlog 0130). The contract-test mode
+    # needs no optional dependency and runs in the default suite; the dedicated
+    # CI lane selects it with `-m invocation_conformance`. It additionally probes
+    # a live db:///namespace endpoint when the LANCEDB_ROBOTICS_CONFORMANCE_* vars
+    # are set, and LANCEDB_ROBOTICS_REQUIRE_INVOCATION_CONFORMANCE=1 turns a
+    # misconfigured (creds-absent) live run into a hard failure instead of a
+    # silent skip of the endpoint the lane exists to exercise.
+    "invocation_conformance: exercises the 0076-audit remote/namespace invocation conformance suite",
 ]

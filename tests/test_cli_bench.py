@@ -93,6 +93,60 @@ def test_bench_run_writes_report_and_prints_skips(tmp_path):
     assert (artifact_dir / "lerobot-default" / "dataset_export_manifest.json").exists()
 
 
+def test_bench_run_parquet_and_iceberg_write_structured_entries(tmp_path):
+    lake_path = tmp_path / "robot.lance"
+    benchmark_lake(lake_path)
+    report_path = tmp_path / "analytics-report.json"
+    artifact_dir = tmp_path / "analytics-artifacts"
+
+    result = runner.invoke(
+        app,
+        [
+            "bench",
+            "run",
+            "--lake",
+            str(lake_path),
+            "--snapshot",
+            "bench-v1",
+            "--formats",
+            "parquet,iceberg",
+            "--sample-limit",
+            "2",
+            "--random-access-samples",
+            "2",
+            "--random-frame-samples",
+            "2",
+            "--frames-per-clip",
+            "3",
+            "--out",
+            str(report_path),
+            "--artifacts",
+            str(artifact_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "format parquet: completed" in result.output
+    assert "format iceberg:" in result.output
+
+    report = json.loads(report_path.read_text())
+    parquet = report["formats"]["parquet"]
+    assert parquet["status"] == "completed"
+    assert parquet["payload_placement"] == "inline"
+    assert parquet["metrics"]["metadata_scan_latency"]["details"]["read_payload"] is False
+    assert parquet["metrics"]["subset_filter_change"]["details"]["requires_full_rewrite"] is True
+    assert parquet["metrics"]["storage_footprint"]["details"]["materialized_bytes_written"] > 0
+    assert (artifact_dir / "parquet" / "table.parquet").exists()
+
+    iceberg = report["formats"]["iceberg"]
+    # pyiceberg is not part of the default developer install; when present with a
+    # catalog it runs end to end, otherwise it is a structured skip.
+    assert iceberg["status"] in {"completed", "skipped"}
+    if iceberg["status"] == "skipped":
+        assert iceberg["skip_reason"]
+        assert iceberg["iceberg"]["install"]
+
+
 def test_bench_run_enterprise_fixture_writes_phase_report(tmp_path):
     lake_path = tmp_path / "robot.lance"
     benchmark_lake(lake_path)

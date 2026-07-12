@@ -50,6 +50,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from lancedb_robotics.capability_gates import INDEX, lake_capability_reason
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.lineage import emit_transform_lineage
 from lancedb_robotics.schemas import TRANSFORM_RUNS_SCHEMA
@@ -553,6 +554,12 @@ def build_scalar_index(
     index_type: str = SCALAR_INDEX_TYPE,
 ) -> ScalarIndexResult:
     """Build or refresh a scalar predicate index when the backend supports it."""
+    capability_reason = lake_capability_reason(lake, INDEX)
+    if capability_reason is not None:
+        return ScalarIndexResult(
+            table=table, column=column, status="skipped", index_type=index_type,
+            reason=capability_reason,
+        )
     handle = lake.table(table)
     names = _table_column_names(handle)
     num_rows = _table_row_count(handle)
@@ -943,6 +950,9 @@ def build_vector_index(
     would only error in IVF/PQ training. Existing indexes on the column are
     replaced.
     """
+    capability_reason = lake_capability_reason(lake, INDEX)
+    if capability_reason is not None:
+        return IndexResult(table=table, column=column, status="skipped", reason=capability_reason)
     spec = spec or IndexSpec()
     handle = lake.table(table)
     dimension = _vector_dimension(handle, column)
@@ -1036,6 +1046,9 @@ def build_fts_index(
     replace: bool = True,
 ) -> FtsIndexResult:
     """Build or refresh a persistent Lance FTS index over ``table.column``."""
+    capability_reason = lake_capability_reason(lake, INDEX)
+    if capability_reason is not None:
+        return FtsIndexResult(table=table, column=column, status="skipped", reason=capability_reason)
     handle = lake.table(table)
     if column not in handle.schema.names:
         raise IndexingError(f"no {column!r} column to index in table {table!r}")

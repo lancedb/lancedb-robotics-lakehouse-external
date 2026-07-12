@@ -105,6 +105,62 @@ jobs:
           name: video-decode-conformance
           path: artifacts/video-decode
 
+  invocation-conformance:
+    name: Enterprise/namespace invocation conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        run: uv python install 3.11
+      # This lane turns the static 0076 invocation audit into executable proof:
+      # it samples representative rows per support class and probes them against
+      # the 0128 capability gates and 0129 namespace-direct adapter. The suite is
+      # pure-Python (no optional heavy stack); `dev` brings pytest. Contract-test
+      # mode probes real gates/adapter against fake backends with
+      # credential-vending and managed-versioning fixtures -- no live endpoint,
+      # so the default lane is fast and always green.
+      - name: Sync (dev)
+        run: uv sync --extra dev
+      - name: Invocation conformance suite (contract-test)
+        run: uv run --no-sync pytest -m invocation_conformance -v
+      # Publish the summarized compatibility report (linked back to 0076 audit row
+      # ids) as a CI artifact. `--strict` exits non-zero if any sampled row is
+      # non-conformant with its audit support class.
+      - name: Publish compatibility report
+        run: |
+          mkdir -p artifacts/invocation-conformance
+          uv run --no-sync lancedb-robotics inspect invocation-conformance \
+            --per-class 8 --strict \
+            --report-out artifacts/invocation-conformance/report.json
+          uv run --no-sync lancedb-robotics inspect invocation-conformance \
+            --per-class 8 --format markdown \
+            > artifacts/invocation-conformance/report.md
+      # Live probing activates ONLY when the deployment wires the optional
+      # LANCEDB_ROBOTICS_CONFORMANCE_* db:///namespace endpoint + auth-ref repo
+      # variables. Only then does REQUIRE=1 apply -- so a misconfigured live run
+      # fails loudly instead of silently skipping the endpoint it exists to
+      # exercise, while an unconfigured repo never reaches this step and the lane
+      # stays green (backlog 0130 acceptance: contract-test when creds absent).
+      - name: Live invocation conformance (opt-in)
+        if: ${{ vars.LANCEDB_ROBOTICS_CONFORMANCE_DB_URI != '' }}
+        env:
+          LANCEDB_ROBOTICS_REQUIRE_INVOCATION_CONFORMANCE: "1"
+          LANCEDB_ROBOTICS_CONFORMANCE_DB_URI: ${{ vars.LANCEDB_ROBOTICS_CONFORMANCE_DB_URI }}
+          LANCEDB_ROBOTICS_CONFORMANCE_DB_AUTH_REF: ${{ vars.LANCEDB_ROBOTICS_CONFORMANCE_DB_AUTH_REF }}
+          LANCEDB_ROBOTICS_CONFORMANCE_NAMESPACE_IMPL: ${{ vars.LANCEDB_ROBOTICS_CONFORMANCE_NAMESPACE_IMPL }}
+          LANCEDB_ROBOTICS_CONFORMANCE_NAMESPACE_PROPERTIES_JSON: ${{ vars.LANCEDB_ROBOTICS_CONFORMANCE_NAMESPACE_PROPERTIES_JSON }}
+          LANCEDB_ROBOTICS_CONFORMANCE_NAMESPACE_AUTH_REF: ${{ vars.LANCEDB_ROBOTICS_CONFORMANCE_NAMESPACE_AUTH_REF }}
+          LANCEDB_ROBOTICS_CONFORMANCE_STORAGE_AUTH_REF: ${{ vars.LANCEDB_ROBOTICS_CONFORMANCE_STORAGE_AUTH_REF }}
+        run: uv run --no-sync pytest -m invocation_conformance -v
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: invocation-conformance
+          path: artifacts/invocation-conformance
+
   lerobot-native-benchmark:
     name: LeRobot native benchmark fixture matrix
     runs-on: ubuntu-latest

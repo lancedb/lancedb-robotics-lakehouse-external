@@ -299,6 +299,7 @@ def seek_video_frame(
         VIDEO_ENCODING_BLOB_COLUMN,
         row["encoding_id"],
         id_column="encoding_id",
+        connection_spec=lake.connection_spec,
     )
     if not encoded:
         return _seek_video_reference_frame(lake, row, int(frame), decoder=decoder)
@@ -881,6 +882,7 @@ def _encoding_row(
         "payload_blob",
         observation_ids,
         id_column="observation_id",
+        connection_spec=lake.connection_spec,
     )
     missing = [obs_id for obs_id in observation_ids if not payloads.get(obs_id)]
     if missing:

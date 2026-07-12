@@ -570,6 +570,7 @@ def _payload_blobs_as_of(
             PAYLOAD_BLOB_COLUMN,
             observation_ids,
             id_column="observation_id",
+            connection_spec=lake.connection_spec,
         )
     finally:
         if version is not None:
@@ -592,6 +593,7 @@ def _video_encoding_blobs_as_of(
             VIDEO_ENCODING_BLOB_COLUMN,
             encoding_ids,
             id_column="encoding_id",
+            connection_spec=lake.connection_spec,
         )
     finally:
         if version is not None:

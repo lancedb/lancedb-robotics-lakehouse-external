@@ -15,12 +15,19 @@ from lancedb_robotics.benchmark import (
     DEFAULT_LEROBOT_BENCHMARK_SOURCE_URI,
     ENTERPRISE_LANCE_FORMAT,
     FAKE_LOCAL_DB_PROFILE,
+    ICEBERG_FORMAT,
     LANCE_FORMAT,
     LEROBOT_DEFAULT_FORMAT,
     LEROBOT_NATIVE_FORMAT,
     LIVE_DB_PROFILE,
     LIVE_NAMESPACE_PROFILE,
+    METRIC_METADATA_SCAN_LATENCY,
     METRIC_RANDOM_FRAME_SAMPLING,
+    METRIC_ROW_HYDRATION_LATENCY,
+    METRIC_SHUFFLED_EPOCH_THROUGHPUT,
+    METRIC_SUBSET_FILTER_CHANGE,
+    PARQUET_FORMAT,
+    PAYLOAD_PLACEMENT_INLINE,
     PUBLIC_LEROBOT_CLAIMS_SCHEMA_VERSION,
     WEBDATASET_FORMAT,
     BenchmarkError,
@@ -283,6 +290,126 @@ def test_benchmark_runs_lance_metrics_and_lerobot_comparison(lake, tmp_path):
         ]
         > 0
     )
+
+
+def test_parquet_baseline_materializes_same_sample_set_and_splits_scan_from_hydration(
+    lake, tmp_path
+):
+    report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[LANCE_FORMAT, WEBDATASET_FORMAT, PARQUET_FORMAT],
+        output_dir=tmp_path / "artifacts",
+        sample_limit=2,
+        random_access_samples=3,
+        random_frame_samples=2,
+        frames_per_clip=3,
+        seed=7,
+        query_limit=1,
+    )
+
+    parquet = report["formats"][PARQUET_FORMAT]
+    assert parquet["status"] == "completed"
+    assert parquet["payload_placement"] == PAYLOAD_PLACEMENT_INLINE
+
+    # Same logical sample set as the Lance and WebDataset arms: the snapshot's four
+    # observations across its two scenarios.
+    assert parquet["table_manifest"]["rows"] == 4
+    assert report["formats"][WEBDATASET_FORMAT]["projection_manifest"]["step_count"] == 4
+
+    metrics = parquet["metrics"]
+    # Standard comparison metrics are present so parquet appears in the table.
+    assert set(BENCHMARK_METRICS).issubset(metrics)
+    # Analytics-specific metrics separate metadata scan from payload hydration.
+    for key in (
+        METRIC_METADATA_SCAN_LATENCY,
+        METRIC_ROW_HYDRATION_LATENCY,
+        METRIC_SHUFFLED_EPOCH_THROUGHPUT,
+        METRIC_SUBSET_FILTER_CHANGE,
+    ):
+        assert key in metrics
+
+    scan = metrics[METRIC_METADATA_SCAN_LATENCY]
+    assert scan["status"] == "completed"
+    assert scan["details"]["read_payload"] is False
+    assert scan["details"]["num_row_groups"] >= 1
+
+    hydration = metrics[METRIC_ROW_HYDRATION_LATENCY]
+    assert hydration["status"] == "completed"
+    assert hydration["details"]["payload_bytes_materialized"] > 0
+
+    storage = metrics["storage_footprint"]
+    assert storage["details"]["materialized_bytes_written"] > 0
+    assert storage["details"]["payload_placement"] == PAYLOAD_PLACEMENT_INLINE
+
+    table_by_format = {row["format"]: row for row in report["comparison_table"]}
+    assert table_by_format[PARQUET_FORMAT]["dataloader_throughput"] >= 0
+    assert report["format_versions"][PARQUET_FORMAT]["layout"] == "parquet-analytics-table-v0"
+    assert (artifact_dir_table := tmp_path / "artifacts" / "parquet" / "table.parquet").exists()
+    assert artifact_dir_table.stat().st_size > 0
+
+
+def test_parquet_filter_change_records_rewrite_cost(lake, tmp_path):
+    report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[PARQUET_FORMAT],
+        output_dir=tmp_path / "artifacts",
+        sample_limit=2,
+    )
+    filter_change = report["formats"][PARQUET_FORMAT]["metrics"][METRIC_SUBSET_FILTER_CHANGE]
+    assert filter_change["status"] == "completed"
+    details = filter_change["details"]
+    assert details["requires_full_rewrite"] is True
+    assert details["rewritten_bytes"] > 0
+    assert details["materialized_bytes_written"] == details["rewritten_bytes"]
+    assert details["selected_rows"] == 2
+    assert "row plan" in details["contrast"]
+    # The rewrite produced a distinct materialized artifact.
+    assert (tmp_path / "artifacts" / "parquet" / "table-filtered.parquet").exists()
+
+
+def test_iceberg_baseline_skipped_when_dependency_absent(lake, tmp_path, monkeypatch):
+    import lancedb_robotics.benchmark as benchmark
+
+    # Force the optional dependency to look absent regardless of the environment.
+    monkeypatch.setattr(
+        benchmark,
+        "_module_available",
+        lambda module: False if module == benchmark.ICEBERG_MODULE else True,
+    )
+    report = run_benchmark_suite(
+        lake,
+        "bench-v1",
+        formats=[ICEBERG_FORMAT],
+        output_dir=tmp_path / "artifacts",
+    )
+    iceberg = report["formats"][ICEBERG_FORMAT]
+    assert iceberg["status"] == "skipped"
+    assert "pyiceberg" in iceberg["skip_reason"]
+    assert iceberg["iceberg"]["available"] is False
+    assert iceberg["iceberg"]["install"]
+    # Every standard metric is explicitly skipped so the report cannot be read as
+    # Iceberg coverage.
+    assert set(iceberg["metrics"]) == set(BENCHMARK_METRICS)
+    assert all(
+        metric["status"] == "skipped" for metric in iceberg["metrics"].values()
+    )
+    table_by_format = {row["format"]: row for row in report["comparison_table"]}
+    assert table_by_format[ICEBERG_FORMAT]["status"] == "skipped"
+
+
+def test_iceberg_baseline_skips_without_catalog_when_ephemeral(lake, monkeypatch):
+    import lancedb_robotics.benchmark as benchmark
+
+    # pyiceberg present but no catalog configured and no artifact dir to root a
+    # local catalog -> structured skip rather than a misleading empty run.
+    monkeypatch.setattr(benchmark, "_module_available", lambda module: True)
+    monkeypatch.delenv(benchmark.ICEBERG_CATALOG_URI_ENV, raising=False)
+    report = run_benchmark_suite(lake, "bench-v1", formats=[ICEBERG_FORMAT])
+    iceberg = report["formats"][ICEBERG_FORMAT]
+    assert iceberg["status"] == "skipped"
+    assert "catalog" in iceberg["skip_reason"]
 
 
 def test_enterprise_remote_benchmark_reports_cache_phases_and_filter_change(

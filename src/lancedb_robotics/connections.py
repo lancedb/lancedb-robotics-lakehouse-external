@@ -60,7 +60,16 @@ class ManagedVersioningMismatch(ConnectionResolverError):
 
 @dataclass(frozen=True)
 class LakeCapabilities:
-    """Capabilities implied by the resolved backend path."""
+    """Capabilities implied by the resolved backend path.
+
+    ``server_side_query``/``direct_object_io``/``namespace_*``/``blob_fetch_remote``
+    describe the data-plane the backend exposes. ``index_management``,
+    ``table_versioning``, and ``schema_evolution`` are the control-plane
+    capabilities the backlog-0128 capability gates consult before running the
+    ``index``/``versioning``/``schema`` operation families classified by the 0076
+    invocation audit. They default to ``False`` (the honest "not advertised"
+    state) so a backend must positively claim them before those paths run.
+    """
 
     server_side_query: bool = False
     direct_object_io: bool = False
@@ -68,6 +77,9 @@ class LakeCapabilities:
     namespace_managed_versioning: bool = False
     geneva_worker_specs: bool = False
     blob_fetch_remote: bool = False
+    index_management: bool = False
+    table_versioning: bool = False
+    schema_evolution: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,6 +94,23 @@ class PylanceAccessSpec:
     def worker_properties(self) -> dict[str, str]:
         """Properties after applying worker-specific namespace overrides."""
         return apply_worker_namespace_overrides(self.namespace_client_properties)
+
+
+#: Data-plane labels (0129): how a read/write reaches storage. Provenance, not
+#: secrets -- recorded in reports/manifests so a reader can tell whether IO went
+#: through a local path, object store, the namespace-direct pylance data-plane,
+#: or a ``db://`` remote query node.
+DATA_PLANE_LOCAL = "local"
+DATA_PLANE_OBJECT_STORE = "object_store"
+DATA_PLANE_NAMESPACE_DIRECT = "namespace_direct"
+DATA_PLANE_REMOTE_DB = "remote_db"
+DATA_PLANE_UNCLASSIFIED = "unclassified"
+
+_DATA_PLANE_BY_KIND = {
+    "local_path": DATA_PLANE_LOCAL,
+    "object_store_lancedb_oss": DATA_PLANE_OBJECT_STORE,
+    "lancedb_remote_db": DATA_PLANE_REMOTE_DB,
+}
 
 
 @dataclass(frozen=True)
@@ -102,10 +131,23 @@ class LakeConnectionSpec:
     capabilities: LakeCapabilities = field(default_factory=LakeCapabilities)
     local_path_required: bool = False
 
+    @property
+    def data_plane(self) -> str:
+        """The data-plane label for how this backend reaches storage (0129).
+
+        A namespace backend (``pylance_access`` set) is ``namespace_direct``
+        regardless of ``kind``, because it routes through the direct-pylance
+        adapter; otherwise the label follows ``kind``.
+        """
+        if self.pylance_access is not None:
+            return DATA_PLANE_NAMESPACE_DIRECT
+        return _DATA_PLANE_BY_KIND.get(self.kind, DATA_PLANE_UNCLASSIFIED)
+
     def safe_summary(self) -> dict[str, Any]:
         """Secret-free diagnostic summary suitable for logs or task records."""
         return {
             "kind": self.kind,
+            "data_plane": self.data_plane,
             "uri": self.display_uri,
             "namespace_client_impl": self.namespace_client_impl,
             "namespace_client_properties": safe_namespace_properties(
@@ -268,10 +310,18 @@ def resolve_lake_connection(
     namespace_client_impl: str | None = None,
     namespace_client_properties: Mapping[str, Any] | None = None,
     namespace_client_pushdown_operations: Sequence[str] | None = None,
+    remote_capabilities: Mapping[str, bool] | None = None,
 ) -> LakeConnectionSpec:
-    """Resolve a user lake target into a typed backend connection spec."""
+    """Resolve a user lake target into a typed backend connection spec.
+
+    ``remote_capabilities`` advertises control-plane support a specific LanceDB
+    Enterprise ``db://`` deployment is known to expose (``index_management``,
+    ``table_versioning``, ``schema_evolution``). It is ignored for local,
+    object-store, and namespace backends, which already own these operations.
+    """
     value = str(uri) if uri is not None else None
     pushdowns = normalize_namespace_pushdowns(namespace_client_pushdown_operations)
+    control_plane = _direct_control_plane_capabilities()
 
     if namespace_client_impl:
         namespace_ref = namespace_auth_ref or auth_ref
@@ -297,6 +347,7 @@ def resolve_lake_connection(
             namespace_resolution=True,
             geneva_worker_specs=True,
             blob_fetch_remote=True,
+            **control_plane,
         )
         return LakeConnectionSpec(
             kind="rest_namespace_lancedb"
@@ -346,6 +397,7 @@ def resolve_lake_connection(
             namespace_resolution=False,
             geneva_worker_specs=False,
             blob_fetch_remote=True,
+            **_advertised_remote_control_plane(remote_capabilities),
         )
         return LakeConnectionSpec(
             kind="lancedb_remote_db",
@@ -380,7 +432,9 @@ def resolve_lake_connection(
                 "source": None,
             },
             direct_object_io_allowed=True,
-            capabilities=LakeCapabilities(direct_object_io=True, blob_fetch_remote=True),
+            capabilities=LakeCapabilities(
+                direct_object_io=True, blob_fetch_remote=True, **control_plane
+            ),
         )
 
     if scheme:
@@ -396,7 +450,7 @@ def resolve_lake_connection(
         lancedb_connect_kwargs={},
         auth_refs={"remote": None, "namespace": None, "storage": None, "source": None},
         direct_object_io_allowed=True,
-        capabilities=LakeCapabilities(direct_object_io=True),
+        capabilities=LakeCapabilities(direct_object_io=True, **control_plane),
         local_path_required=True,
     )
 
@@ -419,9 +473,42 @@ def resolve_raw_source_connection(
         display_uri=value,
         auth_refs={"remote": None, "namespace": None, "storage": None, "source": source_auth_ref},
         direct_object_io_allowed=True,
-        capabilities=LakeCapabilities(direct_object_io=True),
+        capabilities=LakeCapabilities(
+            direct_object_io=True, **_direct_control_plane_capabilities()
+        ),
         local_path_required=kind == "local_path",
     )
+
+
+#: Control-plane capabilities a direct-object-IO backend (local path, object-store
+#: OSS, or namespace-backed Lance) fully owns: index management, table version
+#: checkout, and schema evolution all run against the underlying dataset.
+_DIRECT_CONTROL_PLANE_CAPABILITIES = ("index_management", "table_versioning", "schema_evolution")
+
+
+def _direct_control_plane_capabilities() -> dict[str, bool]:
+    return {name: True for name in _DIRECT_CONTROL_PLANE_CAPABILITIES}
+
+
+def _advertised_remote_control_plane(
+    remote_capabilities: Mapping[str, bool] | None,
+) -> dict[str, bool]:
+    """Resolve db:// control-plane flags from an operator's advertised support.
+
+    Unadvertised flags stay ``False`` so the backlog-0128 capability gates report
+    guidance rather than assume a remote deployment exposes index/version/schema
+    operations through the plain ``db://`` Table surface.
+    """
+    advertised = {name: False for name in _DIRECT_CONTROL_PLANE_CAPABILITIES}
+    for key, value in dict(remote_capabilities or {}).items():
+        name = str(key)
+        if name not in advertised:
+            supported = ", ".join(_DIRECT_CONTROL_PLANE_CAPABILITIES)
+            raise NamespaceConfigError(
+                f"unknown remote capability {name!r}; advertise one of: {supported}"
+            )
+        advertised[name] = bool(value)
+    return advertised
 
 
 def enterprise_remote_kwargs(

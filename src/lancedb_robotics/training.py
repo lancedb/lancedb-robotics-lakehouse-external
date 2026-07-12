@@ -39,6 +39,7 @@ from lancedb_robotics.blob import (
     fetch_blobs,
     fetch_blobs_by_row_id,
 )
+from lancedb_robotics.connections import DATA_PLANE_UNCLASSIFIED
 from lancedb_robotics.dataset_export import (
     _camera_key,
     _Episode,
@@ -714,6 +715,9 @@ class TrainingBackendReport:
     fallback_events: tuple[dict[str, Any], ...] = ()
     warnings: tuple[str, ...] = ()
     metrics: dict[str, Any] = field(default_factory=dict)
+    #: How this run's IO reached storage (0129): local / object_store /
+    #: namespace_direct / remote_db / unclassified. Provenance, not a secret.
+    data_plane: str = DATA_PLANE_UNCLASSIFIED
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -721,6 +725,7 @@ class TrainingBackendReport:
             "resolved_backend": self.resolved_backend,
             "execution_mode": self.execution_mode,
             "connection_kind": self.connection_kind,
+            "data_plane": self.data_plane,
             "display_uri": self.display_uri,
             "request_routing": _jsonable(self.request_routing),
             "capabilities": _jsonable(self.capabilities),
@@ -9971,6 +9976,7 @@ def _training_backend_report(
     )
     spec = getattr(lake, "connection_spec", None)
     connection_kind = str(getattr(spec, "kind", "local_path") or "local_path")
+    data_plane = str(getattr(spec, "data_plane", DATA_PLANE_UNCLASSIFIED) or DATA_PLANE_UNCLASSIFIED)
     display_uri = str(getattr(spec, "display_uri", lake.uri) or lake.uri)
     connect_kwargs = dict(getattr(spec, "lancedb_connect_kwargs", {}) or {})
     host_override = connect_kwargs.get("host_override")
@@ -10184,6 +10190,7 @@ def _training_backend_report(
         fallback_events=tuple(fallback_events),
         warnings=tuple(warnings),
         metrics=metrics,
+        data_plane=data_plane,
     )
 
 
@@ -10622,6 +10629,7 @@ def _loader_report_lake(
         "display_uri": backend.get("display_uri") or manifest.get("lake_uri"),
         "backend_kind": backend.get("resolved_backend"),
         "connection_kind": backend.get("connection_kind"),
+        "data_plane": backend.get("data_plane"),
         "execution_mode": backend.get("execution_mode"),
         "request_routing": _mapping_dict(backend.get("request_routing")),
     }
@@ -10633,6 +10641,7 @@ def _remote_execution_report(backend: Mapping[str, Any]) -> dict[str, Any]:
         "resolved_backend": backend.get("resolved_backend"),
         "execution_mode": backend.get("execution_mode"),
         "connection_kind": backend.get("connection_kind"),
+        "data_plane": backend.get("data_plane"),
         "display_uri": backend.get("display_uri"),
         "request_routing": _mapping_dict(backend.get("request_routing")),
         "capabilities": _mapping_dict(backend.get("capabilities")),

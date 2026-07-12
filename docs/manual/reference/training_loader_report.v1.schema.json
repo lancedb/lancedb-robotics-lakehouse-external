@@ -138,6 +138,12 @@
             "null"
           ]
         },
+        "data_plane": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "display_uri": {
           "type": [
             "string",
@@ -284,6 +290,12 @@
           "type": "object"
         },
         "connection_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data_plane": {
           "type": [
             "string",
             "null"

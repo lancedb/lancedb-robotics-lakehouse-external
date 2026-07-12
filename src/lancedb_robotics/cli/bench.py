@@ -13,7 +13,9 @@ _FORMATS_OPTION = typer.Option(
     "--formats",
     help=(
         "Comma-separated formats: enterprise-lance, lance, lerobot-default, "
-        "lerobot-native, webdataset, deeplake."
+        "lerobot-native, webdataset, deeplake, parquet, iceberg. parquet and "
+        "iceberg are opt-in analytics-lakehouse baselines (iceberg needs pyiceberg "
+        "plus a catalog, or it is reported as skipped)."
     ),
 )
 _OUT_OPTION = typer.Option(None, "--out", help="Write the structured JSON report here.")

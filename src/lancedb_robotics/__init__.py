@@ -1,5 +1,10 @@
 """LanceDB Robotics: multimodal data lakehouse substrate for Physical AI pipelines."""
 
+from lancedb_robotics.capability_gates import (
+    BackendCapabilityError,
+    backend_supports,
+    require_backend_capability,
+)
 from lancedb_robotics.connections import (
     create_namespace_client as namespace_client,
 )
@@ -70,4 +75,7 @@ __all__ = [
     "namespace_client",
     "namespace_worker_spec",
     "pylance_namespace_access",
+    "BackendCapabilityError",
+    "backend_supports",
+    "require_backend_capability",
 ]

@@ -538,6 +538,7 @@ def _fetch_encoding_blobs(
             VIDEO_ENCODING_BLOB_COLUMN,
             encoding_ids,
             id_column="encoding_id",
+            connection_spec=lake.connection_spec,
         )
     finally:
         if table_version is not None:

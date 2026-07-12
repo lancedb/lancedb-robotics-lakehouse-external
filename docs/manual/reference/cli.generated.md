@@ -313,6 +313,10 @@ Register a ROS1 `.bag` or ROS2 sqlite `.db3` source and ingest it.
 
 Inspect robot log files (MCAP first) without ingesting.
 
+### `inspect invocation-conformance`
+
+Probe representative 0076-audit rows against a backend and report compatibility.
+
 ### `inspect lerobot`
 
 Describe a LeRobot dataset without ingesting it.
