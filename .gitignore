@@ -35,3 +35,5 @@ docs/research/ai-researcher-*.md
 docs/product/*reframe*.md
 # Added by code-review-graph
 .code-review-graph/
+.claude/
+.mcp.json
