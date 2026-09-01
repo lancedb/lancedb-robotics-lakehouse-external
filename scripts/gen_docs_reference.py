@@ -18,6 +18,7 @@ test can call them without touching disk.
 from __future__ import annotations
 
 import inspect
+import re
 import tempfile
 from pathlib import Path
 
@@ -159,6 +160,14 @@ def render_api() -> str:
             except (TypeError, ValueError):
                 signature = "(...)"
             signature = signature.replace("(self, ", "(").replace("(self)", "()")
+            # ``str(inspect.signature(...))`` qualifies typing objects
+            # inconsistently across interpreter versions -- e.g. ``Any`` renders
+            # as ``typing.Any`` on 3.11 (and inside plain generics on 3.14) but as
+            # bare ``Any`` inside ``X | None`` unions on 3.14. The drift test
+            # (tests/test_docs_reference_current.py) runs under whatever Python CI
+            # pins, so strip the ``typing.`` module qualifier to keep the rendered
+            # reference byte-identical regardless of the interpreter that ran it.
+            signature = re.sub(r"\btyping\.", "", signature)
             doc = _first_line(func.__doc__)
             suffix = f" — {doc}" if doc else ""
             lines.append(f"- `{accessor}.{method_name}{signature}`{suffix}")

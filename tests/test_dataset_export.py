@@ -207,17 +207,83 @@ def test_lerobot_export_writes_episode_parquet_metadata_and_camera_blob(lake, tm
     episode_rows = pq.read_table(out / "meta/episodes/chunk-000/file-000.parquet").to_pylist()
     assert episode_rows[0]["dataset_from_index"] == 0
     assert episode_rows[0]["dataset_to_index"] == 1
-    assert (out / "images/camera_front/episode_000000/frame_000000.bin").read_bytes() == b"frame-0"
+    # This fixture's observation carries a synthetic `payload_blob` with a
+    # fake `raw_uri` ("memory://run-export") that can't actually be
+    # re-opened, so the exporter correctly can't resolve a real image for it
+    # (see test_lerobot_export_resolves_real_camera_bytes_from_mcap_source for
+    # the real-source path) — no file is written rather than one holding the
+    # raw, undecoded payload_blob bytes.
+    assert not (out / "images/camera_front/episode_000000/frame_000000.bin").exists()
 
     rows = pq.read_table(out / "data/chunk-000/file-000.parquet").to_pylist()
     assert rows[0]["observation.state"] == pytest.approx([1.0, 2.0])
     assert rows[0]["action"] == pytest.approx([0.25, -0.5])
     assert rows[0]["language_instruction"] == "reach toward the cube"
-    assert (
-        rows[0]["observation.images.camera_front"]["path"]
-        == "images/camera_front/episode_000000/frame_000000.bin"
+    assert rows[0]["observation.images.camera_front"] is None
+
+
+def _write_camera_mcap(path, frames: list[bytes]) -> None:
+    """A minimal real MCAP with one cbor `/camera/front` message per entry in
+    ``frames``. cbor is self-describing (no schema definition needed to
+    decode, unlike ros1/ros2/protobuf), so this is a real, exercisable decode
+    without needing a full ROS message-definition fixture. Each frame is made
+    large enough to cross ``DEFAULT_BLOB_THRESHOLD`` so the decoder actually
+    hoists it as a blob field rather than base64-inlining it, matching how a
+    real compressed-image payload behaves.
+    """
+    import cbor2
+    from mcap.writer import CompressionType, Writer
+
+    with open(path, "wb") as stream:
+        writer = Writer(stream, compression=CompressionType.NONE)
+        writer.start(profile="", library="lancedb-robotics-test")
+        schema_id = writer.register_schema(
+            name="test.CompressedImage",
+            encoding="cbor",
+            data=cbor2.dumps({"fields": ["format", "data"]}),
+        )
+        channel_id = writer.register_channel(
+            topic="/camera/front", message_encoding="cbor", schema_id=schema_id
+        )
+        for i, frame in enumerate(frames):
+            writer.add_message(
+                channel_id=channel_id,
+                log_time=1_000_000_000 + i * 100_000_000,
+                publish_time=1_000_000_000 + i * 100_000_000,
+                data=cbor2.dumps({"format": "jpeg", "data": frame}),
+            )
+        writer.finish()
+
+
+def test_decode_camera_frames_from_source_reads_real_image_bytes(tmp_path):
+    from lancedb_robotics.dataset_export import _decode_camera_frames_from_source
+
+    frame_0 = b"\xff\xd8\xff" + b"\x00" * 3000
+    frame_1 = b"\xff\xd8\xff" + b"\x01" * 3000
+    mcap_path = tmp_path / "camera.mcap"
+    _write_camera_mcap(mcap_path, [frame_0, frame_1])
+
+    resolved = _decode_camera_frames_from_source(
+        str(mcap_path),
+        {("/camera/front", 0): "obs-a", ("/camera/front", 1): "obs-b"},
+        storage_options=None,
+        auth_ref=None,
     )
-    assert rows[0]["observation.images.camera_front"]["bytes"] is None
+
+    assert resolved == {"obs-a": frame_0, "obs-b": frame_1}
+
+
+def test_decode_camera_frames_from_source_unresolvable_source_returns_empty(tmp_path):
+    from lancedb_robotics.dataset_export import _decode_camera_frames_from_source
+
+    resolved = _decode_camera_frames_from_source(
+        str(tmp_path / "does-not-exist.mcap"),
+        {("/camera/front", 0): "obs-a"},
+        storage_options=None,
+        auth_ref=None,
+    )
+
+    assert resolved == {}
 
 
 @pytest.mark.skipif(
@@ -239,6 +305,157 @@ def test_lerobot_export_metadata_loads_with_official_lerobot_package(lake, tmp_p
     assert dataset.num_frames == manifest.step_count
     assert dataset.num_episodes == manifest.episode_count
     assert "observation.state" in dataset.features
+
+
+def _lake_with_action_vectors(path, action_vectors: list[list[float] | None]) -> Lake:
+    """A minimal exportable lake with one run/scenario and one state-only
+    observation per entry in ``action_vectors`` (state_vector stays constant so
+    only the 'action' feature's shape behavior is under test)."""
+    lake = Lake.init(path)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    observation_ids = [f"obs-{i}" for i in range(len(action_vectors))]
+    lake.table("runs").add(
+        pa.Table.from_pylist(
+            [
+                {
+                    "run_id": "run-export",
+                    "run_kind": "demo",
+                    "source": "synthetic",
+                    "source_id": "src-export",
+                    "raw_uri": "memory://run-export",
+                    "robot_id": "robot-1",
+                    "site_id": "lab",
+                    "task_id": "pick the cube",
+                    "start_time_ns": 1_000,
+                    "end_time_ns": 1_000 + len(action_vectors),
+                    "duration_ns": len(action_vectors),
+                    "software_version": "test",
+                    "hardware_version": "test",
+                    "calibration_version": "test",
+                    "model_version": "",
+                    "metadata": [],
+                    "quality_flags": [],
+                    "transform_id": "tfm-source",
+                    "created_at": now,
+                }
+            ],
+            schema=RUNS_SCHEMA,
+        )
+    )
+    lake.table("observations").add(
+        pa.Table.from_pylist(
+            [
+                {
+                    "observation_id": observation_id,
+                    "run_id": "run-export",
+                    "timestamp_ns": 1_000 + i,
+                    "sensor_id": "joint_state",
+                    "topic": "/joint_states",
+                    "modality": "state",
+                    "raw_uri": "memory://run-export",
+                    "raw_channel": "/joint_states",
+                    "raw_log_time_ns": 1_000 + i,
+                    "raw_sequence": i,
+                    "payload_json": "{\"joint\":1}",
+                    "payload_blob": None,
+                    "message_encoding": "json",
+                    "schema_encoding": "json",
+                    "decode_status": "decoded",
+                    "decode_error": "",
+                    "state_vector": [1.0, 2.0],
+                    "action_vector": action_vector,
+                    "caption": "close the gripper",
+                    "quality_flags": [],
+                    "transform_id": "tfm-ingest",
+                    "created_at": now,
+                }
+                for i, (observation_id, action_vector) in enumerate(
+                    zip(observation_ids, action_vectors, strict=True)
+                )
+            ],
+            schema=OBSERVATIONS_SCHEMA,
+        )
+    )
+    lake.table("scenarios").add(
+        pa.Table.from_pylist(
+            [
+                {
+                    "scenario_id": "scn-export-a",
+                    "run_id": "run-export",
+                    "start_time_ns": 1_000,
+                    "end_time_ns": 1_000 + len(action_vectors),
+                    "window_ns": 0,
+                    "is_partial": False,
+                    "topics": ["/joint_states"],
+                    "observation_ids": observation_ids,
+                    "observation_count": len(observation_ids),
+                    "scenario_type": "demo",
+                    "trigger_event_id": "",
+                    "source": "synthetic",
+                    "parent_scenario_id": "",
+                    "coverage_tags": ["state"],
+                    "summary": "pick the cube",
+                    "transform_id": "tfm-scenario",
+                    "created_at": now,
+                }
+            ],
+            schema=SCENARIOS_SCHEMA,
+        )
+    )
+    create_snapshot(lake, name="demo-v1", scenario_ids=["scn-export-a"], split_by="scenario")
+    return lake
+
+
+def test_lerobot_export_omits_feature_with_no_data(tmp_path):
+    lake = _lake_with_action_vectors(tmp_path / "robot.lance", [None, None])
+    out = tmp_path / "lerobot"
+    export_dataset_snapshot(lake, "demo-v1", out_dir=out, fmt="lerobot")
+
+    info = json.loads((out / "meta/info.json").read_text())
+    assert "action" not in info["features"]
+    assert "observation.state" in info["features"]
+
+    # The declared schema must match the physical parquet columns exactly, or
+    # a real LeRobot/`datasets` load fails with a column-mismatch CastError
+    # even though the export itself "succeeded" (regression: the omission
+    # above used to apply only to meta/info.json, not to the parquet writer).
+    columns = set(pq.read_schema(out / "data/chunk-000/file-000.parquet").names)
+    assert "action" not in columns
+    assert "observation.state" in columns
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("lerobot") is None,
+    reason="LeRobot optional dependency is not installed",
+)
+def test_lerobot_export_with_no_action_data_loads_with_official_lerobot_package(tmp_path):
+    lake = _lake_with_action_vectors(tmp_path / "robot.lance", [None, None])
+    out = tmp_path / "lerobot"
+    manifest = export_dataset_snapshot(lake, "demo-v1", out_dir=out, fmt="lerobot")
+
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset = LeRobotDataset(repo_id="local/demo-v1", root=out, download_videos=False)
+
+    assert dataset.num_frames == manifest.step_count
+    assert "action" not in dataset.features
+    assert "observation.state" in dataset.features
+
+
+def test_lerobot_export_rejects_inconsistent_vector_lengths(tmp_path):
+    lake = _lake_with_action_vectors(tmp_path / "robot.lance", [[0.1, 0.2], [0.1, 0.2, 0.3]])
+    out = tmp_path / "lerobot"
+
+    with pytest.raises(DatasetExportError, match="inconsistent vector lengths"):
+        export_dataset_snapshot(lake, "demo-v1", out_dir=out, fmt="lerobot")
+
+
+def test_lerobot_export_rejects_partial_vector_coverage(tmp_path):
+    lake = _lake_with_action_vectors(tmp_path / "robot.lance", [[0.1, 0.2], None])
+    out = tmp_path / "lerobot"
+
+    with pytest.raises(DatasetExportError, match="missing this feature"):
+        export_dataset_snapshot(lake, "demo-v1", out_dir=out, fmt="lerobot")
 
 
 def test_rlds_export_writes_episode_step_structure(lake, tmp_path):

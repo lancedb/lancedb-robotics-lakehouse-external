@@ -20,6 +20,7 @@ trying to do**, not by the order features were built.
   - [The training loader report contract](concepts/training-loader-report.md)
 - **Journeys** — end-to-end walkthroughs of a real task.
   - [Bring a LeRobot dataset into the lake](journeys/lerobot-ingest.md)
+  - [Bring an RLDS / TFDS dataset into the lake](journeys/rlds-ingest.md)
   - [The rebuild loop: invalidate → plan → approve → dispatch](journeys/rebuild-loop.md)
   - [Retention policy and governance: define → activate → apply → project](journeys/retention-governance.md)
   - [Lineage audit reports and cleanup gates](journeys/lineage-audit-reports.md)

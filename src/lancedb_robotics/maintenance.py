@@ -29,6 +29,12 @@ from lancedb_robotics.lineage import (
     snapshot_retention_pin_details,
 )
 from lancedb_robotics.pylance_execution import require_namespace_write_supported
+from lancedb_robotics.scalar_index_jobs import (
+    reconcile_scalar_index_jobs as _reconcile_scalar_index_jobs,
+)
+from lancedb_robotics.scalar_index_jobs import (
+    request_aligned_predicate_index_jobs as _request_aligned_predicate_index_jobs,
+)
 from lancedb_robotics.schemas import CANONICAL_TABLES, TRANSFORM_RUNS_SCHEMA
 
 MAINTENANCE_TRANSFORM_KIND = "maintenance"
@@ -76,6 +82,11 @@ class MaintenanceReport:
     tables: dict[str, TableMaintenanceReport] = field(default_factory=dict)
     required_audit_report: dict[str, Any] | None = None
     lerobot_checkpoint_retention: dict[str, Any] | None = None
+    aligned_tick_lifecycle: dict[str, Any] | None = None
+    scalar_index_jobs: dict[str, Any] | None = None
+    curation_membership_chunks: dict[str, Any] | None = None
+    curation_row_plan_chunks: dict[str, Any] | None = None
+    curation_replay_retention: dict[str, Any] | None = None
 
 
 def _digest(payload: dict) -> str:
@@ -259,6 +270,14 @@ def maintain_lake(
     lerobot_checkpoint_retention_statuses: tuple[str, ...] | list[str] | None = None,
     lerobot_checkpoint_retain_completed_per_source: int = 10,
     lerobot_checkpoint_retain_failed_per_source: int = 10,
+    aligned_tick_lifecycle_diagnostics: bool = True,
+    reconcile_index_jobs: bool = True,
+    request_predicate_index_jobs: bool = False,
+    apply_predicate_recommendations: bool = False,
+    predicate_recommendation_limit: int = 200,
+    curation_chunk_maintenance: bool = True,
+    compact_curation_chunks: bool = True,
+    curation_replay_retention: bool = True,
     created_by: str = "lancedb-robotics",
 ) -> MaintenanceReport:
     """Compact tables, refresh existing indexes, and prune old unpinned versions.
@@ -427,6 +446,142 @@ def maintain_lake(
             cleanup=cleanup,
         )
 
+    # Surface aligned-tick retention posture (backlog 0135) as read-only
+    # diagnostics when the hot training table is in scope. Never fails
+    # maintenance: a diagnostic error is recorded rather than raised, and the
+    # cleanup itself stays an explicit, dry-run-first operation elsewhere.
+    aligned_tick_lifecycle: dict[str, Any] | None = None
+    if aligned_tick_lifecycle_diagnostics and "aligned_ticks" in selected:
+        try:
+            from lancedb_robotics.aligned_tick_lifecycle import diagnose_aligned_ticks
+
+            aligned_tick_lifecycle = diagnose_aligned_ticks(lake)
+        except Exception as exc:  # noqa: BLE001 - diagnostics are best-effort.
+            aligned_tick_lifecycle = {"status": "failed", "reason": str(exc)}
+
+    # Reconcile the durable scalar predicate index job lifecycle (backlog 0136)
+    # without disturbing vector/FTS indexes: poll pending remote builds, expire
+    # stale ones, and (opt-in) request the recommended aligned hot-predicate index
+    # jobs so default researchers get indexes built for them. Best-effort: never
+    # fails maintenance, and reconcile is a no-op returning [] until a job table
+    # exists (the read path never creates it).
+    scalar_index_job_report: dict[str, Any] | None = None
+    if reconcile_index_jobs or request_predicate_index_jobs or apply_predicate_recommendations:
+        report: dict[str, Any] = {}
+        try:
+            if request_predicate_index_jobs and (
+                "aligned_ticks" in selected or "aligned_frames" in selected
+            ):
+                report["requested"] = [
+                    result.to_dict()
+                    for result in _request_aligned_predicate_index_jobs(
+                        lake,
+                        include_frames="aligned_frames" in selected,
+                    )
+                ]
+            if apply_predicate_recommendations:
+                # 0137: learn hot/selective predicates from persisted training-report
+                # telemetry and request index jobs for the safe, high-confidence
+                # typed-column ones -- so non-default hot predicates get indexed
+                # automatically. Opt-in and best-effort; JSONB promotions stay advisory.
+                from lancedb_robotics.predicate_index_telemetry import (
+                    apply_index_recommendations,
+                    recent_aligned_reports,
+                    recommend_from_reports,
+                )
+
+                recommendations = recommend_from_reports(
+                    recent_aligned_reports(lake, limit=predicate_recommendation_limit)
+                )
+                report["recommendations_applied"] = apply_index_recommendations(
+                    lake, recommendations, min_confidence="high"
+                )
+            if reconcile_index_jobs:
+                report["reconciled"] = _reconcile_scalar_index_jobs(lake)
+            scalar_index_job_report = report or None
+        except Exception as exc:  # noqa: BLE001 - job lifecycle is best-effort.
+            scalar_index_job_report = {"status": "failed", "reason": str(exc)}
+
+    # Validate chunked curation-view membership integrity and reclaim orphaned
+    # chunk rows (backlog 0140). Best-effort: never fails maintenance. Migration
+    # of legacy inline views is a deliberate layout change and is NOT run here --
+    # it stays an explicit `curate migrate-views` operation. Superseded-revision
+    # GC is likewise opt-in and only reported here as candidates.
+    curation_membership_chunks: dict[str, Any] | None = None
+    if curation_chunk_maintenance and "curation_view_membership_chunks" in selected:
+        try:
+            from lancedb_robotics.curate import (
+                compact_view_membership,
+                validate_view_membership,
+            )
+
+            report = {
+                "validation": validate_view_membership(lake).to_params(),
+                "compaction": compact_view_membership(
+                    lake,
+                    include_superseded=False,
+                    dry_run=not compact_curation_chunks,
+                    created_by=created_by,
+                ).to_params(),
+            }
+            curation_membership_chunks = report
+        except Exception as exc:  # noqa: BLE001 - chunk maintenance is best-effort.
+            curation_membership_chunks = {"status": "failed", "reason": str(exc)}
+
+    # Validate chunked row-plan storage and reclaim orphaned chunk rows (backlog
+    # 0146). The row-plan write path *deliberately* produces orphan chunk rows as
+    # its crash-safety mechanism (chunks first, header last), so something has to
+    # collect them; leaving it to an operator remembering `curate compact-row-plans`
+    # means they accumulate forever. Best-effort: never fails maintenance. The
+    # in-flight grace window is honoured, so a compile still streaming chunks is
+    # never reclaimed out from under itself.
+    curation_row_plan_chunks: dict[str, Any] | None = None
+    if curation_chunk_maintenance and "curation_row_plan_chunks" in selected:
+        try:
+            from lancedb_robotics.curation_row_plans import (
+                compact_row_plan_chunks,
+                validate_row_plan_storage,
+            )
+
+            # Compaction derives the orphan set itself -- and more precisely, since
+            # it also separates in-flight writes -- so validation skips its own
+            # orphan sweep (a whole-chunk-table scan plus a whole-header scan).
+            compaction = compact_row_plan_chunks(
+                lake,
+                dry_run=not compact_curation_chunks,
+            )
+            curation_row_plan_chunks = {
+                "validation": validate_row_plan_storage(
+                    lake, include_orphans=False
+                ).to_dict(),
+                "compaction": compaction,
+            }
+        except Exception as exc:  # noqa: BLE001 - chunk maintenance is best-effort.
+            curation_row_plan_chunks = {"status": "failed", "reason": str(exc)}
+
+    # Verify curation as-of replay readiness (backlog 0143). The per-table loop
+    # above already tagged every snapshot-pinned version (including the three
+    # curation replay tables), so this read-only check confirms those pins are
+    # protected + readable and surfaces any pruned/unreadable/unprotected replay
+    # pin. Best-effort: never fails maintenance.
+    curation_replay_retention_report: dict[str, Any] | None = None
+    _curation_replay_tables = (
+        "curation_views",
+        "curation_view_membership_chunks",
+        "curation_memberships",
+    )
+    if curation_replay_retention and any(
+        table in selected for table in _curation_replay_tables
+    ):
+        try:
+            from lancedb_robotics.curation_replay_retention import (
+                curation_replay_readiness,
+            )
+
+            curation_replay_retention_report = curation_replay_readiness(lake).to_dict()
+        except Exception as exc:  # noqa: BLE001 - readiness is best-effort.
+            curation_replay_retention_report = {"status": "failed", "reason": str(exc)}
+
     finished = datetime.now(UTC)
     transform_id = "tfm-maintenance-" + _digest(
         {
@@ -454,6 +609,11 @@ def maintain_lake(
         ),
         "required_audit_report": required_audit_report,
         "lerobot_checkpoint_retention": lerobot_retention_report,
+        "aligned_tick_lifecycle": aligned_tick_lifecycle,
+        "scalar_index_jobs": scalar_index_job_report,
+        "curation_membership_chunks": curation_membership_chunks,
+        "curation_row_plan_chunks": curation_row_plan_chunks,
+        "curation_replay_retention": curation_replay_retention_report,
     }
     transform_row = {
         "transform_id": transform_id,
@@ -480,4 +640,9 @@ def maintain_lake(
         tables=table_reports,
         required_audit_report=required_audit_report,
         lerobot_checkpoint_retention=lerobot_retention_report,
+        aligned_tick_lifecycle=aligned_tick_lifecycle,
+        scalar_index_jobs=scalar_index_job_report,
+        curation_membership_chunks=curation_membership_chunks,
+        curation_row_plan_chunks=curation_row_plan_chunks,
+        curation_replay_retention=curation_replay_retention_report,
     )

@@ -155,6 +155,43 @@ def inspect_rosbag(path: str = _PATH_ARGUMENT, format: str = _FORMAT_OPTION) -> 
     _print_report(report, format=format)
 
 
+@inspect_app.command("rlds")
+def inspect_rlds(
+    path: str = typer.Argument(
+        ...,
+        help="Prepared TFDS version directory (local path or gs:// URI).",
+    ),
+    format: str = _FORMAT_OPTION,
+    auth_ref: str | None = _AUTH_REF_OPTION,
+    storage_option: list[str] | None = _STORAGE_OPTION,
+) -> None:
+    """Describe RLDS/TFDS splits, shards, and feature metadata without ingesting."""
+    from lancedb_robotics.adapters import AdapterError, get_adapter
+    from lancedb_robotics.storage import parse_storage_option_pairs
+
+    if format not in ("json", "text"):
+        typer.echo(f"error: unknown format {format!r}; expected json or text", err=True)
+        raise typer.Exit(code=1)
+    try:
+        storage_options = parse_storage_option_pairs(storage_option)
+        report = get_adapter("rlds").inspect(
+            path,
+            storage_options=storage_options,
+            auth_ref=auth_ref,
+        )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except AdapterError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if format == "text":
+        _print_rlds_report(report)
+    else:
+        _print_report(report, format=format)
+
+
 @inspect_app.command("lerobot")
 def inspect_lerobot(
     path: str = typer.Argument(
@@ -446,6 +483,19 @@ def _print_report(report: dict, *, format: str) -> None:
         typer.echo(
             f"  {gap['kind']} between shard {gap['after_shard']} and {gap['before_shard']}: "
             f"{gap['delta_ns']} ns"
+        )
+
+
+def _print_rlds_report(report: dict) -> None:
+    typer.echo(f"{report['path']}")
+    typer.echo(
+        f"  RLDS/TFDS {report.get('dataset_name')}@{report.get('dataset_version')}: "
+        f"{report['episode_count']} episodes, {report['shard_count']} shards"
+    )
+    for split in report.get("splits") or []:
+        typer.echo(
+            f"  {split['name']}\t{split['episode_count']} episodes\t"
+            f"{split['shard_count']} shards\t{split['num_bytes']} bytes"
         )
 
 

@@ -1,7 +1,5 @@
 """`lancedb-robotics dataset` subcommands."""
 
-from pathlib import Path
-
 import typer
 
 from lancedb_robotics.cli.lineage_context import (
@@ -54,6 +52,16 @@ _COMPRESSION_OPTION = typer.Option(
     "none",
     "--compression",
     help="WebDataset tar compression: none or gzip.",
+)
+_STORAGE_OPTION = typer.Option(
+    None,
+    "--storage-option",
+    help="Object-store credential/config as key=value; repeat for several.",
+)
+_AUTH_REF_OPTION = typer.Option(
+    None,
+    "--auth-ref",
+    help="Auth-reference name resolving object-store credentials from the environment.",
 )
 
 
@@ -112,14 +120,21 @@ def export_dataset(
     ),
     lake: str = _LAKE_OPTION,
     snapshot: str = _SNAPSHOT_OPTION,
-    out: Path = _OUT_OPTION,
+    out: str = _OUT_OPTION,
     fmt: str = _FORMAT_OPTION,
     require_native_loader: bool = _REQUIRE_NATIVE_OPTION,
     shard_size: int = _SHARD_SIZE_OPTION,
     compression: str = _COMPRESSION_OPTION,
+    storage_option: list[str] = _STORAGE_OPTION,
+    auth_ref: str | None = _AUTH_REF_OPTION,
     lineage_context: str | None = LINEAGE_CONTEXT_OPTION,
 ) -> None:
-    """Export a dataset snapshot as a materialized boundary projection."""
+    """Export a dataset snapshot as a materialized boundary projection.
+
+    ``--out`` may be a local directory or an object-store URI (``s3://``,
+    ``gs://``, ``az://``); object-store credentials resolve from repeated
+    ``--storage-option key=value`` pairs and/or ``--auth-ref``.
+    """
     from lancedb_robotics.dataset_export import DATASET_EXPORT_MANIFEST_FILENAME
     from lancedb_robotics.lake import Lake, LakeError
     from lancedb_robotics.lineage_hooks import LineageHookError
@@ -128,10 +143,12 @@ def export_dataset(
         ProjectionError,
         export_projection,
     )
+    from lancedb_robotics.storage import join_uri, parse_storage_option_pairs
 
     selected_format = _resolve_format_argument(format_arg, fmt)
 
     try:
+        storage_options = parse_storage_option_pairs(storage_option) or None
         context = load_lineage_context(lineage_context)
         opened = Lake.open(lake)
         manifest = export_projection(
@@ -143,8 +160,10 @@ def export_dataset(
             shard_size=shard_size,
             compression=compression,
             lineage_context=context,
+            storage_options=storage_options,
+            auth_ref=auth_ref,
         )
-    except (LakeError, ProjectionError) as exc:
+    except (LakeError, ProjectionError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     except LineageHookError as exc:
@@ -153,8 +172,8 @@ def export_dataset(
     _echo_projection_manifest(manifest)
     typer.echo(f"out: {out}")
     typer.echo(f"content hash: {manifest.content_hashes.get('dataset', '')}")
-    typer.echo(f"manifest: {Path(out) / DATASET_EXPORT_MANIFEST_FILENAME}")
-    typer.echo(f"projection manifest: {Path(out) / PROJECTION_MANIFEST_FILENAME}")
+    typer.echo(f"manifest: {join_uri(out, DATASET_EXPORT_MANIFEST_FILENAME)}")
+    typer.echo(f"projection manifest: {join_uri(out, PROJECTION_MANIFEST_FILENAME)}")
     _echo_native_loader(manifest)
 
 
@@ -164,18 +183,26 @@ def project_dataset(
     lake: str = _LAKE_OPTION,
     snapshot: str = _SNAPSHOT_OPTION,
     mode: str = typer.Option("live", "--mode", help="Projection mode: live, plan, or export."),
-    out: Path | None = _OPTIONAL_OUT_OPTION,
+    out: str | None = _OPTIONAL_OUT_OPTION,
     require_native_loader: bool = _REQUIRE_NATIVE_OPTION,
     shard_size: int = _SHARD_SIZE_OPTION,
     compression: str = _COMPRESSION_OPTION,
+    storage_option: list[str] = _STORAGE_OPTION,
+    auth_ref: str | None = _AUTH_REF_OPTION,
     lineage_context: str | None = LINEAGE_CONTEXT_OPTION,
 ) -> None:
-    """Open, plan, or materialize an external-format dataset projection."""
+    """Open, plan, or materialize an external-format dataset projection.
+
+    In ``export`` mode, ``--out`` may be a local directory or an object-store URI;
+    object-store credentials resolve from ``--storage-option``/``--auth-ref``.
+    """
     from lancedb_robotics.lake import Lake, LakeError
     from lancedb_robotics.lineage_hooks import LineageHookError
     from lancedb_robotics.projections import ProjectionError, ProjectionMode, export_projection
+    from lancedb_robotics.storage import parse_storage_option_pairs
 
     try:
+        storage_options = parse_storage_option_pairs(storage_option) or None
         context = load_lineage_context(lineage_context)
         opened = Lake.open(lake)
         selected_mode = ProjectionMode(mode)
@@ -191,6 +218,8 @@ def project_dataset(
                 shard_size=shard_size,
                 compression=compression,
                 lineage_context=context,
+                storage_options=storage_options,
+                auth_ref=auth_ref,
             )
             sample_count = None
         elif selected_mode == ProjectionMode.PLAN:
@@ -224,8 +253,9 @@ def project_dataset(
         typer.echo(f"samples: {sample_count}")
     if out is not None and manifest.mode == ProjectionMode.EXPORT:
         from lancedb_robotics.projections import PROJECTION_MANIFEST_FILENAME
+        from lancedb_robotics.storage import join_uri
 
-        typer.echo(f"projection manifest: {Path(out) / PROJECTION_MANIFEST_FILENAME}")
+        typer.echo(f"projection manifest: {join_uri(out, PROJECTION_MANIFEST_FILENAME)}")
     _echo_native_loader(manifest)
 
 
@@ -297,6 +327,22 @@ def _echo_projection_manifest(manifest) -> None:
             typer.echo(
                 f"materialization: {accounting.get('payload_copy_policy')}"
             )
+    reconciliation = getattr(manifest, "reconciliation", None) or {}
+    if reconciliation.get("checked"):
+        typer.echo(
+            "reconciliation: "
+            f"{reconciliation.get('status')} "
+            f"backend={reconciliation.get('backend')} "
+            f"objects={reconciliation.get('verified_object_count')}/"
+            f"{reconciliation.get('object_count')} "
+            f"bytes={reconciliation.get('total_object_bytes')}"
+        )
+        missing = reconciliation.get("missing") or []
+        mismatched = reconciliation.get("mismatched") or []
+        if missing:
+            typer.echo(f"  missing: {len(missing)}")
+        if mismatched:
+            typer.echo(f"  size-mismatched: {len(mismatched)}")
     dry_run = manifest.feature_schema.get("dry_run") or {}
     if dry_run:
         typer.echo(f"planned shards: {dry_run.get('shard_count')}")

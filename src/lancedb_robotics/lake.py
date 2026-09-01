@@ -1,9 +1,11 @@
 """Lake open/create API: the canonical-table substrate over a LanceDB database."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import lancedb
+import pyarrow as pa
 
 from lancedb_robotics.connections import (
     ConnectionResolverError,
@@ -12,6 +14,7 @@ from lancedb_robotics.connections import (
 )
 from lancedb_robotics.schemas import (
     CANONICAL_TABLES,
+    RLDS_INGEST_CLAIMS_SCHEMA,
     SCHEMA_METADATA_VERSION_KEY,
     TABLE_SCHEMAS,
 )
@@ -103,9 +106,11 @@ class Lake:
     ) -> "Lake":
         """Create the canonical tables at ``uri``, leaving existing ones intact.
 
-        Idempotent: missing tables are created empty, existing tables (and
-        their rows) are left untouched. Raises ``ValueError`` if an existing
-        table's schema conflicts with the canonical schema.
+        Idempotent: missing data tables are created empty, the internal RLDS
+        coordination table is created with its single unclaimed gate row, and
+        existing tables (and their rows) are left untouched. Raises
+        ``ValueError`` if an existing table's schema conflicts with the
+        canonical schema.
         """
         try:
             spec = resolve_lake_connection(
@@ -134,6 +139,38 @@ class Lake:
                     # LanceDB 0.33 can report Arrow JSON extension schemas with
                     # storage metadata that fail create_table(..., exist_ok=True)
                     # validation even though the persisted table is usable.
+                    continue
+                if name == "rlds_ingest_claims" and name not in existing:
+                    now = datetime.now(UTC)
+                    gate = pa.Table.from_pylist(
+                        [
+                            {
+                                "claim_key": "global",
+                                "owner_token": None,
+                                "run_id": None,
+                                "claimed_by": None,
+                                "claimed_at": None,
+                                "updated_at": now,
+                                "created_at": now,
+                            }
+                        ],
+                        schema=RLDS_INGEST_CLAIMS_SCHEMA,
+                    )
+                    # Seed the only mutable coordination row atomically with
+                    # table creation.  A concurrent init sees the winner's
+                    # table via exist_ok instead of appending a second gate.
+                    db.create_table(name, data=gate, exist_ok=True)
+                    continue
+                if name == "rlds_ingest_claims":
+                    claim_table = db.open_table(name)
+                    total_rows = int(claim_table.count_rows())
+                    global_rows = int(claim_table.count_rows("claim_key = 'global'"))
+                    if total_rows != 1 or global_rows != 1:
+                        raise ValueError(
+                            "rlds_ingest_claims must contain exactly one `global` gate "
+                            f"row (found total={total_rows}, global={global_rows}); "
+                            "automatic repair is unsafe while writers may be active"
+                        )
                     continue
                 db.create_table(name, schema=schema, exist_ok=True)
         except (ImportError, ModuleNotFoundError, OSError, RuntimeError, ValueError) as exc:

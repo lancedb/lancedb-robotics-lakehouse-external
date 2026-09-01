@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from lancedb_robotics.export_reconciliation import ExportTarget
 from lancedb_robotics.lineage import emit_transform_lineage
 from lancedb_robotics.lineage_hooks import (
     attach_lineage_context_to_params,
@@ -148,6 +149,7 @@ class ProjectionManifest:
     transform_lineage_id: str
     accounting: dict[str, Any] = field(default_factory=dict)
     lineage_context: dict[str, Any] = field(default_factory=dict)
+    reconciliation: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         """Validate the schema-level requirements shared by all projection modes."""
@@ -226,6 +228,8 @@ class ProjectionManifest:
         }
         if self.lineage_context:
             payload["lineage_context"] = dict(self.lineage_context)
+        if self.reconciliation:
+            payload["reconciliation"] = dict(self.reconciliation)
         return payload
 
     @classmethod
@@ -251,6 +255,7 @@ class ProjectionManifest:
             transform_lineage_id=str(payload.get("transform_lineage_id") or ""),
             accounting=dict(payload.get("accounting") or {}),
             lineage_context=dict(payload.get("lineage_context") or {}),
+            reconciliation=dict(payload.get("reconciliation") or {}),
         )
 
 
@@ -534,6 +539,8 @@ class LakeProjectionBinding:
         shard_size: int = DEFAULT_WEBDATASET_SHARD_SIZE,
         compression: str = DEFAULT_WEBDATASET_COMPRESSION,
         lineage_context: Any | None = None,
+        storage_options: Mapping[str, Any] | None = None,
+        auth_ref: str | None = None,
     ) -> ProjectionManifest:
         return export_projection(
             self._lake,
@@ -544,6 +551,8 @@ class LakeProjectionBinding:
             shard_size=shard_size,
             compression=compression,
             lineage_context=lineage_context,
+            storage_options=storage_options,
+            auth_ref=auth_ref,
         )
 
 
@@ -619,6 +628,8 @@ class LakeProjections:
         shard_size: int = DEFAULT_WEBDATASET_SHARD_SIZE,
         compression: str = DEFAULT_WEBDATASET_COMPRESSION,
         lineage_context: Any | None = None,
+        storage_options: Mapping[str, Any] | None = None,
+        auth_ref: str | None = None,
     ) -> ProjectionManifest:
         return self.format(format).export(
             snapshot_name,
@@ -627,6 +638,8 @@ class LakeProjections:
             shard_size=shard_size,
             compression=compression,
             lineage_context=lineage_context,
+            storage_options=storage_options,
+            auth_ref=auth_ref,
         )
 
     def materialization_summary(
@@ -854,8 +867,18 @@ def export_projection(
     compression: str = DEFAULT_WEBDATASET_COMPRESSION,
     created_by: str = "lancedb-robotics",
     lineage_context: Any | None = None,
+    storage_options: Mapping[str, Any] | None = None,
+    auth_ref: str | None = None,
 ) -> ProjectionManifest:
-    """Materialize a projection and write its shared projection manifest."""
+    """Materialize a projection and write its shared projection manifest.
+
+    ``out_dir`` may be a local path or an object-store URI (``s3://``, ``gs://``,
+    ``az://``). The dataset writer stages the tree locally, publishes it, and
+    reconciles the written objects; this layer adds the shared
+    ``projection_manifest.json`` to the same destination and carries the
+    reconciliation summary. Accounting is measured from the staged tree, so a
+    local and an object-store export are byte-identical.
+    """
     import lancedb_robotics.dataset_export as dataset_export
 
     spec = DEFAULT_PROJECTION_REGISTRY.get(fmt)
@@ -873,56 +896,41 @@ def export_projection(
     )
     context = handle.finish(status="completed")
 
-    dataset_manifest = dataset_export.export_dataset_snapshot(
-        lake,
-        snapshot_name,
-        out_dir=out_dir,
-        fmt=spec.name,
-        require_native=require_native,
-        **projection_options,
-        created_by=created_by,
-        record_materialization=False,
-    )
-    plan = _projection_plan(lake, snapshot_name, spec, **projection_options)
-    root = Path(dataset_manifest.out_dir)
-    projection_manifest_path = root / PROJECTION_MANIFEST_FILENAME
-    output_paths = tuple(
-        str(root / rel)
-        for rel in (
-            *dataset_manifest.data_files,
-            dataset_export.DATASET_EXPORT_MANIFEST_FILENAME,
+    target = ExportTarget(out_dir, storage_options=storage_options, auth_ref=auth_ref)
+    try:
+        dataset_manifest = dataset_export.export_dataset_snapshot(
+            lake,
+            snapshot_name,
+            out_dir=out_dir,
+            fmt=spec.name,
+            require_native=require_native,
+            **projection_options,
+            created_by=created_by,
+            record_materialization=False,
+            storage_options=storage_options,
+            auth_ref=auth_ref,
+            _target=target,
         )
-    ) + (str(projection_manifest_path),)
-    media_policy = _media_policy(
-        "export",
-        native_loader=dataset_manifest.native_loader,
-        projection_options=projection_options,
-    )
-    metadata_bytes = 0
-    manifest = _manifest(
-        lake,
-        plan,
-        spec,
-        mode=ProjectionMode.EXPORT,
-        media_policy=media_policy,
-        output_paths=output_paths,
-        live_adapter={},
-        content_hashes={"dataset": dataset_manifest.content_hash},
-        metadata_bytes=metadata_bytes,
-        payload_bytes_copied=plan.payload_bytes_to_copy,
-        planned_payload_bytes=plan.payload_bytes_to_copy,
-        target_path=str(root),
-        lineage_context=context,
-    )
-    for _ in range(3):
-        _write_projection_manifest(root, manifest)
-        observed_metadata_bytes = metadata_bytes_written(
-            output_paths,
-            payload_bytes_copied=plan.payload_bytes_to_copy,
+        plan = _projection_plan(lake, snapshot_name, spec, **projection_options)
+        # Writers and the metadata-bytes fixpoint operate on the local staging
+        # root; only the final projection manifest is published to the remote
+        # destination. All accounting therefore matches a local export exactly.
+        root = target.local_root
+        projection_manifest_path = root / PROJECTION_MANIFEST_FILENAME
+        output_paths = tuple(
+            str(root / rel)
+            for rel in (
+                *dataset_manifest.data_files,
+                dataset_export.DATASET_EXPORT_MANIFEST_FILENAME,
+            )
+        ) + (str(projection_manifest_path),)
+        media_policy = _media_policy(
+            "export",
+            native_loader=dataset_manifest.native_loader,
+            projection_options=projection_options,
         )
-        if observed_metadata_bytes == metadata_bytes:
-            break
-        metadata_bytes = observed_metadata_bytes
+        reconciliation = dataset_manifest.reconciliation
+        metadata_bytes = 0
         manifest = _manifest(
             lake,
             plan,
@@ -935,13 +943,42 @@ def export_projection(
             metadata_bytes=metadata_bytes,
             payload_bytes_copied=plan.payload_bytes_to_copy,
             planned_payload_bytes=plan.payload_bytes_to_copy,
-            target_path=str(root),
+            target_path=target.destination,
             lineage_context=context,
+            reconciliation=reconciliation,
         )
-    _write_projection_manifest(root, manifest)
-    _record_projection_transform(lake, manifest, created_by=created_by)
-    _record_projection_accounting(lake, manifest, created_by=created_by)
-    return manifest
+        for _ in range(3):
+            _write_projection_manifest(root, manifest)
+            observed_metadata_bytes = metadata_bytes_written(
+                output_paths,
+                payload_bytes_copied=plan.payload_bytes_to_copy,
+            )
+            if observed_metadata_bytes == metadata_bytes:
+                break
+            metadata_bytes = observed_metadata_bytes
+            manifest = _manifest(
+                lake,
+                plan,
+                spec,
+                mode=ProjectionMode.EXPORT,
+                media_policy=media_policy,
+                output_paths=output_paths,
+                live_adapter={},
+                content_hashes={"dataset": dataset_manifest.content_hash},
+                metadata_bytes=metadata_bytes,
+                payload_bytes_copied=plan.payload_bytes_to_copy,
+                planned_payload_bytes=plan.payload_bytes_to_copy,
+                target_path=target.destination,
+                lineage_context=context,
+                reconciliation=reconciliation,
+            )
+        _write_projection_manifest(root, manifest)
+        target.publish([PROJECTION_MANIFEST_FILENAME])
+        _record_projection_transform(lake, manifest, created_by=created_by)
+        _record_projection_accounting(lake, manifest, created_by=created_by)
+        return manifest
+    finally:
+        target.cleanup()
 
 
 def _mode(value: str | ProjectionMode) -> ProjectionMode:
@@ -1574,6 +1611,7 @@ def _manifest(
     planned_payload_bytes: int | None = None,
     target_path: str = "",
     lineage_context: Any | None = None,
+    reconciliation: Mapping[str, Any] | None = None,
 ) -> ProjectionManifest:
     lineage_context = normalize_lineage_context(lineage_context)
     transform_id = _transform_id(
@@ -1630,6 +1668,7 @@ def _manifest(
         transform_lineage_id=transform_id,
         accounting=accounting,
         lineage_context=lineage_context.to_dict() if lineage_context else {},
+        reconciliation=dict(reconciliation) if reconciliation else {},
     )
     manifest.validate()
     return manifest
@@ -1749,6 +1788,7 @@ def _record_projection_accounting(
         metadata_bytes_written=accounting.metadata_bytes_written,
         planned_payload_bytes=accounting.payload_bytes_planned,
         projection_transform_id=manifest.transform_id,
+        reconciliation=manifest.reconciliation or None,
         created_by=created_by,
     )
 

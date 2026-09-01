@@ -290,6 +290,17 @@ def maintain(
     tables: list[str] | None = _TABLE_OPTION,
     compact: bool = _COMPACT_OPTION,
     refresh_indexes: bool = _REFRESH_INDEXES_OPTION,
+    request_predicate_index_jobs: bool = typer.Option(
+        False,
+        "--request-predicate-index-jobs/--no-request-predicate-index-jobs",
+        help="Request the recommended aligned hot-predicate scalar index jobs (0136).",
+    ),
+    apply_predicate_recommendations: bool = typer.Option(
+        False,
+        "--apply-predicate-recommendations/--no-apply-predicate-recommendations",
+        help="Request scalar-index jobs for safe, high-confidence predicates learned "
+        "from persisted training-report telemetry (0137).",
+    ),
     retention: bool = _RETENTION_OPTION,
     cleanup_older_than_days: float = _CLEANUP_OLDER_THAN_DAYS_OPTION,
     retain_versions: int | None = _RETAIN_VERSIONS_OPTION,
@@ -377,6 +388,8 @@ def maintain(
             ),
             lerobot_checkpoint_retain_completed_per_source=lerobot_retain_completed_per_source,
             lerobot_checkpoint_retain_failed_per_source=lerobot_retain_failed_per_source,
+            request_predicate_index_jobs=request_predicate_index_jobs,
+            apply_predicate_recommendations=apply_predicate_recommendations,
         )
     except (LakeError, MaintenanceError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -384,8 +397,30 @@ def maintain(
 
     typer.echo(f"lake: {report.lake_uri}")
     typer.echo(f"transform: {report.transform_id}")
+    if report.scalar_index_jobs:
+        sij = report.scalar_index_jobs
+        if sij.get("status") == "failed":
+            typer.echo(f"scalar-index jobs: skipped ({sij.get('reason')})")
+        else:
+            typer.echo(
+                "scalar-index jobs: "
+                f"requested {len(sij.get('requested') or [])}, "
+                f"reconciled {len(sij.get('reconciled') or [])}"
+            )
     if report.required_audit_report:
         typer.echo(f"required audit report: {report.required_audit_report['report_id']}")
+    if report.curation_replay_retention:
+        crr = report.curation_replay_retention
+        if crr.get("status") == "failed":
+            typer.echo(f"curation replay: skipped ({crr.get('reason')})")
+        else:
+            at_risk = len(crr.get("at_risk_pins") or [])
+            typer.echo(
+                "curation replay: "
+                f"{crr.get('status')} "
+                f"(backend {crr.get('backend', {}).get('status')}, "
+                f"{crr.get('snapshots_checked', 0)} snapshots, {at_risk} at-risk pins)"
+            )
     if report.lerobot_checkpoint_retention:
         retention_report = report.lerobot_checkpoint_retention
         typer.echo(

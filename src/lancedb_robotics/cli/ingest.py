@@ -81,6 +81,37 @@ _SOURCE_STORAGE_OPTION = typer.Option(
     "--source-storage-option",
     help="Raw source storage option as key=value; defaults to --storage-option when omitted.",
 )
+_RLDS_SPLIT_OPTION = typer.Option(
+    None,
+    "--split",
+    help="TFDS split to ingest; repeat to ingest several (default: all declared splits).",
+)
+_RLDS_STATE_KEY_OPTION = typer.Option(
+    None,
+    "--state-key",
+    help="Dotted state key below observation (default probes state/robot_state/proprio/joint_state).",
+)
+_RLDS_ACTION_KEY_OPTION = typer.Option(
+    "action",
+    "--action-key",
+    help="Dotted optional action key; nested numeric mappings are flattened deterministically.",
+)
+_RLDS_LANGUAGE_KEY_OPTION = typer.Option(
+    "observation.natural_language_instruction",
+    "--language-key",
+    help="Dotted language-instruction key used for task_id/caption.",
+)
+_RLDS_TIMESTAMP_KEY_OPTION = typer.Option(
+    None,
+    "--timestamp-key",
+    help="Dotted timestamp key; *_ns is interpreted as nanoseconds, other values as seconds.",
+)
+_RLDS_FPS_OPTION = typer.Option(
+    None,
+    "--fps",
+    min=0.000001,
+    help="Derive timestamps from frame index at this rate when the source has no timestamp.",
+)
 _REGION_OPTION = typer.Option(None, "--region", help="LanceDB Enterprise region.")
 _HOST_OVERRIDE_OPTION = typer.Option(
     None,
@@ -344,6 +375,89 @@ def ingest_rosbag_command(
             retain_versions=retain_versions,
             index_predicates=index_predicates,
             auth_ref=source_auth_ref or auth_ref,
+        )
+    except AdapterError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    _print_report(report, opened)
+
+
+@ingest_app.command("rlds")
+def ingest_rlds_command(
+    path: str = typer.Argument(
+        ...,
+        help="Prepared TFDS version directory (local path or gs:// URI).",
+    ),
+    lake: str = _LAKE_OPTION,
+    split: list[str] | None = _RLDS_SPLIT_OPTION,
+    state_key: str | None = _RLDS_STATE_KEY_OPTION,
+    action_key: str = _RLDS_ACTION_KEY_OPTION,
+    language_key: str = _RLDS_LANGUAGE_KEY_OPTION,
+    timestamp_key: str | None = _RLDS_TIMESTAMP_KEY_OPTION,
+    fps: float | None = _RLDS_FPS_OPTION,
+    batch_size: int = _BATCH_SIZE_OPTION,
+    compact: bool = _COMPACT_OPTION,
+    prune_versions: bool = _PRUNE_VERSIONS_OPTION,
+    retain_versions: int = _RETAIN_VERSIONS_OPTION,
+    index_predicates: bool = _INDEX_PREDICATES_OPTION,
+    auth_ref: str | None = _AUTH_REF_OPTION,
+    remote_auth_ref: str | None = _REMOTE_AUTH_REF_OPTION,
+    storage_auth_ref: str | None = _STORAGE_AUTH_REF_OPTION,
+    source_auth_ref: str | None = _SOURCE_AUTH_REF_OPTION,
+    storage_option: list[str] | None = _STORAGE_OPTION,
+    source_storage_option: list[str] | None = _SOURCE_STORAGE_OPTION,
+    region: str | None = _REGION_OPTION,
+    host_override: str | None = _HOST_OVERRIDE_OPTION,
+) -> None:
+    """Ingest prepared RLDS/TFDS episodes and steps into canonical lake rows."""
+    from lancedb_robotics.adapters import AdapterError
+    from lancedb_robotics.adapters.rlds_adapter import RldsFieldMapping
+    from lancedb_robotics.ingest import ingest_rlds
+    from lancedb_robotics.lake import Lake, LakeError
+    from lancedb_robotics.storage import parse_storage_option_pairs
+
+    try:
+        storage_options = parse_storage_option_pairs(storage_option)
+        source_storage_options = parse_storage_option_pairs(source_storage_option)
+        mapping = RldsFieldMapping(
+            state_key=state_key,
+            action_key=action_key,
+            language_key=language_key,
+            timestamp_key=timestamp_key,
+            fps=fps,
+        )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    try:
+        opened = Lake.open(
+            lake,
+            auth_ref=auth_ref,
+            remote_auth_ref=remote_auth_ref,
+            storage_auth_ref=storage_auth_ref,
+            storage_options=storage_options,
+            region=region,
+            host_override=host_override,
+        )
+    except LakeError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        report = ingest_rlds(
+            opened,
+            path,
+            splits=split,
+            mapping=mapping,
+            batch_size=batch_size,
+            compact=compact,
+            prune_versions=prune_versions,
+            retain_versions=retain_versions,
+            index_predicates=index_predicates,
+            auth_ref=source_auth_ref or auth_ref,
+            storage_options=source_storage_options,
         )
     except AdapterError as exc:
         typer.echo(f"error: {exc}", err=True)

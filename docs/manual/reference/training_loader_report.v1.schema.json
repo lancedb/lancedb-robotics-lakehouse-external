@@ -281,6 +281,115 @@
       ],
       "type": "object"
     },
+    "predicate_telemetry": {
+      "properties": {
+        "backend_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backend_supports_scalar_index": {
+          "type": "boolean"
+        },
+        "filter_columns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "output_table": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "predicates": {
+          "items": {
+            "properties": {
+              "column": {
+                "type": "string"
+              },
+              "column_kind": {
+                "enum": [
+                  "typed",
+                  "jsonb_path"
+                ]
+              },
+              "index_backed": {
+                "type": "boolean"
+              },
+              "index_status": {
+                "type": "string"
+              },
+              "index_type": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "job_status": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "num_rows": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "predicate_role": {
+                "type": "string"
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "table": {
+                "type": "string"
+              },
+              "used_in_filter": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "table",
+              "column",
+              "column_kind",
+              "index_status"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "selected_rows": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "selectivity_fraction": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_rows": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "predicates"
+      ],
+      "type": "object"
+    },
     "read_table_versions": {
       "$ref": "#/$defs/table_versions"
     },

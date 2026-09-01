@@ -8,6 +8,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Fail a hung suite fast instead of burning the 6h GitHub Actions ceiling.
+    # The full suite runs in ~9 min; 30 leaves headroom for a slow runner.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -29,6 +32,7 @@ jobs:
   rlds-native:
     name: RLDS native optional dependency
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       # The upstream rlds package publishes Linux x86_64 artifacts only. This
@@ -40,6 +44,10 @@ jobs:
   torch-loader:
     name: Torch-enabled Enterprise loader matrix
     runs-on: ubuntu-latest
+    # A fork-based multi-worker DataLoader test can deadlock (lance is not
+    # fork-safe), and a wedged worker previously ran this lane to the 6h ceiling.
+    # The matrix normally finishes in ~2 min; cap it so a hang fails fast.
+    timeout-minutes: 20
     env:
       # This lane exists precisely to exercise real PyTorch DataLoader workers
       # (backlog 0118), so a missing or broken torch install must FAIL, not skip.
@@ -74,6 +82,7 @@ jobs:
   video-decode:
     name: LeRobot source MP4 video-decode conformance
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       # This lane exists to prove real decoded RGB hashes from LeRobot/source MP4s
       # with only the declared video-decode extra installed. Missing PyAV/NumPy,
@@ -108,6 +117,7 @@ jobs:
   invocation-conformance:
     name: Enterprise/namespace invocation conformance
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -164,6 +174,7 @@ jobs:
   lerobot-native-benchmark:
     name: LeRobot native benchmark fixture matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # This lane exists to prove the official LeRobotDataset benchmark arm with
       # the real optional stack installed. Missing/broken LeRobot, torch,

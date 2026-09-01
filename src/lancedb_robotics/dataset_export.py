@@ -29,12 +29,21 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lancedb_robotics.blob import PAYLOAD_BLOB_COLUMN, fetch_blobs
+from lancedb_robotics.export_reconciliation import (
+    ExportTarget,
+    publish_and_reconcile,
+)
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.lineage import emit_transform_lineage
 from lancedb_robotics.materialization import (
     ProjectionAccounting,
     metadata_bytes_written,
     payload_size,
+)
+from lancedb_robotics.rlds_contract import (
+    RLDS_EPISODE_METADATA_KEY,
+    RLDS_STANDARD_STEP_FIELDS,
+    RLDS_STEPS_KEY,
 )
 from lancedb_robotics.schemas import OBSERVATIONS_SCHEMA, TRANSFORM_RUNS_SCHEMA
 from lancedb_robotics.video import VIDEO_ENCODING_BLOB_COLUMN
@@ -81,6 +90,7 @@ class DatasetExportManifest:
     native_loader: dict[str, Any]
     lossy_mapping: tuple[str, ...]
     accounting: dict[str, Any] = field(default_factory=dict)
+    reconciliation: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +110,7 @@ class DatasetExportManifest:
             "native_loader": self.native_loader,
             "lossy_mapping": list(self.lossy_mapping),
             "accounting": dict(self.accounting),
+            "reconciliation": dict(self.reconciliation),
             "manifest": DATASET_EXPORT_MANIFEST_FILENAME,
         }
 
@@ -146,6 +157,9 @@ def export_dataset_snapshot(
     compression: str = DEFAULT_WEBDATASET_COMPRESSION,
     created_by: str = "lancedb-robotics",
     record_materialization: bool = True,
+    storage_options: Mapping[str, Any] | None = None,
+    auth_ref: str | None = None,
+    _target: ExportTarget | None = None,
 ) -> DatasetExportManifest:
     """Export ``snapshot_name`` into ``fmt`` and return its manifest.
 
@@ -153,6 +167,14 @@ def export_dataset_snapshot(
     exported layout is a deterministic projection of the snapshot's pinned table
     versions: re-running the export for the same snapshot and format/options
     yields the same ``content_hash`` even when the destination directory differs.
+
+    ``out_dir`` may be a local path or an object-store URI (``s3://``, ``gs://``,
+    ``az://``). Object-store exports stage into a temporary local directory,
+    publish each file, then reconcile the written objects against the plan;
+    ``storage_options``/``auth_ref`` resolve non-persisted credentials. Accounting
+    is computed from the staged tree, so a local and an object-store export of the
+    same snapshot produce byte-identical accounting. ``_target`` is an internal
+    seam letting the projection layer supply a caller-owned staging directory.
     """
     if fmt not in DATASET_EXPORT_FORMATS:
         raise DatasetExportError(
@@ -170,76 +192,104 @@ def export_dataset_snapshot(
 
     context = _snapshot_context(lake, snapshot_name)
     episodes = _episodes(context)
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    owns_target = _target is None
+    target = _target or ExportTarget(
+        out_dir, storage_options=storage_options, auth_ref=auth_ref
+    )
+    out_path = target.local_root
+    try:
+        if fmt == LEROBOT_FORMAT:
+            format_version = LEROBOT_FORMAT_VERSION
+            files, feature_spec, lossy_mapping, step_count = _write_lerobot(
+                out_path, context, episodes, storage_options=storage_options, auth_ref=auth_ref
+            )
+        elif fmt == RLDS_FORMAT:
+            format_version = RLDS_FORMAT_VERSION
+            files, feature_spec, lossy_mapping, step_count = _write_rlds(
+                out_path, context, episodes
+            )
+        else:
+            shard_size = _normalize_webdataset_shard_size(shard_size)
+            compression = _normalize_webdataset_compression(compression)
+            format_version = WEBDATASET_FORMAT_VERSION
+            files, feature_spec, lossy_mapping, step_count = _write_webdataset(
+                out_path,
+                context,
+                episodes,
+                shard_size=shard_size,
+                compression=compression,
+            )
 
-    if fmt == LEROBOT_FORMAT:
-        format_version = LEROBOT_FORMAT_VERSION
-        files, feature_spec, lossy_mapping, step_count = _write_lerobot(out_path, context, episodes)
-    elif fmt == RLDS_FORMAT:
-        format_version = RLDS_FORMAT_VERSION
-        files, feature_spec, lossy_mapping, step_count = _write_rlds(out_path, context, episodes)
-    else:
-        shard_size = _normalize_webdataset_shard_size(shard_size)
-        compression = _normalize_webdataset_compression(compression)
-        format_version = WEBDATASET_FORMAT_VERSION
-        files, feature_spec, lossy_mapping, step_count = _write_webdataset(
-            out_path,
-            context,
-            episodes,
-            shard_size=shard_size,
-            compression=compression,
+        content_hash = _content_hash(out_path, files)
+        transform_id = f"tfm-dataset-export-{fmt}-{context.dataset_id.removeprefix('ds-')}"
+        manifest = DatasetExportManifest(
+            lake_uri=lake.uri,
+            dataset_id=context.dataset_id,
+            snapshot_name=context.snapshot_name,
+            format=fmt,
+            format_version=format_version,
+            out_dir=target.destination,
+            transform_id=transform_id,
+            table_versions=context.table_versions,
+            feature_spec=feature_spec,
+            content_hash=content_hash,
+            episode_count=len(episodes),
+            step_count=step_count,
+            data_files=tuple(sorted(files)),
+            native_loader=native_loader,
+            lossy_mapping=tuple(lossy_mapping),
         )
 
-    content_hash = _content_hash(out_path, files)
-    transform_id = f"tfm-dataset-export-{fmt}-{context.dataset_id.removeprefix('ds-')}"
-    manifest = DatasetExportManifest(
-        lake_uri=lake.uri,
-        dataset_id=context.dataset_id,
-        snapshot_name=context.snapshot_name,
-        format=fmt,
-        format_version=format_version,
-        out_dir=str(out_path),
-        transform_id=transform_id,
-        table_versions=context.table_versions,
-        feature_spec=feature_spec,
-        content_hash=content_hash,
-        episode_count=len(episodes),
-        step_count=step_count,
-        data_files=tuple(sorted(files)),
-        native_loader=native_loader,
-        lossy_mapping=tuple(lossy_mapping),
-    )
+        # Publish + reconcile the materialized data files against the destination
+        # before the manifest is finalized. The reconciliation block is stable
+        # (data-file sizes/checksums do not change), so embedding it in the
+        # manifest keeps the metadata-bytes fixpoint below convergent.
+        data_files = list(manifest.data_files)
+        reconciliation = publish_and_reconcile_data(target, data_files)
 
-    output_paths = tuple(
-        str(out_path / rel)
-        for rel in (*manifest.data_files, DATASET_EXPORT_MANIFEST_FILENAME)
-    )
-    manifest = _manifest_with_accounting(
-        manifest,
-        context,
-        episodes,
-        metadata_bytes=0,
-    )
-    for _ in range(3):
-        _write_json(out_path, DATASET_EXPORT_MANIFEST_FILENAME, manifest.to_dict())
-        observed_metadata_bytes = metadata_bytes_written(
-            output_paths,
-            payload_bytes_copied=manifest.accounting["payload_bytes_copied"],
+        output_paths = tuple(
+            str(out_path / rel)
+            for rel in (*manifest.data_files, DATASET_EXPORT_MANIFEST_FILENAME)
         )
-        if observed_metadata_bytes == manifest.accounting["metadata_bytes_written"]:
-            break
         manifest = _manifest_with_accounting(
             manifest,
             context,
             episodes,
-            metadata_bytes=observed_metadata_bytes,
+            metadata_bytes=0,
         )
-    _write_json(out_path, DATASET_EXPORT_MANIFEST_FILENAME, manifest.to_dict())
-    _record_transform(lake, manifest, created_by=created_by)
-    if record_materialization:
-        _record_materialization_accounting(lake, manifest, created_by=created_by)
-    return manifest
+        manifest = replace(manifest, reconciliation=reconciliation)
+        for _ in range(3):
+            _write_json(out_path, DATASET_EXPORT_MANIFEST_FILENAME, manifest.to_dict())
+            observed_metadata_bytes = metadata_bytes_written(
+                output_paths,
+                payload_bytes_copied=manifest.accounting["payload_bytes_copied"],
+            )
+            if observed_metadata_bytes == manifest.accounting["metadata_bytes_written"]:
+                break
+            manifest = _manifest_with_accounting(
+                manifest,
+                context,
+                episodes,
+                metadata_bytes=observed_metadata_bytes,
+            )
+            manifest = replace(manifest, reconciliation=reconciliation)
+        _write_json(out_path, DATASET_EXPORT_MANIFEST_FILENAME, manifest.to_dict())
+        target.publish([DATASET_EXPORT_MANIFEST_FILENAME])
+        _record_transform(lake, manifest, created_by=created_by)
+        if record_materialization:
+            _record_materialization_accounting(lake, manifest, created_by=created_by)
+        return manifest
+    finally:
+        if owns_target:
+            target.cleanup()
+
+
+def publish_and_reconcile_data(
+    target: ExportTarget,
+    data_files: Sequence[str],
+) -> dict[str, Any]:
+    """Publish the export's data files and reconcile them against the target."""
+    return publish_and_reconcile(target, data_files).to_dict()
 
 
 def _manifest_with_accounting(
@@ -311,6 +361,7 @@ def _record_materialization_accounting(
         metadata_bytes_written=accounting.metadata_bytes_written,
         planned_payload_bytes=accounting.payload_bytes_planned,
         projection_transform_id=manifest.transform_id,
+        reconciliation=manifest.reconciliation or None,
         created_by=created_by,
     )
 
@@ -861,10 +912,23 @@ def _write_lerobot(
     root: Path,
     context: _SnapshotContext,
     episodes: tuple[_Episode, ...],
+    *,
+    storage_options: Mapping[str, Any] | None = None,
+    auth_ref: str | None = None,
 ) -> tuple[list[str], dict[str, Any], list[str], int]:
     files: list[str] = []
     frame_count = sum(len(episode.observations) for episode in episodes)
     camera_topics = _camera_topics(episodes)
+    # Computed once, up front, and threaded through every writer below so the
+    # declared schema (meta/info.json) and the physical parquet columns can
+    # never disagree about whether 'observation.state'/'action' exist.
+    state_feature = _lerobot_vector_feature("observation.state", episodes, "state_vector")
+    action_feature = _lerobot_vector_feature("action", episodes, "action_vector")
+    has_state = state_feature is not None
+    has_action = action_feature is not None
+    real_camera_bytes = _resolve_real_camera_bytes(
+        episodes, storage_options=storage_options, auth_ref=auth_ref
+    )
     feature_spec, lossy_mapping = _feature_spec(
         context,
         episodes,
@@ -880,7 +944,15 @@ def _write_lerobot(
         _write_json(
             root,
             "meta/info.json",
-            _lerobot_info(context, episodes, feature_spec, frame_count, len(tasks)),
+            _lerobot_info(
+                context,
+                episodes,
+                feature_spec,
+                frame_count,
+                len(tasks),
+                state_feature=state_feature,
+                action_feature=action_feature,
+            ),
         )
     )
     files.append(_write_json(root, "meta/stats.json", _stats(episodes)))
@@ -897,7 +969,15 @@ def _write_lerobot(
 
     frame_rows: list[dict[str, Any]] = []
     for episode in episodes:
-        rows, image_files = _lerobot_frame_rows(root, context, episode, camera_topics)
+        rows, image_files = _lerobot_frame_rows(
+            root,
+            context,
+            episode,
+            camera_topics,
+            has_state=has_state,
+            has_action=has_action,
+            real_camera_bytes=real_camera_bytes,
+        )
         frame_rows.extend(rows)
         files.extend(image_files)
     files.append(
@@ -905,7 +985,7 @@ def _write_lerobot(
             root,
             f"data/{_CHUNK}/{_FILE}.parquet",
             frame_rows,
-            _lerobot_schema(camera_topics),
+            _lerobot_schema(camera_topics, has_state=has_state, has_action=has_action),
         )
     )
 
@@ -1022,11 +1102,17 @@ def _lerobot_frame_rows(
     context: _SnapshotContext,
     episode: _Episode,
     camera_topics: dict[str, str],
+    *,
+    has_state: bool,
+    has_action: bool,
+    real_camera_bytes: dict[str, bytes],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     image_files: list[str] = []
     for frame_index, obs in enumerate(episode.observations):
-        camera_paths, written = _camera_paths(root, context, episode, frame_index, obs)
+        camera_paths, written = _camera_paths(
+            root, context, episode, frame_index, obs, real_camera_bytes
+        )
         image_files.extend(written)
         row = {
             "index": _global_index(episode, frame_index),
@@ -1047,6 +1133,10 @@ def _lerobot_frame_rows(
             "modality": obs.get("modality"),
             "caption": obs.get("caption") or episode.task,
         }
+        if not has_state:
+            del row["observation.state"]
+        if not has_action:
+            del row["action"]
         for camera_key in camera_topics:
             path = camera_paths.get(camera_key)
             row[f"observation.images.{camera_key}"] = (
@@ -1373,17 +1463,115 @@ def _normalize_webdataset_compression(value: str) -> str:
     return normalized
 
 
+def _resolve_real_camera_bytes(
+    episodes: tuple[_Episode, ...],
+    *,
+    storage_options: Mapping[str, Any] | None,
+    auth_ref: str | None,
+) -> dict[str, bytes]:
+    """Real per-frame image bytes for camera observations, re-decoded from
+    each observation's original MCAP source.
+
+    ``observations.payload_blob`` intentionally stores the still-wire-encoded
+    message envelope, not a bare image (see
+    :mod:`lancedb_robotics.adapters.decoders`): re-decoding it needs the
+    channel's schema, and only `schema_name`/`schema_encoding` *strings* are
+    persisted to the lakehouse, not the schema definition a decoder needs.
+    The source file still carries that schema, so this re-reads each distinct
+    source once, in one streaming pass, and pulls the real bytes for whatever
+    camera observations point into it.
+
+    Returns a mapping keyed by ``observation_id``. An observation missing
+    from the result could not be resolved (source unreachable, the message no
+    longer sits at the expected `(topic, sequence)`, or its decoded form
+    didn't hoist exactly one large-binary field) — the caller treats that the
+    same as "no image for this frame," not a reason to fail the export.
+    """
+    needed_by_source: dict[str, dict[tuple[str, int], str]] = {}
+    for episode in episodes:
+        for obs in episode.observations:
+            if not _is_camera_observation(obs):
+                continue
+            raw_uri = obs.get("raw_uri")
+            raw_channel = obs.get("raw_channel")
+            raw_sequence = obs.get("raw_sequence")
+            if not raw_uri or not raw_channel or raw_sequence is None:
+                continue
+            needed_by_source.setdefault(raw_uri, {})[(raw_channel, int(raw_sequence))] = obs[
+                "observation_id"
+            ]
+
+    resolved: dict[str, bytes] = {}
+    for raw_uri, wanted in needed_by_source.items():
+        resolved.update(
+            _decode_camera_frames_from_source(
+                raw_uri, wanted, storage_options=storage_options, auth_ref=auth_ref
+            )
+        )
+    return resolved
+
+
+def _decode_camera_frames_from_source(
+    raw_uri: str,
+    wanted: dict[tuple[str, int], str],
+    *,
+    storage_options: Mapping[str, Any] | None,
+    auth_ref: str | None,
+) -> dict[str, bytes]:
+    """One streaming pass over ``raw_uri``, matching ``(topic, sequence)`` the
+    same way ``McapAdapter`` computes it at ingest time (per-topic, 0-based,
+    log-time order) so the same provenance columns resolve the same message.
+    """
+    from mcap.reader import make_reader
+
+    from lancedb_robotics.adapters.decoders import PayloadDecoder
+    from lancedb_robotics.storage import open_binary_uri
+
+    resolved: dict[str, bytes] = {}
+    remaining = dict(wanted)
+    per_topic_index: dict[str, int] = {}
+    decoder = PayloadDecoder()
+    try:
+        with open_binary_uri(raw_uri, storage_options=storage_options, auth_ref=auth_ref) as stream:
+            reader = make_reader(stream)
+            for schema, channel, message in reader.iter_messages(log_time_order=True):
+                topic = channel.topic
+                sequence = per_topic_index.get(topic, 0)
+                per_topic_index[topic] = sequence + 1
+                observation_id = remaining.pop((topic, sequence), None)
+                if observation_id is None:
+                    continue
+                result = decoder.decode(channel.message_encoding, schema, message.data)
+                if result.status == "decoded" and len(result.blobs) == 1:
+                    resolved[observation_id] = result.blobs[0]
+                if not remaining:
+                    break
+    except Exception:  # noqa: BLE001 - source unreachable/corrupt: leave these frames unresolved
+        return resolved
+    return resolved
+
+
 def _camera_paths(
     root: Path,
     context: _SnapshotContext,
     episode: _Episode,
     frame_index: int,
     obs: dict[str, Any],
+    real_camera_bytes: dict[str, bytes] | None = None,
 ) -> tuple[dict[str, str | None], list[str]]:
     if not _is_camera_observation(obs):
         return {}, []
 
-    payload = context.payload_blobs.get(obs["observation_id"], b"")
+    observation_id = obs["observation_id"]
+    if real_camera_bytes is not None:
+        # payload_blob is the still-wire-encoded message envelope by design
+        # (see adapters.decoders), not a bare image; when the caller resolved
+        # real per-frame bytes from the source file, prefer them and treat an
+        # unresolved frame as "no image" rather than fall back to bytes that
+        # are guaranteed to fail decoding for any real consumer.
+        payload = real_camera_bytes.get(observation_id, b"")
+    else:
+        payload = context.payload_blobs.get(observation_id, b"")
     camera_key = _camera_key(obs)
     if not payload:
         return {camera_key: None}, []
@@ -1398,7 +1586,7 @@ def _camera_paths(
     return {camera_key: rel}, [rel]
 
 
-def _lerobot_schema(camera_topics: dict[str, str]) -> pa.Schema:
+def _lerobot_schema(camera_topics: dict[str, str], *, has_state: bool, has_action: bool) -> pa.Schema:
     fields = [
         pa.field("index", pa.int64()),
         pa.field("episode_index", pa.int64()),
@@ -1406,8 +1594,12 @@ def _lerobot_schema(camera_topics: dict[str, str]) -> pa.Schema:
         pa.field("timestamp", pa.float32()),
         pa.field("timestamp_ns", pa.int64()),
         pa.field("task_index", pa.int64()),
-        pa.field("observation.state", pa.list_(pa.float32())),
-        pa.field("action", pa.list_(pa.float32())),
+    ]
+    if has_state:
+        fields.append(pa.field("observation.state", pa.list_(pa.float32())))
+    if has_action:
+        fields.append(pa.field("action", pa.list_(pa.float32())))
+    fields += [
         pa.field("task", pa.string()),
         pa.field("language_instruction", pa.string()),
         pa.field("observation_id", pa.string()),
@@ -1429,6 +1621,9 @@ def _lerobot_info(
     feature_spec: dict[str, Any],
     frame_count: int,
     task_count: int,
+    *,
+    state_feature: dict[str, Any] | None,
+    action_feature: dict[str, Any] | None,
 ) -> dict[str, Any]:
     fps = _infer_fps(episodes)
     return {
@@ -1436,7 +1631,7 @@ def _lerobot_info(
         "dataset_id": context.dataset_id,
         "format": LEROBOT_FORMAT,
         "fps": int(round(fps or 1)),
-        "features": _lerobot_format_features(feature_spec),
+        "features": _lerobot_format_features(feature_spec, state_feature, action_feature),
         "total_episodes": len(episodes),
         "total_frames": frame_count,
         "total_tasks": task_count,
@@ -1451,10 +1646,12 @@ def _lerobot_info(
     }
 
 
-def _lerobot_format_features(feature_spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _lerobot_format_features(
+    feature_spec: dict[str, Any],
+    state_feature: dict[str, Any] | None,
+    action_feature: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
     features = feature_spec["features"]
-    state_shape = list(features["observation.state"]["shape"])
-    action_shape = list(features["action"]["shape"])
     projected: dict[str, dict[str, Any]] = {
         "index": {"dtype": "int64", "shape": [1]},
         "episode_index": {"dtype": "int64", "shape": [1]},
@@ -1462,8 +1659,6 @@ def _lerobot_format_features(feature_spec: dict[str, Any]) -> dict[str, dict[str
         "timestamp": {"dtype": "float32", "shape": [1]},
         "timestamp_ns": {"dtype": "int64", "shape": [1]},
         "task_index": {"dtype": "int64", "shape": [1]},
-        "observation.state": {"dtype": "float32", "shape": state_shape},
-        "action": {"dtype": "float32", "shape": action_shape},
         "task": {"dtype": "string", "shape": [1]},
         "language_instruction": {"dtype": "string", "shape": [1]},
         "observation_id": {"dtype": "string", "shape": [1]},
@@ -1474,6 +1669,10 @@ def _lerobot_format_features(feature_spec: dict[str, Any]) -> dict[str, dict[str
         "modality": {"dtype": "string", "shape": [1]},
         "caption": {"dtype": "string", "shape": [1]},
     }
+    if state_feature is not None:
+        projected["observation.state"] = state_feature
+    if action_feature is not None:
+        projected["action"] = action_feature
     for camera in features.get("cameras", ()):
         projected[f"observation.images.{camera['key']}"] = {
             "dtype": "image",
@@ -1482,6 +1681,48 @@ def _lerobot_format_features(feature_spec: dict[str, Any]) -> dict[str, dict[str
             "topic": camera.get("topic", ""),
         }
     return projected
+
+
+def _lerobot_vector_feature(
+    name: str,
+    episodes: tuple[_Episode, ...],
+    key: str,
+) -> dict[str, Any] | None:
+    """Real `{dtype, shape}` for a numeric vector feature, or None to omit it.
+
+    LeRobot requires every declared feature to have one fixed positive-length
+    shape shared by every frame. Returns None when no observation carries this
+    feature at all (nothing to export — the feature is simply absent, not an
+    error). Raises when the data can't be represented as one fixed shape
+    (inconsistent lengths, or only some frames have it) rather than emitting a
+    placeholder shape that would only fail later, more cryptically, when a
+    LeRobot loader tries to cast it to an Arrow fixed-size list.
+    """
+    lengths: set[int] = set()
+    any_missing = False
+    for episode in episodes:
+        for obs in episode.observations:
+            vector = _vector(obs.get(key))
+            if vector:
+                lengths.add(len(vector))
+            else:
+                any_missing = True
+    if not lengths:
+        return None
+    if len(lengths) > 1:
+        raise DatasetExportError(
+            f"cannot export '{name}' to LeRobot format: observations have "
+            f"inconsistent vector lengths ({sorted(lengths)}); LeRobot requires "
+            "a single fixed shape per feature."
+        )
+    if any_missing:
+        raise DatasetExportError(
+            f"cannot export '{name}' to LeRobot format: some observations are "
+            f"missing this feature while others have a fixed length of "
+            f"{next(iter(lengths))}; LeRobot requires every frame to provide "
+            "every declared feature."
+        )
+    return {"dtype": "float32", "shape": [next(iter(lengths))]}
 
 
 def _lerobot_episode_metadata_rows(
@@ -1638,18 +1879,9 @@ def _feature_spec(
     }
     if format == RLDS_FORMAT:
         features["rlds"] = {
-            "episode_key": "episode_metadata",
-            "steps_key": "steps",
-            "step_fields": [
-                "observation",
-                "action",
-                "reward",
-                "discount",
-                "is_first",
-                "is_last",
-                "is_terminal",
-                "metadata",
-            ],
+            "episode_key": RLDS_EPISODE_METADATA_KEY,
+            "steps_key": RLDS_STEPS_KEY,
+            "step_fields": list(RLDS_STANDARD_STEP_FIELDS),
             "observation_keys": ["state", "caption", "payload_json", "image"],
             "metadata_keys": [
                 "observation_id",

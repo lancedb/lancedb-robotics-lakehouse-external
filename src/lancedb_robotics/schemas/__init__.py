@@ -646,6 +646,186 @@ CURATION_MATERIALIZATIONS_SCHEMA = _schema(
     ],
 )
 
+CURATION_MATERIALIZATION_ROLLUPS_SCHEMA = _schema(
+    "curation_materialization_rollups",
+    # v1 (backlog 0145): scalable, indexed rollup catalog over
+    # ``curation_materializations``. 0083 stores one report row per
+    # projection/live/plan/export op; at hundreds of thousands of reports the
+    # compare "materialization" summary streamed every row and parsed
+    # ``report_json`` per row to recover planned bytes, which does not scale.
+    # This table promotes every byte/count field and identity column (dataset,
+    # snapshot, format, mode, transform ids, created_at) into dedicated,
+    # scalar-indexable columns so snapshot/format/branch rollups and paged
+    # history queries push down and never parse a JSON blob in client memory.
+    # Derived and fully rebuildable from ``curation_materializations`` via
+    # ``curate sync-materialization-rollups``; every ``materialization_report``
+    # write emits the matching rollup row inline (0098 zero-divergence).
+    # ``state`` carries the retention lifecycle (active|superseded|pruned) that
+    # must not be written onto the compat source row. Pruning a superseded
+    # plan/dry-run report clears the source ``report_json`` and its per-file
+    # chunks only; the promoted columns + ``report_sha1`` survive here as audit
+    # evidence, and completed export rows are never pruned. Lakes created at an
+    # earlier contract add the table via ``Lake.init`` (same re-init story as
+    # 0057's table add) and backfill via the sync command.
+    "1",
+    [
+        pa.field("materialization_id", pa.string()),
+        pa.field("dataset_id", pa.string()),
+        pa.field("snapshot_name", pa.string()),
+        pa.field("target_format", pa.string()),
+        pa.field("output_uri", pa.string()),
+        pa.field("mode", pa.string()),
+        pa.field("payload_copy_policy", pa.string()),
+        pa.field("reconciliation_status", pa.string()),
+        pa.field("state", pa.string()),
+        pa.field("selected_scenario_count", pa.int64()),
+        pa.field("selected_observation_count", pa.int64()),
+        pa.field("total_payload_bytes", pa.int64()),
+        pa.field("copied_payload_bytes", pa.int64()),
+        pa.field("logical_reference_bytes", pa.int64()),
+        pa.field("planned_payload_bytes", pa.int64()),
+        pa.field("metadata_bytes_written", pa.int64()),
+        pa.field("copy_ratio", pa.float64()),
+        pa.field("output_file_count", pa.int64()),
+        pa.field("output_file_bytes", pa.int64()),
+        pa.field("captured_file_count", pa.int64()),
+        pa.field("report_sha1", pa.string()),
+        pa.field("report_bytes", pa.int64()),
+        pa.field("source_report_available", pa.bool_()),
+        pa.field("source_table_versions", _table_versions()),
+        pa.field("projection_transform_id", pa.string()),
+        pa.field("transform_id", pa.string()),
+        pa.field("superseded_by", pa.string()),
+        pa.field("superseded_at", pa.timestamp("us", tz="UTC")),
+        pa.field("pruned_at", pa.timestamp("us", tz="UTC")),
+        pa.field("retention_policy_json", pa.string()),
+        pa.field("created_by", pa.string()),
+        _CREATED_AT,
+    ],
+)
+
+CURATION_MATERIALIZATION_FILES_SCHEMA = _schema(
+    "curation_materialization_files",
+    # v1 (backlog 0145): optional per-output-file accounting chunks for large
+    # exports. The 0144 object-store reconciliation enumerates every written
+    # object, but the durable ``curation_materializations`` row deliberately
+    # embeds only a summary (never the 10^5-10^6-entry object array, which would
+    # bloat a single Lance cell -- backlog 0144/0483). This table holds the
+    # per-object accounting rows, written in bounded batches so a large export's
+    # file list never becomes one oversized commit, and keeps the rollup row
+    # light. Rows are content-addressed by ``file_accounting_id`` and cleared
+    # together with the source ``report_json`` when retention prunes a superseded
+    # plan report.
+    "1",
+    [
+        pa.field("file_accounting_id", pa.string()),
+        pa.field("materialization_id", pa.string()),
+        pa.field("dataset_id", pa.string()),
+        pa.field("chunk_index", pa.int64()),
+        pa.field("relative_path", pa.string()),
+        pa.field("uri", pa.string()),
+        pa.field("content_length", pa.int64()),
+        pa.field("classification", pa.string()),
+        pa.field("container", pa.string()),
+        pa.field("compression", pa.string()),
+        pa.field("checksum", pa.string()),
+        pa.field("transform_id", pa.string()),
+        _CREATED_AT,
+    ],
+)
+
+CURATION_ROW_PLANS_SCHEMA = _schema(
+    "curation_row_plans",
+    # v1 (backlog 0146): manifest/header row per compiled row-grain curation plan
+    # (backlog 0084). 0084 kept the whole plan in memory and embedded the full
+    # target-id list in the frozen ``lineage_artifacts`` row plus the
+    # ``transform_runs`` params JSON; a program compiling millions of observation,
+    # aligned-frame, or episode targets per branch cannot use that shape. Here the
+    # header promotes every identity/count column so plan lookup, filtering, and
+    # retention read indexed columns only, while the ordered target membership
+    # lives in ``curation_row_plan_chunks``. ``summary_json`` is deliberately a
+    # *bounded* summary (counts plus capped conflict/rejected/label samples) --
+    # never the full id lists.
+    "1",
+    [
+        pa.field("plan_id", pa.string()),
+        pa.field("view_id", pa.string()),
+        pa.field("view_name", pa.string()),
+        pa.field("target_grain", pa.string()),
+        pa.field("target_table", pa.string()),
+        pa.field("source_snapshot_name", pa.string()),
+        pa.field("base_policy", pa.string()),
+        pa.field("conflict_policy", pa.string()),
+        # Storage shape: ``inline`` keeps the ids on the compact lineage handle,
+        # ``chunked`` moves them into the chunk table (see 0146 threshold).
+        pa.field("storage_kind", pa.string()),
+        pa.field("chunk_table", pa.string()),
+        pa.field("chunk_size", pa.int64()),
+        pa.field("chunk_count", pa.int64()),
+        pa.field("target_count", pa.int64()),
+        pa.field("candidate_count", pa.int64()),
+        pa.field("selected_count", pa.int64()),
+        pa.field("rejected_count", pa.int64()),
+        pa.field("conflict_count", pa.int64()),
+        pa.field("label_intent_count", pa.int64()),
+        pa.field("scenario_count", pa.int64()),
+        pa.field("membership_transform_count", pa.int64()),
+        pa.field("superseded_membership_count", pa.int64()),
+        pa.field("lance_row_ids_present", pa.bool_()),
+        # Fragment ids of the target table at compile time. Lance row ids are
+        # fragment addresses, so compaction (which rewrites the fragment set) can
+        # remap them while a plain append (which only extends it) cannot. Comparing
+        # this set is how a reader tells a genuinely-stale plan from a merely-older
+        # one -- the table version alone moves on every append.
+        pa.field("target_fragment_ids", pa.list_(pa.int64())),
+        pa.field("target_ids_digest", pa.string()),
+        pa.field("plan_digest", pa.string()),
+        pa.field("artifact_id", pa.string()),
+        pa.field("frozen", pa.bool_()),
+        pa.field("metadata_only", pa.bool_()),
+        pa.field("payload_copy_policy", pa.string()),
+        pa.field("copied_payload_bytes", pa.int64()),
+        pa.field("transform_id", pa.string()),
+        pa.field("source_view_transform_id", pa.string()),
+        pa.field("source_snapshot_transform_id", pa.string()),
+        pa.field("table_versions", _table_versions()),
+        pa.field("state", pa.string()),
+        pa.field("superseded_at", pa.timestamp("us", tz="UTC")),
+        pa.field("pruned_at", pa.timestamp("us", tz="UTC")),
+        pa.field("retention_policy_json", pa.string()),
+        pa.field("summary_available", pa.bool_()),
+        pa.field("summary_json", pa.string()),
+        pa.field("created_by", pa.string()),
+        _CREATED_AT,
+    ],
+)
+
+CURATION_ROW_PLAN_CHUNKS_SCHEMA = _schema(
+    "curation_row_plan_chunks",
+    # v1 (backlog 0146): ordered target membership for a compiled row plan, in
+    # bounded chunks. Mirrors ``curation_view_membership_chunks`` (backlog 0081)
+    # and adds the resolved Lance row ids alongside the target ids so a training
+    # loader can ``take_row_ids`` a page without rebuilding a wide ``IN (...)``
+    # predicate (SKILLS.md §2 / BUG-06 round 2). ``start_ordinal`` is the stable
+    # read order; chunks are content-addressed by ``chunk_id`` so a retried write
+    # converges instead of duplicating.
+    "1",
+    [
+        pa.field("chunk_id", pa.string()),
+        pa.field("plan_id", pa.string()),
+        pa.field("chunk_index", pa.int64()),
+        pa.field("start_ordinal", pa.int64()),
+        pa.field("end_ordinal", pa.int64()),
+        pa.field("target_ids", pa.list_(pa.string())),
+        pa.field("lance_row_ids", pa.list_(pa.int64())),
+        pa.field("target_count", pa.int64()),
+        pa.field("chunk_digest", pa.string()),
+        pa.field("created_by", pa.string()),
+        pa.field("transform_id", pa.string()),
+        _CREATED_AT,
+    ],
+)
+
 CURATION_COMPARISONS_SCHEMA = _schema(
     "curation_comparisons",
     # v2 (backlog 0093): comparison reports become a first-class catalog with a
@@ -934,6 +1114,23 @@ TRANSFORM_RUNS_SCHEMA = _schema(
         pa.field("started_at", pa.timestamp("us", tz="UTC")),
         pa.field("finished_at", pa.timestamp("us", tz="UTC")),
         pa.field("created_by", pa.string()),
+        _CREATED_AT,
+    ],
+)
+
+RLDS_INGEST_CLAIMS_SCHEMA = _schema(
+    "rlds_ingest_claims",
+    "1",
+    [
+        # A single pre-seeded row is the lake-resident CAS gate for the RLDS
+        # multi-table write path.  The owner fields are set and cleared with a
+        # predicate-gated Table.update; they are never appended per attempt.
+        pa.field("claim_key", pa.string()),
+        pa.field("owner_token", pa.string()),
+        pa.field("run_id", pa.string()),
+        pa.field("claimed_by", pa.string()),
+        pa.field("claimed_at", pa.timestamp("us", tz="UTC")),
+        pa.field("updated_at", pa.timestamp("us", tz="UTC")),
         _CREATED_AT,
     ],
 )
@@ -1486,6 +1683,10 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
     "curation_memberships": CURATION_MEMBERSHIPS_SCHEMA,
     "curation_review_queues": CURATION_REVIEW_QUEUES_SCHEMA,
     "curation_materializations": CURATION_MATERIALIZATIONS_SCHEMA,
+    "curation_materialization_rollups": CURATION_MATERIALIZATION_ROLLUPS_SCHEMA,
+    "curation_materialization_files": CURATION_MATERIALIZATION_FILES_SCHEMA,
+    "curation_row_plans": CURATION_ROW_PLANS_SCHEMA,
+    "curation_row_plan_chunks": CURATION_ROW_PLAN_CHUNKS_SCHEMA,
     "curation_comparisons": CURATION_COMPARISONS_SCHEMA,
     "distribution_catalog": DISTRIBUTION_CATALOG_SCHEMA,
     "labels": LABELS_SCHEMA,
@@ -1496,6 +1697,7 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
     "aligned_frames": ALIGNED_FRAMES_SCHEMA,
     "aligned_ticks": ALIGNED_TICKS_SCHEMA,
     "transform_runs": TRANSFORM_RUNS_SCHEMA,
+    "rlds_ingest_claims": RLDS_INGEST_CLAIMS_SCHEMA,
     "lerobot_ingest_checkpoints": LEROBOT_INGEST_CHECKPOINTS_SCHEMA,
     "lerobot_checkpoint_holds": LEROBOT_CHECKPOINT_HOLDS_SCHEMA,
     "lineage_artifacts": LINEAGE_ARTIFACTS_SCHEMA,

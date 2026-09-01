@@ -3596,6 +3596,50 @@ def ingest_rosbag(
     )
 
 
+def ingest_rlds(
+    lake: Lake,
+    source: str | Path,
+    *,
+    split: str | None = None,
+    splits: Sequence[str] | None = None,
+    mapping: Any | None = None,
+    created_by: str = "lancedb-robotics",
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    compact: bool = True,
+    prune_versions: bool = True,
+    retain_versions: int = DEFAULT_INGEST_RETAIN_VERSIONS,
+    index_predicates: bool = True,
+    auth_ref: str | None = None,
+    storage_options: dict[str, Any] | None = None,
+) -> IngestReport:
+    """Ingest a prepared RLDS/TFDS directory into canonical episode/frame rows.
+
+    TensorFlow and TFDS are loaded lazily from the optional ``tfds`` extra.
+    Physical TFRecord shards, nested episodes, and canonical writes are all
+    consumed in bounded batches.  ``split`` selects one split; ``splits`` accepts
+    several.  Omitting both ingests every declared split in deterministic order.
+    """
+    if split is not None and splits is not None:
+        raise ValueError("pass either split or splits, not both")
+    selected = tuple(splits) if splits is not None else (split,) if split is not None else None
+    from lancedb_robotics.rlds_ingest import ingest_rlds_impl
+
+    return ingest_rlds_impl(
+        lake,
+        source,
+        splits=selected,
+        mapping=mapping,
+        created_by=created_by,
+        batch_size=batch_size,
+        compact=compact,
+        prune_versions=prune_versions,
+        retain_versions=retain_versions,
+        index_predicates=index_predicates,
+        auth_ref=auth_ref,
+        storage_options=storage_options,
+    )
+
+
 def ingest_lerobot(
     lake: Lake,
     source: str | Path,

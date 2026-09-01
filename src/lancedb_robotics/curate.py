@@ -11,21 +11,59 @@ import heapq
 import json
 import math
 import time
+import warnings
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+if TYPE_CHECKING:  # pragma: no cover - typing only; runtime import stays lazy.
+    from lancedb_robotics.curation_replay_retention import CurationReplayReadinessReport
+
+from lancedb_robotics import curation_row_plans as _row_plan_catalog
 from lancedb_robotics.capability_gates import VERSIONING, require_lake_capability
 from lancedb_robotics.comparison_plugins import (
     ComparisonMetricContext,
     ComparisonMetricPlugin,
     resolve_comparison_plugins,
 )
-from lancedb_robotics.dataset import SPLIT_BY_RUN, SnapshotManifest, create_snapshot
+from lancedb_robotics.curation_row_plans import (
+    CurationRowPlanEntry,
+    CurationRowPlanPage,
+    CurationRowPlanTargets,
+    RowPlanRetentionReport,
+    RowPlanValidationReport,
+)
+from lancedb_robotics.curation_row_plans import (
+    compact_row_plan_chunks as _compact_row_plan_chunks,
+)
+from lancedb_robotics.curation_row_plans import (
+    list_row_plans as _list_row_plans,
+)
+from lancedb_robotics.curation_row_plans import (
+    open_row_plan_targets as _open_row_plan_targets,
+)
+from lancedb_robotics.curation_row_plans import (
+    prune_row_plans as _prune_row_plans,
+)
+from lancedb_robotics.curation_row_plans import (
+    read_row_plan as _read_row_plan,
+)
+from lancedb_robotics.curation_row_plans import (
+    row_plan_summary as _row_plan_catalog_summary,
+)
+from lancedb_robotics.curation_row_plans import (
+    validate_row_plan_storage as _validate_row_plan_storage,
+)
+from lancedb_robotics.dataset import (
+    SPLIT_BY_RUN,
+    SPLIT_BYS,
+    SnapshotManifest,
+    create_snapshot,
+)
 from lancedb_robotics.enrich import DEFAULT_EMBEDDING_COLUMN
 from lancedb_robotics.indexing import (
     MIN_INDEX_ROWS,
@@ -47,6 +85,30 @@ from lancedb_robotics.materialization import (
     ProjectionAccounting,
     json_metadata_bytes,
     normalize_table_versions,
+)
+from lancedb_robotics.materialization_rollups import (
+    MaterializationRetentionReport,
+    MaterializationRollup,
+    MaterializationRollupPage,
+    MaterializationRollupSyncReport,
+)
+from lancedb_robotics.materialization_rollups import (
+    dataset_summary_compat as _rollup_dataset_summary,
+)
+from lancedb_robotics.materialization_rollups import (
+    list_materialization_history as _list_materialization_history,
+)
+from lancedb_robotics.materialization_rollups import (
+    materialization_rollup_summary as _materialization_rollup_summary,
+)
+from lancedb_robotics.materialization_rollups import (
+    prune_materialization_rollups as _prune_materialization_rollups,
+)
+from lancedb_robotics.materialization_rollups import (
+    sync_materialization_rollups as _sync_materialization_rollups,
+)
+from lancedb_robotics.materialization_rollups import (
+    write_rollup as _write_materialization_rollup,
 )
 from lancedb_robotics.review_connectors import (
     ReviewConnectorResult,
@@ -218,6 +280,27 @@ _EXTERNAL_EXECUTION = "external"
 _DEFAULT_DEDUP_NEIGHBOR_LIMIT = 64
 _PROMOTION_DECISIONS = ("promote", "reject")
 _ROW_PLAN_TARGET_GRAINS = ("episode", "observation", "aligned-frame", "snapshot-row")
+#: Batch width for the row-plan candidate scans.
+_ROW_PLAN_SCAN_BATCH = 4096
+#: Depth cap on one target's supersession chain in the plan summary. A target
+#: re-decided thousands of times would otherwise contribute an unbounded chain.
+_ROW_PLAN_MAX_CHAIN_DEPTH = 32
+#: The *only* columns each candidate builder reads from its grain table. A
+#: candidate never keeps the source row (nothing downstream reads it), so the scan
+#: projects exactly this set plus the Lance row id (backlog 0146 / SKILLS.md §2).
+_ROW_PLAN_CANDIDATE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "observations": ("observation_id", "run_id", "timestamp_ns", "raw_log_time_ns"),
+    "episodes": ("episode_id", "run_id", "from_timestamp_ns", "to_timestamp_ns", "episode_index"),
+    "aligned_frames": (
+        "aligned_frame_id",
+        "run_id",
+        "timestamp_ns",
+        "source_time_ns",
+        "tick_index",
+        "stream",
+    ),
+    "dataset_snapshots": ("name", "dataset_id", "query_spec"),
+}
 _ROW_PLAN_INCLUDE_DECISIONS = ("include", "promote")
 _ROW_PLAN_EXCLUDE_DECISIONS = (*_EXCLUDING_DECISIONS, "reject")
 _ROW_PLAN_INTENT_DECISIONS = ("label", "relabel")
@@ -326,6 +409,90 @@ _REVIEW_CONNECTOR_EXPORTED_STATUSES = (
     "reviewing",
 )
 
+# --- 0141: lazy curation selection iteration + snapshot planning -----------
+# 0081 stored large saved-view membership as ordered chunk rows, but the public
+# selection surface still materialized every scenario id as a Python tuple. The
+# lazy-membership helpers keyed on these constants let a million-row view be
+# iterated by ordinal pages, streamed into decision application, and pinned into
+# a snapshot plan without loading the whole membership into client memory.
+# Cursors are opaque base64url JSON of an absolute ordinal (mirrors the
+# review-queue cursor codec).
+_VIEW_MEMBERSHIP_DEFAULT_PAGE_SIZE = 1000
+_VIEW_MEMBERSHIP_MAX_PAGE_SIZE = 100_000
+# Chunk rows scanned per ordinal window; window width in ids is this times the
+# view's chunk size, bounding per-window client memory. Windows are chunk-aligned
+# and disjoint so no chunk is scanned twice.
+_VIEW_MEMBERSHIP_CHUNK_SCAN_BATCH = 32
+# Ids above which materialize()/diagnostics recommend a paged/streamed path over a
+# full tuple.
+_VIEW_MEMBERSHIP_MATERIALIZE_SOFT_LIMIT = 50_000
+# Rough per-id byte estimate for memory diagnostics (scenario ids are short ascii).
+_VIEW_MEMBERSHIP_APPROX_ID_BYTES = 24
+_VIEW_MEMBERSHIP_CHUNK_COLUMNS = (
+    "view_id",
+    "chunk_index",
+    "start_ordinal",
+    "end_ordinal",
+    "scenario_ids",
+    "scenario_count",
+)
+
+# --- 0142: indexed paginated curation membership-history replay ------------
+# 0082's resolve_membership() replays as-of decisions correctly but materializes
+# the whole curation_memberships table (to_arrow().to_pylist()) and filters in
+# Python. At enterprise scale -- millions of decision rows across reviewers,
+# models, dedup passes, and active-learning queues -- that OOMs a safety review or
+# a training-data investigation. resolve_membership_pages() keeps the small-history
+# convenience API (resolve_membership) and adds a bounded, resumable audit replay:
+#   * scope predicates (view/target/scenario/source/decision/reviewer -- all
+#     string equality/IN) are pushed into Lance, indexed via
+#     CURATION_MEMBERSHIP_PREDICATE_INDEX_COLUMNS, so unrelated targets/views are
+#     never read into client memory;
+#   * rows stream ordered by (created_at, membership_id) and only page_size+1 rows
+#     are held at once (early break on page fill and on the as-of upper bound);
+#   * cursors are opaque base64url JSON of the (created_at, membership_id) keyset,
+#     mirroring the review-queue keyset cursor codec.
+# created_at bounds stay Python-side: this repo never pushes timestamp literals
+# into a SQL predicate (see _filter_replay_membership_rows). The (created_at,
+# membership_id) order key relies on the server sort agreeing with the Python
+# composite key -- true because created_at is timestamp("us") (matching Python
+# datetime microsecond precision) and membership_id is a unique content hash. A
+# backend that cannot order the scan, or cannot push the scope predicate, degrades
+# to a bounded top-(page_size+1) heap over a streamed scan -- still O(page_size)
+# client memory on any backend with batched streaming -- and each degradation (scan
+# not ordered; predicate not pushed) is raised once as a RuntimeWarning (SKILLS.md
+# sec 1: never silently take a costlier path). Only a backend lacking to_batches
+# entirely falls to a full materialization, which is also warned. Scan *cost* for
+# deep single-target pagination is O(scope) per page (created_at cannot ride a SQL
+# keyset here); follow-up 0475 tracks a keyset-in-SQL / ordinal-column freeze.
+_MEMBERSHIP_HISTORY_DEFAULT_PAGE_SIZE = 500
+_MEMBERSHIP_HISTORY_MAX_PAGE_SIZE = 50_000
+_MEMBERSHIP_HISTORY_SCAN_BATCH = 4096
+_MEMBERSHIP_HISTORY_SCHEMA_VERSION = "lancedb-robotics/curation-membership-history/v1"
+_MEMBERSHIP_HISTORY_COLUMNS = (
+    "membership_id",
+    "view_id",
+    "target_grain",
+    "target_id",
+    "scenario_id",
+    "decision",
+    "reason_code",
+    "reason",
+    "note",
+    "reviewer",
+    "queue",
+    "priority",
+    "score",
+    "metadata",
+    "source",
+    "supersedes_membership_id",
+    "created_by",
+    "transform_id",
+    "created_at",
+)
+_MEMBERSHIP_HISTORY_ORDER_COLUMNS = ("created_at", "membership_id")
+_MIN_REPLAY_DATETIME = datetime.min.replace(tzinfo=UTC)
+
 
 class CurationError(Exception):
     """Raised when a curation operation cannot be evaluated."""
@@ -374,6 +541,126 @@ class CurationView:
     status: str = "active"
     membership_storage: str = _VIEW_STORAGE_INLINE
     membership_count: int = 0
+
+
+@dataclass(frozen=True)
+class ViewMembershipChunkIssue:
+    """One validation problem found in a saved view's chunked membership."""
+
+    view_id: str
+    view_name: str
+    code: str
+    detail: str
+    repair: str
+
+    def to_params(self) -> dict[str, Any]:
+        return {
+            "view_id": self.view_id,
+            "view_name": self.view_name,
+            "code": self.code,
+            "detail": self.detail,
+            "repair": self.repair,
+        }
+
+
+@dataclass(frozen=True)
+class ViewMembershipValidationReport:
+    """Read-only chunk-integrity report across chunked saved views."""
+
+    lake_uri: str
+    views_checked: int
+    chunked_views: int
+    healthy_views: int
+    issues: tuple[ViewMembershipChunkIssue, ...] = ()
+    orphan_view_ids: tuple[str, ...] = ()
+
+    @property
+    def status(self) -> str:
+        return "ok" if not self.issues and not self.orphan_view_ids else "issues"
+
+    def to_params(self) -> dict[str, Any]:
+        return {
+            "lake_uri": self.lake_uri,
+            "status": self.status,
+            "views_checked": self.views_checked,
+            "chunked_views": self.chunked_views,
+            "healthy_views": self.healthy_views,
+            "issues": [issue.to_params() for issue in self.issues],
+            "orphan_view_ids": list(self.orphan_view_ids),
+        }
+
+
+@dataclass(frozen=True)
+class ViewMembershipMigrationResult:
+    """Migration outcome for one saved view."""
+
+    view_id: str
+    view_name: str
+    status: str
+    scenario_count: int
+    chunk_count: int
+    transform_id: str = ""
+
+    def to_params(self) -> dict[str, Any]:
+        return {
+            "view_id": self.view_id,
+            "view_name": self.view_name,
+            "status": self.status,
+            "scenario_count": self.scenario_count,
+            "chunk_count": self.chunk_count,
+            "transform_id": self.transform_id,
+        }
+
+
+@dataclass(frozen=True)
+class ViewMembershipMigrationReport:
+    """Summary of a legacy inline -> chunked membership migration run."""
+
+    lake_uri: str
+    inline_scenario_limit: int
+    chunk_size: int
+    dry_run: bool
+    results: tuple[ViewMembershipMigrationResult, ...] = ()
+
+    @property
+    def migrated(self) -> int:
+        return sum(1 for r in self.results if r.status in ("migrated", "would-migrate"))
+
+    def to_params(self) -> dict[str, Any]:
+        return {
+            "lake_uri": self.lake_uri,
+            "inline_scenario_limit": self.inline_scenario_limit,
+            "chunk_size": self.chunk_size,
+            "dry_run": self.dry_run,
+            "migrated": self.migrated,
+            "results": [r.to_params() for r in self.results],
+        }
+
+
+@dataclass(frozen=True)
+class ViewMembershipCompactionReport:
+    """Summary of orphan/superseded chunk-row compaction."""
+
+    lake_uri: str
+    dry_run: bool
+    include_superseded: bool
+    orphan_view_ids: tuple[str, ...] = ()
+    orphan_chunks_removed: int = 0
+    superseded_view_ids: tuple[str, ...] = ()
+    superseded_chunks_removed: int = 0
+    retained_snapshot_pinned_view_ids: tuple[str, ...] = ()
+
+    def to_params(self) -> dict[str, Any]:
+        return {
+            "lake_uri": self.lake_uri,
+            "dry_run": self.dry_run,
+            "include_superseded": self.include_superseded,
+            "orphan_view_ids": list(self.orphan_view_ids),
+            "orphan_chunks_removed": self.orphan_chunks_removed,
+            "superseded_view_ids": list(self.superseded_view_ids),
+            "superseded_chunks_removed": self.superseded_chunks_removed,
+            "retained_snapshot_pinned_view_ids": list(self.retained_snapshot_pinned_view_ids),
+        }
 
 
 @dataclass(frozen=True)
@@ -1031,7 +1318,16 @@ class CurationDecisionResolution:
 
 @dataclass(frozen=True)
 class CurationCompiledRowPlan:
-    """Version-pinned row-grain membership plan compiled from curation decisions."""
+    """Version-pinned row-grain membership plan compiled from curation decisions.
+
+    ``target_ids`` / ``lance_row_ids`` are materialized only while the plan stays
+    under :data:`curation_row_plans.MATERIALIZE_SOFT_LIMIT` targets. Above that
+    they are empty and ``storage`` describes the chunked
+    ``curation_row_plan_chunks`` rows instead -- call :meth:`targets` for a lazy,
+    ordered, bounded view either way (backlog 0146). ``report`` is likewise a
+    *bounded* summary: exact counts plus diagnostic samples capped at
+    :data:`curation_row_plans.SAMPLE_LIMIT`, never the full id lists.
+    """
 
     plan_id: str
     target_grain: str
@@ -1045,6 +1341,40 @@ class CurationCompiledRowPlan:
     report: dict[str, Any]
     artifact_id: str = ""
     frozen: bool = False
+    storage: dict[str, Any] = field(default_factory=dict)
+    lake: Lake | None = None
+
+    @property
+    def storage_kind(self) -> str:
+        """``inline`` while the ids ride on the compact handle, else ``chunked``."""
+        return str(self.storage.get("kind") or "inline")
+
+    @property
+    def target_count(self) -> int:
+        """Selected target count, valid whether or not the ids are materialized."""
+        if self.storage:
+            return int(self.storage.get("target_count") or 0)
+        return len(self.target_ids)
+
+    @property
+    def materialized(self) -> bool:
+        """Whether ``target_ids`` holds the full membership in memory."""
+        return len(self.target_ids) == self.target_count
+
+    def targets(self, *, page_size: int | None = None) -> CurationRowPlanTargets:
+        """Lazy, ordered, bounded view over this plan's targets (backlog 0146).
+
+        Reads bounded windows of ``curation_row_plan_chunks`` for a chunked plan
+        and replays the in-memory ids for a small one -- so the same paging code
+        works at every scale and never materializes a large plan in Python.
+        """
+        if self.lake is None:
+            raise CurationError(
+                f"compiled row plan {self.plan_id!r} has no lake handle; reopen it "
+                "with lake.curate.row_plan_targets(plan_id)"
+            )
+        kwargs = {"page_size": page_size} if page_size is not None else {}
+        return _open_row_plan_targets(self.lake, self.plan_id, **kwargs)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1062,6 +1392,9 @@ class CurationCompiledRowPlan:
             "transform_id": self.transform_id,
             "artifact_id": self.artifact_id,
             "frozen": self.frozen,
+            "storage": dict(self.storage),
+            "target_count": self.target_count,
+            "materialized": self.materialized,
             "report": self.report,
         }
 
@@ -3769,6 +4102,52 @@ class CurationSelection:
             "report": _jsonable(self.report),
         }
 
+    def membership(
+        self, *, page_size: int | None = None
+    ) -> "CurationSelectionMembership":
+        """Return a lazy, ordinally-paged view of this selection's membership (0141).
+
+        A selection reopened from a chunked saved view streams straight from the
+        chunk store without re-materializing every id; inline/legacy and in-memory
+        derived selections wrap their existing tuple through the same page/iterator
+        surface so callers get one uniform lazy API.
+        """
+        report = self.report if isinstance(self.report, dict) else {}
+        storage = report.get("membership_storage")
+        view_id = str(report.get("view_id") or "")
+        size = _normalize_membership_page_size(page_size)
+        if (
+            isinstance(storage, dict)
+            and str(storage.get("kind")) == _VIEW_STORAGE_CHUNKED
+            and view_id
+        ):
+            return CurationSelectionMembership(
+                lake=self.lake,
+                view_id=view_id,
+                view_name=str(report.get("view_name") or ""),
+                storage=dict(storage),
+                inline_scenario_ids=None,
+                page_size=size,
+            )
+        ids = tuple(self.scenario_ids)
+        inline_storage = {
+            "kind": _VIEW_STORAGE_INLINE,
+            "table": "curation_views",
+            "scenario_count": len(ids),
+            "inline_scenario_count": len(ids),
+            "chunk_count": 0,
+            "chunk_size": 0,
+            "order": "scenario_ids",
+        }
+        return CurationSelectionMembership(
+            lake=self.lake,
+            view_id=view_id,
+            view_name=str(report.get("view_name") or self.operation or ""),
+            storage=inline_storage,
+            inline_scenario_ids=ids,
+            page_size=size,
+        )
+
 
 @dataclass
 class CurationBranch:
@@ -3846,6 +4225,41 @@ class LakeCurate:
         row = _latest_view_row(self._lake, name)
         return _selection_from_view(self._lake, _view_from_row(row, lake=self._lake), row=row)
 
+    def view_membership(
+        self, name: str, *, page_size: int | None = None
+    ) -> "CurationSelectionMembership":
+        """Open a saved view's membership lazily, without materializing all ids (0141).
+
+        Unlike :meth:`view`, which reassembles every scenario id into a
+        ``CurationSelection`` tuple on open, this reads only the view header and
+        returns a :class:`CurationSelectionMembership` that streams the chunk store
+        by bounded ordinal pages. Small inline/legacy views wrap their stored tuple
+        through the same surface.
+        """
+        row = _latest_view_row(self._lake, name)
+        storage = _view_membership_storage_from_row(row)
+        view_id = str(row["view_id"])
+        view_name = str(row["name"])
+        size = _normalize_membership_page_size(page_size)
+        if str(storage.get("kind")) == _VIEW_STORAGE_CHUNKED:
+            return CurationSelectionMembership(
+                lake=self._lake,
+                view_id=view_id,
+                view_name=view_name,
+                storage=storage,
+                inline_scenario_ids=None,
+                page_size=size,
+            )
+        inline = tuple(str(item) for item in row["scenario_ids"] or ())
+        return CurationSelectionMembership(
+            lake=self._lake,
+            view_id=view_id,
+            view_name=view_name,
+            storage=storage,
+            inline_scenario_ids=inline,
+            page_size=size,
+        )
+
     def predicate_index_status(
         self,
         *,
@@ -3874,6 +4288,48 @@ class LakeCurate:
                 include_view_chunks=include_view_chunks,
                 replace=refresh,
             )
+        )
+
+    def migrate_view_membership(
+        self,
+        *,
+        view_name: str | None = None,
+        inline_scenario_limit: int = _VIEW_INLINE_SCENARIO_ID_LIMIT,
+        chunk_size: int = _VIEW_MEMBERSHIP_CHUNK_SIZE,
+        dry_run: bool = False,
+        created_by: str = "lancedb-robotics",
+    ) -> ViewMembershipMigrationReport:
+        """Relocate legacy inline saved-view membership into chunk rows."""
+        return migrate_view_membership(
+            self._lake,
+            view_name=view_name,
+            inline_scenario_limit=inline_scenario_limit,
+            chunk_size=chunk_size,
+            dry_run=dry_run,
+            created_by=created_by,
+        )
+
+    def validate_view_membership(
+        self,
+        *,
+        view_name: str | None = None,
+    ) -> ViewMembershipValidationReport:
+        """Validate chunk integrity for chunked saved views (read-only)."""
+        return validate_view_membership(self._lake, view_name=view_name)
+
+    def compact_view_membership(
+        self,
+        *,
+        include_superseded: bool = False,
+        dry_run: bool = False,
+        created_by: str = "lancedb-robotics",
+    ) -> ViewMembershipCompactionReport:
+        """Reclaim orphaned (and opt-in superseded) view membership chunk rows."""
+        return compact_view_membership(
+            self._lake,
+            include_superseded=include_superseded,
+            dry_run=dry_run,
+            created_by=created_by,
         )
 
     def review_queue_predicate_index_status(self) -> tuple[dict[str, Any], ...]:
@@ -3928,6 +4384,59 @@ class LakeCurate:
             superseded_policy=superseded_policy,
         )
 
+    def resolve_membership_pages(
+        self,
+        *,
+        view_name: str | None = None,
+        view_id: str | None = None,
+        target_grain: str | None = "scenario",
+        target_ids: Sequence[str] = (),
+        scenario_ids: Sequence[str] = (),
+        as_of: datetime | str | None = None,
+        transform_id: str | None = None,
+        snapshot_name: str | None = None,
+        sources: Sequence[str] = (),
+        decisions: Sequence[str] = (),
+        reviewers: Sequence[str] = (),
+        page_size: int | None = None,
+    ) -> "CurationMembershipHistory":
+        """Open a bounded, resumable replay of the as-of membership decision history (0142).
+
+        Unlike :meth:`resolve_membership` (which materializes the whole
+        ``curation_memberships`` table and is meant for small saved-view audits),
+        this returns a lazy :class:`CurationMembershipHistory` handle that pages the
+        append-only decision log in deterministic ``(created_at, membership_id)``
+        order without loading rows for unrelated views/targets into client memory.
+        Client memory stays ``O(page_size)`` regardless of history size; for a
+        narrowly-scoped target the scan is bounded too. Deep pagination over a very
+        broad or unfiltered scope re-scans the scoped prefix per page (``O(scope)``
+        per page) -- see follow-up 0475 for the keyset-in-SQL optimization.
+
+        Scope filters (``view``/``target``/``scenario``/``sources``/``decisions``/
+        ``reviewers``) are pushed into Lance as indexed predicates; ``as_of`` /
+        ``transform_id`` / ``snapshot_name`` pin the replay scope exactly as
+        :meth:`resolve_membership` does (and a snapshot pin is version-validated).
+        Iterate pages with :meth:`CurationMembershipHistory.page` /
+        :meth:`CurationMembershipHistory.iter_pages`; the manifest header plus
+        per-page cursor metadata is enough for an external audit bundle to prove no
+        rows were skipped.
+        """
+        return _resolve_membership_history(
+            self._lake,
+            view_name=view_name,
+            view_id=view_id,
+            target_grain=target_grain,
+            target_ids=target_ids,
+            scenario_ids=scenario_ids,
+            as_of=as_of,
+            transform_id=transform_id,
+            snapshot_name=snapshot_name,
+            sources=sources,
+            decisions=decisions,
+            reviewers=reviewers,
+            page_size=page_size,
+        )
+
     def trace_membership(
         self,
         snapshot_name: str,
@@ -3941,6 +4450,30 @@ class LakeCurate:
             snapshot_name=snapshot_name,
             scenario_id=scenario_id,
             superseded_policy=superseded_policy,
+        )
+
+    def replay_readiness(
+        self,
+        *,
+        snapshot_name: str | None = None,
+        check_readability: bool = True,
+    ) -> "CurationReplayReadinessReport":
+        """Report whether snapshot-pinned curation versions are still replayable.
+
+        Classifies the resolved backend (as-of curation replay is ``supported``,
+        ``capability-gated``, or ``unavailable``) and, for a backend that owns
+        its version history, checks each curation version an active dataset
+        snapshot pins: ``protected`` (tagged/current), ``unprotected``,
+        ``pruned``, or ``unreadable``. Pass ``snapshot_name`` to scope the check
+        to one snapshot (the shape :meth:`trace_membership` embeds); omit it to
+        audit every active snapshot. Read-only and bounded.
+        """
+        from lancedb_robotics.curation_replay_retention import curation_replay_readiness
+
+        return curation_replay_readiness(
+            self._lake,
+            snapshot_name=snapshot_name,
+            check_readability=check_readability,
         )
 
     def compile_row_plan(
@@ -4561,6 +5094,239 @@ class LakeCurate:
         return _sync_eval_metric_catalog(
             self._lake,
             build_indexes=build_indexes,
+            created_by=created_by,
+        )
+
+    def materialization_history(
+        self,
+        *,
+        dataset_id: str | None = None,
+        snapshot: str | None = None,
+        target_format: str | None = None,
+        mode: str | None = None,
+        payload_copy_policy: str | None = None,
+        state: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        page_size: int | None = None,
+        cursor: str | None = None,
+    ) -> MaterializationRollupPage:
+        """Return one bounded, resumable page of materialization history (0145).
+
+        Reads the indexed ``curation_materialization_rollups`` catalog: filters
+        push down to scalar-indexed columns (dataset, snapshot/branch, format,
+        mode, copy policy, lifecycle state) and rows are keyset-paged by
+        ``(created_at, materialization_id)`` in O(page_size) client memory --
+        never scanning or parsing every ``report_json`` blob. Pass ``cursor``
+        from a prior page's ``next_cursor`` to resume.
+        """
+        return _list_materialization_history(
+            self._lake,
+            dataset_id=dataset_id,
+            snapshot_name=snapshot,
+            target_format=target_format,
+            mode=mode,
+            payload_copy_policy=payload_copy_policy,
+            state=state,
+            since=since,
+            until=until,
+            page_size=page_size,
+            cursor=cursor,
+        )
+
+    def materialization_rollup(
+        self,
+        *,
+        dataset_id: str | None = None,
+        snapshot: str | None = None,
+        include_pruned: bool = True,
+        group_by: str | None = None,
+    ) -> MaterializationRollup:
+        """Aggregate copy-cost over the indexed rollup catalog (0145).
+
+        Streams only the promoted numeric/identity columns for the scoped rows
+        and folds them into a grand total plus, when ``group_by`` is set, per-key
+        buckets (``snapshot``/``branch``, ``format``, ``mode``, ``policy``,
+        ``transform``, ``day``). This is the copy-cost trend surface branch
+        comparison and benchmark reports reuse -- it never parses ``report_json``.
+        """
+        return _materialization_rollup_summary(
+            self._lake,
+            dataset_id=dataset_id,
+            snapshot_name=snapshot,
+            include_pruned=include_pruned,
+            group_by=group_by,
+        )
+
+    def sync_materialization_rollups(
+        self,
+        *,
+        build_indexes: bool = True,
+        created_by: str = "lancedb-robotics",
+    ) -> MaterializationRollupSyncReport:
+        """Rebuild the rollup catalog from ``curation_materializations`` (0145).
+
+        Streams the source reports in bounded batches, re-derives each promoted
+        rollup row deterministically, and preserves the retention lifecycle
+        (state / supersession / pruned body) for rows a prior prune acted on. Run
+        once on a lake that recorded materializations before 0145, or any time to
+        repair catalog drift; :meth:`materialization_report` keeps the catalog
+        current automatically.
+        """
+        return _sync_materialization_rollups(
+            self._lake,
+            build_indexes=build_indexes,
+            created_by=created_by,
+        )
+
+    def prune_materializations(
+        self,
+        *,
+        retain_latest: int = 1,
+        older_than: datetime | timedelta | None = None,
+        dry_run: bool = False,
+        created_by: str = "lancedb-robotics",
+    ) -> MaterializationRetentionReport:
+        """Compact superseded plan / dry-run materialization reports (0145).
+
+        Within each ``(dataset, format, output_uri, mode)`` plan series the newest
+        ``retain_latest`` reports stay ``active``; older ones are marked
+        ``superseded``. Superseded reports predating ``older_than`` are ``pruned``:
+        the source ``report_json`` and per-file accounting chunks are cleared
+        while the promoted rollup row and ``report_sha1`` survive as audit
+        evidence. Completed export evidence (any copied payload bytes or
+        ``mode==export``) is never eligible. With no ``older_than`` nothing is
+        deleted (safe soft-retire); ``dry_run`` reports the same sets without
+        writing.
+        """
+        return _prune_materialization_rollups(
+            self._lake,
+            retain_latest=retain_latest,
+            older_than=older_than,
+            dry_run=dry_run,
+            created_by=created_by,
+        )
+
+    def row_plans(
+        self,
+        *,
+        view_name: str | None = None,
+        view_id: str | None = None,
+        target_grain: str | None = None,
+        source_snapshot_name: str | None = None,
+        storage_kind: str | None = None,
+        state: str | None = None,
+        frozen: bool | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        page_size: int | None = None,
+        cursor: str | None = None,
+    ) -> CurationRowPlanPage:
+        """One bounded page of compiled row-plan headers (backlog 0146).
+
+        Filters push down to indexed header columns and rows come back ordered by
+        ``(created_at, plan_id)``; client memory is bounded to ``page_size``
+        regardless of how many plans the lake holds. ``next_cursor`` resumes
+        deterministically.
+        """
+        return _list_row_plans(
+            self._lake,
+            view_name=view_name,
+            view_id=view_id,
+            target_grain=target_grain,
+            source_snapshot_name=source_snapshot_name,
+            storage_kind=storage_kind,
+            state=state,
+            frozen=frozen,
+            since=since,
+            until=until,
+            page_size=page_size,
+            cursor=cursor,
+        )
+
+    def row_plan(self, plan_id: str) -> CurationRowPlanEntry:
+        """One compiled row plan's promoted header columns, by id (0146).
+
+        Reads the header via an indexed ``plan_id`` predicate and never touches
+        the chunk table -- so plan metadata is cheap at any target count.
+        """
+        return _read_row_plan(self._lake, plan_id)
+
+    def row_plan_summary(self, plan_id: str) -> dict[str, Any]:
+        """Bounded compile summary for a plan: counts plus capped samples (0146).
+
+        Conflict, rejected, and label-intent samples are capped at
+        :data:`curation_row_plans.SAMPLE_LIMIT` with explicit ``*_truncated``
+        flags; the counts alongside them are exact.
+        """
+        return _row_plan_catalog_summary(self._lake, plan_id)
+
+    def row_plan_targets(
+        self,
+        plan_id: str,
+        *,
+        page_size: int | None = None,
+    ) -> CurationRowPlanTargets:
+        """Lazy, ordered handle over a stored plan's targets (0146).
+
+        Iterating or paging reads bounded windows of ``curation_row_plan_chunks``
+        in stable ``start_ordinal`` order, so a multi-million-target plan is never
+        materialized in client memory. Each target carries its resolved Lance row
+        id, so a consumer can ``take_row_ids`` a page instead of building a wide
+        ``IN (...)`` predicate.
+        """
+        kwargs = {"page_size": page_size} if page_size is not None else {}
+        return _open_row_plan_targets(self._lake, plan_id, **kwargs)
+
+    def validate_row_plans(self, *, plan_id: str | None = None) -> RowPlanValidationReport:
+        """Check chunked plan storage against its header (0146).
+
+        Recomputes each plan's target-id digest, chunk count, ordinal contiguity,
+        and per-chunk bounds through the same bounded windowed reader the target
+        pager uses, and reports orphan chunk rows left by an interrupted write.
+        """
+        return _validate_row_plan_storage(self._lake, plan_id=plan_id)
+
+    def compact_row_plans(
+        self,
+        *,
+        dry_run: bool = False,
+        grace: timedelta | None = None,
+    ) -> dict[str, Any]:
+        """Reclaim orphan row-plan chunk rows whose header never landed (0146).
+
+        Orphans are the expected residue of a crash between the chunk writes and
+        the header publish. Chunks younger than ``grace`` (default
+        :data:`curation_row_plans.ORPHAN_GRACE`) are left alone and reported as
+        in-flight, because a compile that has written its chunks and not yet
+        published its header is indistinguishable from a crashed one.
+        """
+        return _compact_row_plan_chunks(self._lake, dry_run=dry_run, grace=grace)
+
+    def prune_row_plans(
+        self,
+        *,
+        retain_latest: int = 1,
+        older_than: datetime | timedelta | None = None,
+        dry_run: bool = False,
+        created_by: str = "lancedb-robotics",
+    ) -> RowPlanRetentionReport:
+        """Compact superseded, unreferenced compiled row plans (0146).
+
+        Within each ``(view, grain, source snapshot, base policy)`` series the
+        newest ``retain_latest`` plans stay ``active``; older ones become
+        ``superseded`` and, past ``older_than``, ``pruned`` -- chunk rows and the
+        summary body cleared, promoted columns kept as audit evidence. A frozen
+        plan, a plan carrying a lineage artifact id, and any plan named by
+        ``training_runs.row_plan_id`` / ``training_reports.row_plan_id`` are
+        protected and never pruned. With no ``older_than`` nothing is deleted
+        (safe soft-retire); ``dry_run`` reports the same sets without writing.
+        """
+        return _prune_row_plans(
+            self._lake,
+            retain_latest=retain_latest,
+            older_than=older_than,
+            dry_run=dry_run,
             created_by=created_by,
         )
 
@@ -5328,9 +6094,17 @@ class LakeCurate:
         metadata_bytes_written: int = 0,
         planned_payload_bytes: int = 0,
         projection_transform_id: str = "",
+        reconciliation: Mapping[str, Any] | None = None,
         created_by: str = "lancedb-robotics",
     ) -> CurationMaterializationReport:
-        """Record byte/copy accounting for a logical snapshot boundary projection."""
+        """Record byte/copy accounting for a logical snapshot boundary projection.
+
+        When ``reconciliation`` is supplied (backlog 0144), the object-store
+        reconciliation summary -- per-object URIs, content lengths, provider
+        fingerprints, and any missing/mismatched objects -- is embedded in
+        ``report_json`` so the durable accounting row records what the export
+        actually wrote, not just the local plan.
+        """
         if copied_payload_bytes < 0:
             raise CurationError("copied_payload_bytes must be non-negative")
         if metadata_bytes_written < 0:
@@ -5409,6 +6183,19 @@ class LakeCurate:
             "source_table_versions": list(source_table_versions),
             "accounting": accounting,
         }
+        if reconciliation:
+            # Persist the reconciliation summary only -- never the exhaustive
+            # per-object array, which can reach 10^5-10^6 entries for an image
+            # export and would bloat this single Lance cell (backlog 0144/0483).
+            reconciliation_body = {
+                key: value
+                for key, value in dict(reconciliation).items()
+                if key not in {"objects", "objects_embedded", "objects_truncated"}
+            }
+            report["reconciliation"] = reconciliation_body
+            report["reconciliation_status"] = str(
+                reconciliation_body.get("status") or ""
+            )
         transform_id = _record_curation_transform(
             self._lake,
             operation="materialization-report",
@@ -5420,35 +6207,47 @@ class LakeCurate:
             output_tables=("curation_materializations",),
         )
         now = datetime.now(UTC)
+        source_row = {
+            "materialization_id": materialization_id,
+            "dataset_id": snapshot["dataset_id"],
+            "snapshot_name": snapshot["name"],
+            "target_format": target_format,
+            "output_uri": output_uri,
+            "mode": mode,
+            "selected_scenario_count": len(scenario_ids),
+            "selected_observation_count": len(observation_rows),
+            "total_payload_bytes": total_payload_bytes,
+            "copied_payload_bytes": copied_payload_bytes,
+            "logical_reference_bytes": logical_reference_bytes,
+            "metadata_bytes_written": metadata_bytes_written,
+            "copy_ratio": copy_ratio,
+            "source_table_versions": list(source_table_versions),
+            "report_json": json.dumps(report, sort_keys=True),
+            "projection_transform_id": projection_transform_id,
+            "created_by": created_by,
+            "transform_id": transform_id,
+            "created_at": now,
+        }
         table = self._lake.table("curation_materializations")
-        table.delete(f"materialization_id = '{materialization_id}'")
-        table.add(
-            pa.Table.from_pylist(
-                [
-                    {
-                        "materialization_id": materialization_id,
-                        "dataset_id": snapshot["dataset_id"],
-                        "snapshot_name": snapshot["name"],
-                        "target_format": target_format,
-                        "output_uri": output_uri,
-                        "mode": mode,
-                        "selected_scenario_count": len(scenario_ids),
-                        "selected_observation_count": len(observation_rows),
-                        "total_payload_bytes": total_payload_bytes,
-                        "copied_payload_bytes": copied_payload_bytes,
-                        "logical_reference_bytes": logical_reference_bytes,
-                        "metadata_bytes_written": metadata_bytes_written,
-                        "copy_ratio": copy_ratio,
-                        "source_table_versions": list(source_table_versions),
-                        "report_json": json.dumps(report, sort_keys=True),
-                        "projection_transform_id": projection_transform_id,
-                        "created_by": created_by,
-                        "transform_id": transform_id,
-                        "created_at": now,
-                    }
-                ],
-                schema=CURATION_MATERIALIZATIONS_SCHEMA,
-            )
+        # Atomic content-addressed upsert (BUG-04): a single merge_insert commit
+        # keyed on materialization_id, never a delete-then-add a crash or a second
+        # concurrent recorder can leave half-applied.
+        _merge_insert_view_rows_with_retry(
+            table,
+            "materialization_id",
+            pa.Table.from_pylist([source_row], schema=CURATION_MATERIALIZATIONS_SCHEMA),
+            update_matched=True,
+        )
+        # Emit the indexed rollup row (and any per-file accounting chunks) inline
+        # so snapshot/format/branch rollups and paged history stay current without
+        # a separate sync (0098 zero-divergence; backlog 0145). The full
+        # reconciliation object list -- deliberately stripped from the durable
+        # report_json cell -- is passed through here for per-file capture.
+        _write_materialization_rollup(
+            self._lake,
+            source_row,
+            reconciliation=dict(reconciliation) if reconciliation else None,
+            created_by=created_by,
         )
         return CurationMaterializationReport(
             materialization_id=materialization_id,
@@ -9474,18 +10273,49 @@ def _sql_in_predicate(column: str, values: Sequence[str]) -> str:
     return f"{column} IN ({', '.join(_sql_literal(value) for value in unique)})"
 
 
-def _view_membership_chunk_rows_for(lake: Lake, view_id: str) -> list[dict[str, Any]]:
-    return _rows_where(
-        lake,
-        _VIEW_MEMBERSHIP_CHUNK_TABLE,
-        where_sql=f"view_id = {_sql_literal(view_id)}",
-        fallback_filter=lambda row: row["view_id"] == view_id,
+def _view_membership_chunk_rows_for(
+    lake: Lake, view_id: str, *, version: int | None = None
+) -> list[dict[str, Any]]:
+    if version is None:
+        return _rows_where(
+            lake,
+            _VIEW_MEMBERSHIP_CHUNK_TABLE,
+            where_sql=f"view_id = {_sql_literal(view_id)}",
+            fallback_filter=lambda row: row["view_id"] == view_id,
+        )
+    # As-of replay (0143): read the view's membership chunks at the snapshot-
+    # pinned `curation_view_membership_chunks` version so a chunked saved view
+    # resolves to the membership captured at snapshot time, not whatever the
+    # live chunk table holds now. `open_table` returns a fresh handle, so the
+    # filtered read must run on the same checked-out handle (mirrors
+    # `_rows_at_version`); `checkout_latest` restores it in `finally`.
+    require_lake_capability(
+        lake, VERSIONING, operation="as-of curation view membership chunk read"
     )
+    handle = lake.table(_VIEW_MEMBERSHIP_CHUNK_TABLE)
+    where_sql = f"view_id = {_sql_literal(view_id)}"
+    checked_out = False
+    try:
+        handle.checkout(int(version))
+        checked_out = True
+        try:
+            return handle.search().where(where_sql).to_arrow().to_pylist()
+        except Exception:
+            return [
+                row
+                for row in handle.to_arrow().to_pylist()
+                if row["view_id"] == view_id
+            ]
+    finally:
+        if checked_out:
+            handle.checkout_latest()
 
 
-def _scenario_ids_from_view_chunks(lake: Lake, view_id: str) -> tuple[str, ...]:
+def _scenario_ids_from_view_chunks(
+    lake: Lake, view_id: str, *, version: int | None = None
+) -> tuple[str, ...]:
     rows = sorted(
-        _view_membership_chunk_rows_for(lake, view_id),
+        _view_membership_chunk_rows_for(lake, view_id, version=version),
         key=lambda row: (
             int(row.get("start_ordinal") or 0),
             int(row.get("chunk_index") or 0),
@@ -9509,6 +10339,1575 @@ def _scenario_ids_from_view_chunks(lake: Lake, view_id: str) -> tuple[str, ...]:
         scenario_ids.extend(chunk_ids)
         expected_start = end
     return tuple(scenario_ids)
+
+
+# --- 0141: lazy curation selection iteration + snapshot planning -----------
+#
+# 0081 introduced ordered chunk storage for large saved-view membership; the
+# eager reassembly above (``_scenario_ids_from_view_chunks``) still loads every
+# id into a Python tuple. The helpers and dataclasses below give a *lazy* path:
+# a view's membership can be iterated by bounded ordinal pages, streamed into
+# decision application, and pinned into a snapshot plan without materializing
+# the whole membership. Inline/legacy small views keep working through the same
+# surface via an in-memory tuple, so ``selection.scenario_ids`` stays backward
+# compatible.
+
+
+def _normalize_membership_page_size(page_size: int | None) -> int:
+    try:
+        value = (
+            int(page_size)
+            if page_size is not None
+            else _VIEW_MEMBERSHIP_DEFAULT_PAGE_SIZE
+        )
+    except (TypeError, ValueError) as exc:
+        raise CurationError("page_size must be an integer") from exc
+    if value <= 0:
+        raise CurationError("page_size must be positive")
+    return min(value, _VIEW_MEMBERSHIP_MAX_PAGE_SIZE)
+
+
+def _encode_membership_cursor(start_ordinal: int) -> str:
+    payload = {"start_ordinal": int(start_ordinal)}
+    return base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+
+
+def _decode_membership_cursor(cursor: str | None) -> int:
+    if not cursor:
+        return 0
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(str(cursor).encode("ascii")).decode("utf-8")
+        )
+        start = int(payload["start_ordinal"])
+    except Exception as exc:  # noqa: BLE001 - opaque token, any decode error is invalid
+        raise CurationError("invalid curation membership cursor") from exc
+    if start < 0:
+        raise CurationError("curation membership cursor ordinal must be non-negative")
+    return start
+
+
+def _stream_view_chunk_rows(
+    lake: Lake,
+    view_id: str,
+    *,
+    scenario_count: int,
+    chunk_size: int,
+    scan_from_ordinal: int = 0,
+    stats: "_ComparisonExecutionStats | None" = None,
+) -> Iterable[dict[str, Any]]:
+    """Yield a view's membership chunk rows in ``start_ordinal`` order, bounded.
+
+    Reads one chunk-aligned ordinal window at a time (``start_ordinal`` predicate
+    pushed into Lance), so client memory stays bounded by
+    ``_VIEW_MEMBERSHIP_CHUNK_SCAN_BATCH`` chunk rows — never the whole membership.
+    ``scan_from_ordinal`` is snapped down to a chunk boundary so the chunk that
+    *contains* a mid-chunk resume ordinal is still fetched; the id-level iterator
+    drops the ids before the true resume point. Windows are chunk-aligned and
+    disjoint, so no chunk is emitted twice. A backend that cannot push the
+    ``start_ordinal`` predicate degrades to a per-window full scan — O(windows ×
+    table), materially worse than the single-scan ``_rows_where`` fallback. That
+    degradation is not silent: it is flagged in ``stats.materialized_tables`` and,
+    for callers that did not pass ``stats``, raised once as a ``RuntimeWarning`` so
+    a costlier path is never taken without telling the caller (SKILLS.md §1).
+    """
+    width = max(int(chunk_size) or _VIEW_MEMBERSHIP_CHUNK_SIZE, 1)
+    window_ids = width * _VIEW_MEMBERSHIP_CHUNK_SCAN_BATCH
+    lit = _sql_literal(str(view_id))
+    lo = (max(int(scan_from_ordinal), 0) // width) * width
+    total = max(int(scenario_count), 0)
+    # Track fallback even when the caller passed no stats, so we can warn once.
+    scan_stats = stats if stats is not None else _ComparisonExecutionStats(
+        batch_size=_VIEW_TABLE_SCAN_BATCH_SIZE
+    )
+    warned_fallback = False
+    while lo < total:
+        hi = lo + window_ids
+        where_sql = (
+            f"view_id = {lit} AND start_ordinal >= {lo} AND start_ordinal < {hi}"
+        )
+        window_rows: list[dict[str, Any]] = []
+        for batch in _stream_table_rows(
+            lake,
+            _VIEW_MEMBERSHIP_CHUNK_TABLE,
+            columns=_VIEW_MEMBERSHIP_CHUNK_COLUMNS,
+            where_sql=where_sql,
+            batch_size=_VIEW_TABLE_SCAN_BATCH_SIZE,
+            stats=scan_stats,
+        ):
+            for row in batch:
+                if str(row.get("view_id")) != str(view_id):
+                    continue
+                start = int(row.get("start_ordinal") or 0)
+                if lo <= start < hi:
+                    window_rows.append(row)
+        if not warned_fallback and scan_stats.materialized_tables:
+            warned_fallback = True
+            warnings.warn(
+                f"curation view {view_id!r} membership paging fell back to a full "
+                f"table scan (backend cannot push the start_ordinal predicate); "
+                f"paging is O(windows x chunk table). Build the curation predicate "
+                f"indexes (lake.curate.index_predicates()) or use materialize() for "
+                f"small views.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        window_rows.sort(
+            key=lambda row: (
+                int(row.get("start_ordinal") or 0),
+                int(row.get("chunk_index") or 0),
+            )
+        )
+        yield from window_rows
+        lo = hi
+
+
+def _iter_view_membership_ids(
+    lake: Lake,
+    view_id: str,
+    *,
+    scenario_count: int,
+    chunk_size: int,
+    start_ordinal: int = 0,
+    stats: "_ComparisonExecutionStats | None" = None,
+) -> Iterable[str]:
+    """Stream a chunked view's scenario ids in deterministic ordinal order.
+
+    Validates chunk contiguity as it goes (same invariant as the eager
+    ``_scenario_ids_from_view_chunks``) and honours a mid-chunk ``start_ordinal``
+    resume point without re-reading earlier chunks. Memory is bounded by one
+    ordinal window; the caller decides how many ids to pull.
+    """
+    width = max(int(chunk_size) or _VIEW_MEMBERSHIP_CHUNK_SIZE, 1)
+    total = max(int(scenario_count), 0)
+    begin = max(int(start_ordinal), 0)
+    expected = (begin // width) * width
+    for row in _stream_view_chunk_rows(
+        lake,
+        view_id,
+        scenario_count=total,
+        chunk_size=width,
+        scan_from_ordinal=begin,
+        stats=stats,
+    ):
+        start = int(row.get("start_ordinal") or 0)
+        ids = [str(item) for item in row.get("scenario_ids") or ()]
+        end = int(row.get("end_ordinal") or start + len(ids))
+        if start != expected or end != start + len(ids):
+            raise CurationError(
+                f"curation view {view_id!r} has non-contiguous membership chunks"
+            )
+        if int(row.get("scenario_count") or len(ids)) != len(ids):
+            raise CurationError(
+                f"curation view {view_id!r} has an invalid membership chunk count"
+            )
+        expected = end
+        skip = begin - start if begin > start else 0
+        yield from ids[skip:] if skip else ids
+    # Loud short-read guard: a fully-consumed stream that stops before the header's
+    # advertised ``scenario_count`` means the chunk tail is missing (e.g. a header
+    # published over a truncated chunk prefix). Fail loudly instead of silently
+    # returning fewer ids. This runs only when the generator is exhausted — a
+    # caller that breaks early (``page()``) abandons it before this point.
+    if begin <= total and expected != total:
+        raise CurationError(
+            f"curation view {view_id!r} membership is truncated: reached ordinal "
+            f"{expected} of {total} expected scenarios"
+        )
+
+
+def _persist_streamed_view(
+    lake: Lake,
+    *,
+    name: str,
+    scenario_id_source: Callable[[], Iterable[str]],
+    scope: dict[str, Any],
+    source: dict[str, Any],
+    operation_transform_ids: Sequence[str],
+    prior_transform_ids: Sequence[str],
+    owner: str | None,
+    tags: Sequence[str],
+    description: str,
+    status: str,
+    chunk_size: int,
+    created_by: str,
+    operation: str,
+) -> "CurationSelectionMembership":
+    """Persist a *streamed* scenario-id sequence as a chunked saved view.
+
+    Bounded-memory write: ids are consumed in two passes (both bounded) — pass one
+    computes a streaming SHA-1 content id and the row count without holding an id
+    list; pass two writes chunk rows in bounded ``merge_insert`` batches. The
+    view id is content-addressed over the ordered ids (SKILLS.md invariant 4), so
+    re-persisting the same membership converges: chunk rows are inserted only when
+    their content-addressed ``chunk_id`` is absent, and the header upserts on
+    ``view_id`` — no delete-then-add sequence a crash or a race can leave
+    half-done. Callers must pass a *re-iterable* source (a thunk) because the two
+    passes each consume it; the source must be deterministic between passes.
+    """
+    view_name = str(name).strip()
+    if not view_name:
+        raise CurationError("view name must not be empty")
+    width = max(int(chunk_size) or _VIEW_MEMBERSHIP_CHUNK_SIZE, 1)
+    view_owner = str(owner or created_by).strip()
+    view_tags = tuple(
+        dict.fromkeys(str(tag).strip() for tag in tags if str(tag).strip())
+    )
+    # Pass 1: streaming content digest + count (bounded, no id list held).
+    content = hashlib.sha1()
+    content.update(("view:" + view_name + "\n").encode("utf-8"))
+    count = 0
+    for scenario_id in scenario_id_source():
+        content.update(str(scenario_id).encode("utf-8"))
+        content.update(b"\n")
+        count += 1
+    if count == 0:
+        raise CurationError("cannot persist an empty streamed curation view")
+    membership_digest = content.hexdigest()[:16]
+    view_id = "view-" + membership_digest
+    membership_storage = {
+        "kind": _VIEW_STORAGE_CHUNKED,
+        "table": _VIEW_MEMBERSHIP_CHUNK_TABLE,
+        "scenario_count": count,
+        "inline_scenario_count": 0,
+        "chunk_count": int(math.ceil(count / width)),
+        "chunk_size": width,
+        "order": "start_ordinal",
+        "scenario_ids_digest": membership_digest,
+    }
+    query_spec = {
+        "source": source,
+        "scenario_ids": [],
+        "membership_storage": membership_storage,
+    }
+    now = datetime.now(UTC)
+    table_versions = _table_versions(lake)
+    report = {
+        "operation": operation,
+        "name": view_name,
+        "owner": view_owner,
+        "tags": list(view_tags),
+        "description": description,
+        "status": status,
+        "streamed": True,
+        "membership_storage": membership_storage,
+        "input_count": count,
+        "output_count": count,
+    }
+    transform_id = _record_curation_transform(
+        lake,
+        operation="save-view",
+        input_scenario_ids=(),
+        output_scenario_ids=(),
+        report={**report, "view_id": view_id},
+        prior_transform_ids=prior_transform_ids,
+        created_by=created_by,
+        output_tables=("curation_views", _VIEW_MEMBERSHIP_CHUNK_TABLE),
+    )
+    # Write order matters (SKILLS.md converge-or-fail-loudly): the discoverable
+    # ``curation_views`` header — the row ``_latest_view_row(name)`` finds — is the
+    # FINAL commit. Content-addressed, insert-only chunk rows are written first
+    # across bounded merge_insert batches; a crash mid pass-2 leaves the view
+    # invisible-by-name, and a retry re-inserts only the missing chunks and
+    # converges (never a header that advertises the full count over a truncated
+    # chunk prefix, which a streaming read would otherwise accept silently).
+    # Pass 2: stream ids again, writing content-addressed chunk rows in bounded
+    # merge_insert batches (insert-only: same content converges, no duplicates).
+    chunk_table = lake.table(_VIEW_MEMBERSHIP_CHUNK_TABLE)
+    buffer: list[str] = []
+    pending_rows: list[dict[str, Any]] = []
+    state = {"ordinal": 0, "chunk_index": 0}
+
+    def _flush_pending() -> None:
+        if not pending_rows:
+            return
+        _merge_insert_view_rows_with_retry(
+            chunk_table,
+            "chunk_id",
+            pa.Table.from_pylist(
+                pending_rows, schema=CURATION_VIEW_MEMBERSHIP_CHUNKS_SCHEMA
+            ),
+            update_matched=False,
+        )
+        pending_rows.clear()
+
+    def _seal_chunk() -> None:
+        if not buffer:
+            return
+        start = state["ordinal"]
+        chunk_index = state["chunk_index"]
+        chunk_ids = list(buffer)
+        chunk_digest = _digest(
+            {
+                "view_id": view_id,
+                "chunk_index": chunk_index,
+                "start_ordinal": start,
+                "scenario_ids": chunk_ids,
+            }
+        )
+        pending_rows.append(
+            {
+                "chunk_id": f"viewchunk-{chunk_digest}",
+                "view_id": view_id,
+                "chunk_index": chunk_index,
+                "start_ordinal": start,
+                "end_ordinal": start + len(chunk_ids),
+                "scenario_ids": chunk_ids,
+                "scenario_count": len(chunk_ids),
+                "chunk_digest": chunk_digest,
+                "created_by": created_by,
+                "transform_id": transform_id,
+                "created_at": now,
+            }
+        )
+        state["ordinal"] = start + len(chunk_ids)
+        state["chunk_index"] = chunk_index + 1
+        buffer.clear()
+        if len(pending_rows) >= _VIEW_MEMBERSHIP_CHUNK_SCAN_BATCH:
+            _flush_pending()
+
+    for scenario_id in scenario_id_source():
+        buffer.append(str(scenario_id))
+        if len(buffer) >= width:
+            _seal_chunk()
+    _seal_chunk()
+    _flush_pending()
+    if state["ordinal"] != count:
+        # Raise BEFORE publishing the header so a non-deterministic id source can
+        # never leave a discoverable header over a mismatched chunk set.
+        raise CurationError(
+            f"streamed curation view {view_name!r} produced {state['ordinal']} ids "
+            f"but the first pass counted {count}; the id source is not deterministic"
+        )
+    # All chunks are durably written and count-verified — publish the header last.
+    header_row = {
+        "view_id": view_id,
+        "name": view_name,
+        "owner": view_owner,
+        "tags": list(view_tags),
+        "description": description,
+        "source_kind": "curation-workbench",
+        "scope": json.dumps(scope, sort_keys=True),
+        "query_spec": json.dumps(query_spec, sort_keys=True),
+        "scenario_ids": [],
+        "table_versions": table_versions,
+        "parent_transform_ids": list(operation_transform_ids),
+        "status": status,
+        "created_by": created_by,
+        "transform_id": transform_id,
+        "created_at": now,
+    }
+    _merge_insert_view_rows_with_retry(
+        lake.table("curation_views"),
+        "view_id",
+        pa.Table.from_pylist([header_row], schema=CURATION_VIEWS_SCHEMA),
+        update_matched=True,
+    )
+    return CurationSelectionMembership(
+        lake=lake,
+        view_id=view_id,
+        view_name=view_name,
+        storage=membership_storage,
+        inline_scenario_ids=None,
+        page_size=_VIEW_MEMBERSHIP_DEFAULT_PAGE_SIZE,
+    )
+
+
+@dataclass(frozen=True)
+class CurationSelectionPage:
+    """One deterministic ordinal page of a curation selection's membership."""
+
+    view_id: str
+    view_name: str
+    scenario_ids: tuple[str, ...]
+    start_ordinal: int
+    end_ordinal: int
+    page_size: int
+    total_count: int
+    cursor: str = ""
+    next_cursor: str = ""
+    has_more: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "view_id": self.view_id,
+            "view_name": self.view_name,
+            "start_ordinal": self.start_ordinal,
+            "end_ordinal": self.end_ordinal,
+            "page_size": self.page_size,
+            "total_count": self.total_count,
+            "cursor": self.cursor,
+            "next_cursor": self.next_cursor,
+            "has_more": self.has_more,
+            "scenario_count": len(self.scenario_ids),
+            "scenario_ids": list(self.scenario_ids),
+        }
+
+
+@dataclass(frozen=True)
+class CurationSelectionMembership:
+    """Lazy, ordinally-addressable view of a curation selection's scenario ids.
+
+    Backlog 0141. A saved view persisted as ordered chunk rows (0081) can be
+    iterated by bounded ordinal pages, streamed into decision application, and
+    pinned into a snapshot plan without materializing every id as a Python tuple
+    first. Small inline/legacy and in-memory derived selections keep working
+    through the same surface via ``inline_scenario_ids`` and the ``materialize()``
+    / ``scenario_ids`` compatibility adapters.
+    """
+
+    lake: Lake
+    view_id: str
+    view_name: str
+    storage: dict[str, Any]
+    inline_scenario_ids: tuple[str, ...] | None = None
+    page_size: int = _VIEW_MEMBERSHIP_DEFAULT_PAGE_SIZE
+
+    @property
+    def total_count(self) -> int:
+        if self.inline_scenario_ids is not None:
+            return len(self.inline_scenario_ids)
+        return int(self.storage.get("scenario_count") or 0)
+
+    @property
+    def is_chunked(self) -> bool:
+        return (
+            self.inline_scenario_ids is None
+            and str(self.storage.get("kind")) == _VIEW_STORAGE_CHUNKED
+        )
+
+    @property
+    def chunk_count(self) -> int:
+        return int(self.storage.get("chunk_count") or 0)
+
+    @property
+    def chunk_size(self) -> int:
+        return int(self.storage.get("chunk_size") or 0) or _VIEW_MEMBERSHIP_CHUNK_SIZE
+
+    def iter_scenario_ids(
+        self,
+        *,
+        start_ordinal: int = 0,
+        stats: "_ComparisonExecutionStats | None" = None,
+    ) -> Iterable[str]:
+        """Stream ids in deterministic order from ``start_ordinal`` (bounded reads)."""
+        begin = max(int(start_ordinal), 0)
+        if self.inline_scenario_ids is not None:
+            yield from self.inline_scenario_ids[begin:]
+            return
+        yield from _iter_view_membership_ids(
+            self.lake,
+            self.view_id,
+            scenario_count=self.total_count,
+            chunk_size=self.chunk_size,
+            start_ordinal=begin,
+            stats=stats,
+        )
+
+    def page(
+        self,
+        *,
+        page_size: int | None = None,
+        cursor: str | None = None,
+        stats: "_ComparisonExecutionStats | None" = None,
+    ) -> CurationSelectionPage:
+        """Return one bounded ordinal page plus a deterministic resume cursor."""
+        size = _normalize_membership_page_size(
+            page_size if page_size is not None else self.page_size
+        )
+        start = _decode_membership_cursor(cursor)
+        collected: list[str] = []
+        for scenario_id in self.iter_scenario_ids(start_ordinal=start, stats=stats):
+            collected.append(scenario_id)
+            if len(collected) >= size:
+                break
+        end = start + len(collected)
+        has_more = len(collected) == size and end < self.total_count
+        return CurationSelectionPage(
+            view_id=self.view_id,
+            view_name=self.view_name,
+            scenario_ids=tuple(collected),
+            start_ordinal=start,
+            end_ordinal=end,
+            page_size=size,
+            total_count=self.total_count,
+            cursor=str(cursor or ""),
+            next_cursor=_encode_membership_cursor(end) if has_more else "",
+            has_more=has_more,
+        )
+
+    def iter_pages(
+        self,
+        *,
+        page_size: int | None = None,
+        cursor: str | None = None,
+        stats: "_ComparisonExecutionStats | None" = None,
+    ) -> Iterable[CurationSelectionPage]:
+        """Yield successive pages until the membership is exhausted."""
+        size = _normalize_membership_page_size(
+            page_size if page_size is not None else self.page_size
+        )
+        next_cursor = cursor
+        while True:
+            page = self.page(page_size=size, cursor=next_cursor, stats=stats)
+            yield page
+            if not page.has_more:
+                return
+            next_cursor = page.next_cursor
+
+    def materialize(self) -> tuple[str, ...]:
+        """Return the full ordered id tuple (compat adapter for small/local use).
+
+        Streams the chunk store rather than reading it in one shot, so peak read
+        memory is bounded by one ordinal window, but the returned tuple itself is
+        O(count) — prefer :meth:`iter_pages` / :meth:`iter_scenario_ids` for large
+        views. :meth:`diagnostics` reports whether materialization is recommended.
+        """
+        return tuple(self.iter_scenario_ids())
+
+    @property
+    def scenario_ids(self) -> tuple[str, ...]:
+        """Backward-compatible materialized id tuple (see :meth:`materialize`)."""
+        return self.materialize()
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Row-count, memory, and page-size diagnostics for this membership."""
+        count = self.total_count
+        page_size = _normalize_membership_page_size(self.page_size)
+        return {
+            "view_id": self.view_id,
+            "view_name": self.view_name,
+            "storage_kind": str(self.storage.get("kind") or _VIEW_STORAGE_INLINE),
+            "lazy": self.is_chunked,
+            "row_count": count,
+            "chunk_count": self.chunk_count if self.is_chunked else 0,
+            "chunk_size": self.chunk_size if self.is_chunked else 0,
+            "page_size": page_size,
+            "estimated_membership_bytes": count * _VIEW_MEMBERSHIP_APPROX_ID_BYTES,
+            "estimated_page_bytes": page_size * _VIEW_MEMBERSHIP_APPROX_ID_BYTES,
+            "materialize_recommended": count <= _VIEW_MEMBERSHIP_MATERIALIZE_SOFT_LIMIT,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "view_id": self.view_id,
+            "view_name": self.view_name,
+            "membership_storage": dict(self.storage),
+            "diagnostics": self.diagnostics(),
+        }
+
+    def apply_decisions(
+        self,
+        *,
+        excluding_decisions: Sequence[str] = _EXCLUDING_DECISIONS,
+        page_size: int | None = None,
+        created_by: str = "lancedb-robotics",
+    ) -> "CurationDecisionStreamResult":
+        """Stream latest membership decisions over this view without materializing.
+
+        Acceptance criterion: ``apply_decisions`` can stream a large view and still
+        resolve latest decisions correctly. The membership is read by bounded
+        ordinal pages; the latest decision per scenario is resolved once from
+        ``curation_memberships`` (bounded by decision count, not view size) and each
+        streamed id is kept unless its latest decision is in ``excluding_decisions``.
+        The result is itself lazy — it re-streams selected ids on demand and can be
+        materialized into a :class:`CurationSelection` or persisted as a new
+        chunked saved view. This mirrors the eager ``CurationSelection.apply_decisions``
+        for a view-opened selection (where the base order equals the view order), so
+        the "re-include ``include`` decisions" step is implicit: every view id is
+        already in the stream and is kept unless excluded.
+        """
+        excluded = tuple(
+            _normalize_decision(decision) for decision in excluding_decisions
+        )
+        latest = _latest_membership_by_scenario(
+            _membership_rows(self.lake, view_id=self.view_id or None)
+        )
+        decision_transform_ids = tuple(
+            dict.fromkeys(
+                str(row["transform_id"])
+                for row in latest.values()
+                if row.get("transform_id")
+            )
+        )
+        stats = _ComparisonExecutionStats(batch_size=_VIEW_TABLE_SCAN_BATCH_SIZE)
+        input_count = 0
+        output_count = 0
+        removed_by_decision: dict[str, int] = {}
+        content = hashlib.sha1()
+        for scenario_id in self.iter_scenario_ids(stats=stats):
+            input_count += 1
+            decision = latest.get(scenario_id, {}).get("decision")
+            if decision in excluded:
+                removed_by_decision[decision] = (
+                    removed_by_decision.get(decision, 0) + 1
+                )
+                continue
+            output_count += 1
+            content.update(scenario_id.encode("utf-8"))
+            content.update(b"\n")
+        if output_count == 0:
+            raise CurationError(
+                "membership decisions removed every scenario from the selection"
+            )
+        report = {
+            "operation": "apply-decisions",
+            "view_id": self.view_id or "",
+            "view_name": self.view_name or "",
+            "excluding_decisions": list(excluded),
+            "removed_by_decision": dict(sorted(removed_by_decision.items())),
+            "decision_transform_ids": list(decision_transform_ids),
+            "input_count": input_count,
+            "output_count": output_count,
+            "output_membership_digest": content.hexdigest()[:16],
+            "streamed": True,
+            "membership_diagnostics": {
+                **self.diagnostics(),
+                "streamed_read": stats.to_report(),
+            },
+        }
+        transform_id = _record_curation_transform(
+            self.lake,
+            operation="apply-decisions",
+            input_scenario_ids=(),
+            output_scenario_ids=(),
+            report=report,
+            prior_transform_ids=decision_transform_ids,
+            created_by=created_by,
+        )
+        return CurationDecisionStreamResult(
+            lake=self.lake,
+            source=self,
+            excluded=excluded,
+            latest_decision_transform_ids=decision_transform_ids,
+            input_count=input_count,
+            output_count=output_count,
+            removed_by_decision=dict(sorted(removed_by_decision.items())),
+            output_membership_digest=content.hexdigest()[:16],
+            transform_id=transform_id,
+            report=report,
+            page_size=_normalize_membership_page_size(
+                page_size if page_size is not None else self.page_size
+            ),
+        )
+
+    def plan_snapshot(
+        self,
+        *,
+        name: str | None = None,
+        split_by: str = SPLIT_BY_RUN,
+        tag: str | None = None,
+        created_by: str = "lancedb-robotics",
+    ) -> "CurationSnapshotPlan":
+        """Record a deterministic snapshot source plan with bounded client memory.
+
+        Acceptance criterion: snapshot planning records the same
+        ordered/deterministic source lineage while bounding client memory. The plan
+        pins the source view id, membership digest, scenario count, and source table
+        versions without reading the membership (chunked views reuse the digest
+        stored at save time). Freezing (:meth:`CurationSnapshotPlan.create_snapshot`)
+        reuses the existing snapshot writer, whose sorted-id identity is preserved
+        unchanged (0141 non-goal: snapshot identity semantics).
+        """
+        if split_by not in SPLIT_BYS:
+            raise CurationError(
+                f"unknown split_by {split_by!r}; expected one of {', '.join(SPLIT_BYS)}"
+            )
+        snapshot_name = str(name or self.view_name or "curation-snapshot")
+        digest = str(self.storage.get("scenario_ids_digest") or "")
+        if not digest:
+            content = hashlib.sha1()
+            for scenario_id in self.iter_scenario_ids():
+                content.update(scenario_id.encode("utf-8"))
+                content.update(b"\n")
+            digest = content.hexdigest()[:16]
+        table_versions = _table_versions(self.lake)
+        plan_id = "csnapplan-" + _digest(
+            {
+                "name": snapshot_name,
+                "view_id": self.view_id,
+                "membership_digest": digest,
+                "scenario_count": self.total_count,
+                "split_by": split_by,
+                "table_versions": table_versions,
+            }
+        )
+        report = {
+            "operation": "plan-snapshot",
+            "plan_id": plan_id,
+            "view_id": self.view_id,
+            "view_name": self.view_name,
+            "name": snapshot_name,
+            "tag": str(tag or snapshot_name),
+            "split_by": split_by,
+            "scenario_count": self.total_count,
+            "membership_digest": digest,
+            "table_versions": table_versions,
+            "membership_diagnostics": self.diagnostics(),
+        }
+        return CurationSnapshotPlan(
+            lake=self.lake,
+            plan_id=plan_id,
+            name=snapshot_name,
+            tag=str(tag or snapshot_name),
+            view_id=self.view_id,
+            view_name=self.view_name,
+            membership=self,
+            split_by=split_by,
+            scenario_count=self.total_count,
+            membership_digest=digest,
+            table_versions=tuple(
+                (str(tv["table"]), int(tv["version"])) for tv in table_versions
+            ),
+            report=report,
+            created_by=created_by,
+        )
+
+
+@dataclass(frozen=True)
+class CurationDecisionStreamResult:
+    """Lazy result of streaming latest decisions over a curation view (0141)."""
+
+    lake: Lake
+    source: "CurationSelectionMembership"
+    excluded: tuple[str, ...]
+    latest_decision_transform_ids: tuple[str, ...]
+    input_count: int
+    output_count: int
+    removed_by_decision: dict[str, int]
+    output_membership_digest: str
+    transform_id: str
+    report: dict[str, Any]
+    page_size: int = _VIEW_MEMBERSHIP_DEFAULT_PAGE_SIZE
+    #: One-slot cache for the resolved latest-decision map. This result is a
+    #: snapshot of the decisions as of ``apply_decisions``; re-streaming its ids
+    #: (twice in the ``save_view`` two-pass write) must not re-collect the whole
+    #: ``curation_memberships`` table each time. compare=False so it never affects
+    #: dataclass equality/hash.
+    _decision_cache: dict[str, dict[str, dict[str, Any]]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+
+    def _latest(self) -> dict[str, dict[str, Any]]:
+        cached = self._decision_cache.get("latest")
+        if cached is None:
+            cached = _latest_membership_by_scenario(
+                _membership_rows(self.lake, view_id=self.source.view_id or None)
+            )
+            self._decision_cache["latest"] = cached
+        return cached
+
+    def iter_scenario_ids(
+        self, *, stats: "_ComparisonExecutionStats | None" = None
+    ) -> Iterable[str]:
+        """Re-stream the selected (kept) scenario ids in deterministic order."""
+        latest = self._latest()
+        for scenario_id in self.source.iter_scenario_ids(stats=stats):
+            if latest.get(scenario_id, {}).get("decision") in self.excluded:
+                continue
+            yield scenario_id
+
+    def membership(
+        self, *, page_size: int | None = None
+    ) -> "CurationSelectionMembership":
+        """A lazy membership over the *kept* ids (in-memory adapter, small results)."""
+        ids = tuple(self.iter_scenario_ids())
+        storage = {
+            "kind": _VIEW_STORAGE_INLINE,
+            "table": "curation_views",
+            "scenario_count": len(ids),
+            "inline_scenario_count": len(ids),
+            "chunk_count": 0,
+            "chunk_size": 0,
+            "order": "scenario_ids",
+        }
+        return CurationSelectionMembership(
+            lake=self.lake,
+            view_id=self.source.view_id,
+            view_name=self.source.view_name,
+            storage=storage,
+            inline_scenario_ids=ids,
+            page_size=_normalize_membership_page_size(
+                page_size if page_size is not None else self.page_size
+            ),
+        )
+
+    def materialize(self) -> tuple[str, ...]:
+        return tuple(self.iter_scenario_ids())
+
+    def selection(self) -> "CurationSelection":
+        """Materialize the streamed result as a ``CurationSelection`` (compat path)."""
+        selected = self.materialize()
+        if not selected:
+            raise CurationError(
+                "membership decisions removed every scenario from the selection"
+            )
+        return CurationSelection(
+            lake=self.lake,
+            scenario_ids=selected,
+            scope={},
+            operation="apply-decisions",
+            transform_id=self.transform_id,
+            report=self.report,
+            operation_transform_ids=self.latest_decision_transform_ids
+            + (self.transform_id,),
+        )
+
+    def save_view(
+        self,
+        name: str,
+        *,
+        owner: str | None = None,
+        tags: Sequence[str] = (),
+        description: str = "",
+        status: str = "active",
+        chunk_size: int = _VIEW_MEMBERSHIP_CHUNK_SIZE,
+        created_by: str = "lancedb-robotics",
+    ) -> "CurationSelectionMembership":
+        """Persist the streamed decision result as a new chunked saved view.
+
+        Bounded memory end to end: the kept ids are streamed straight into
+        :func:`_persist_streamed_view` without a full materialization.
+        """
+        return _persist_streamed_view(
+            self.lake,
+            name=name,
+            scenario_id_source=lambda: self.iter_scenario_ids(),
+            scope={},
+            source={
+                "kind": "curation-apply-decisions-stream",
+                "view_id": self.source.view_id,
+                "view_name": self.source.view_name,
+                "excluding_decisions": list(self.excluded),
+                "apply_decisions_transform_id": self.transform_id,
+            },
+            operation_transform_ids=self.latest_decision_transform_ids
+            + (self.transform_id,),
+            prior_transform_ids=(self.transform_id,),
+            owner=owner,
+            tags=tags,
+            description=description,
+            status=status,
+            chunk_size=chunk_size,
+            created_by=created_by,
+            operation="apply-decisions",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operation": "apply-decisions",
+            "view_id": self.source.view_id,
+            "view_name": self.source.view_name,
+            "input_count": self.input_count,
+            "output_count": self.output_count,
+            "removed_by_decision": dict(sorted(self.removed_by_decision.items())),
+            "output_membership_digest": self.output_membership_digest,
+            "transform_id": self.transform_id,
+            "excluding_decisions": list(self.excluded),
+        }
+
+
+@dataclass(frozen=True)
+class CurationSnapshotPlan:
+    """Bounded-memory snapshot source plan compiled from a lazy membership (0141)."""
+
+    lake: Lake
+    plan_id: str
+    name: str
+    tag: str
+    view_id: str
+    view_name: str
+    membership: "CurationSelectionMembership"
+    split_by: str
+    scenario_count: int
+    membership_digest: str
+    table_versions: tuple[tuple[str, int], ...]
+    report: dict[str, Any]
+    created_by: str = "lancedb-robotics"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "name": self.name,
+            "tag": self.tag,
+            "view_id": self.view_id,
+            "view_name": self.view_name,
+            "split_by": self.split_by,
+            "scenario_count": self.scenario_count,
+            "membership_digest": self.membership_digest,
+            "table_versions": [
+                {"table": table, "version": version, "tag": ""}
+                for table, version in self.table_versions
+            ],
+            "report": self.report,
+        }
+
+    def create_snapshot(
+        self,
+        *,
+        split_ratios: dict[str, float] | None = None,
+        created_by: str | None = None,
+        lineage_context: Any | None = None,
+    ) -> SnapshotManifest:
+        """Freeze the planned snapshot, streaming ids into the snapshot writer.
+
+        The plan captured deterministic source lineage with bounded memory; the
+        freeze streams the membership into the existing ``create_snapshot`` writer,
+        whose identity (sorted-id digest over name + ids + split + table versions)
+        is preserved unchanged — a plan-driven freeze yields the same ``dataset_id``
+        as the eager ``selection.snapshot(...)`` for the same view.
+        """
+        scenario_ids = list(self.membership.iter_scenario_ids())
+        return create_snapshot(
+            self.lake,
+            name=self.name,
+            scenario_ids=scenario_ids,
+            source={
+                "kind": "curation-snapshot-plan",
+                "plan_id": self.plan_id,
+                "view_id": self.view_id,
+                "view_name": self.view_name,
+                "membership_digest": self.membership_digest,
+                "split_by": self.split_by,
+            },
+            split_by=self.split_by,
+            split_ratios=split_ratios,
+            tag=self.tag,
+            created_by=created_by or self.created_by,
+            lineage_context=lineage_context,
+        )
+
+
+# --- 0140: chunk membership migration, validation, and compaction ---------
+#
+# 0081 introduced chunked storage for *newly* saved large views while leaving
+# small and legacy inline views in ``curation_views.scenario_ids``. The helpers
+# below give production lakes an idempotent path to relocate legacy inline
+# membership into ``curation_view_membership_chunks`` (preserving view identity,
+# transform lineage, and table-version pins), a read-only integrity/repair
+# report over chunked views, and a compaction path that reclaims orphaned and
+# (opt-in) superseded chunk rows. Physical file compaction of the chunk table
+# stays in ``maintain_lake``; these operate at the row/logical layer.
+
+_VIEW_TABLE_SCAN_BATCH_SIZE = 4096
+# Bound the ``view_id IN (...)`` delete predicate so compaction never builds an
+# unbounded SQL string (SKILLS.md wide-IN discipline); deletes are over view
+# ids, which are few, so this is generous.
+_VIEW_ID_DELETE_BATCH = 256
+# Bound the chunk-row write into batches rather than one oversized commit
+# (SKILLS.md BUG-02): the migration targets are the *largest* inline views.
+_VIEW_CHUNK_WRITE_BATCH = 512
+#: merge_insert attempts before surfacing a Lance optimistic-concurrency commit
+#: conflict. These writes are idempotent by key, so a preempted commit converges
+#: on retry (mirrors enrich / aligned_tick_migration).
+_VIEW_MERGE_INSERT_ATTEMPTS = 3
+
+
+def _is_retryable_commit_conflict(exc: BaseException) -> bool:
+    """True for Lance's retryable optimistic-concurrency commit conflict."""
+    return "commit conflict" in str(exc).lower()
+
+
+def _merge_insert_view_rows_with_retry(
+    table: Any,
+    key_column: str,
+    data: pa.Table,
+    *,
+    update_matched: bool,
+) -> None:
+    """Single-commit upsert (BUG-04 fix shape) with bounded conflict retry.
+
+    ``update_matched=False`` is insert-only: matched keys are left untouched, so
+    concurrent writers writing the same content-addressed rows converge without
+    duplicates (used for chunk rows keyed on ``chunk_id``). ``update_matched=True``
+    replaces the matched row in one commit (used for the view header flip keyed on
+    ``view_id``, which must overwrite an existing live row).
+    """
+    last_error: BaseException | None = None
+    for _ in range(_VIEW_MERGE_INSERT_ATTEMPTS):
+        builder = table.merge_insert(key_column)
+        if update_matched:
+            builder = builder.when_matched_update_all()
+        try:
+            builder.when_not_matched_insert_all().execute(data)
+            return
+        except Exception as exc:  # noqa: BLE001 - retry only the retryable conflict.
+            if not _is_retryable_commit_conflict(exc):
+                raise
+            last_error = exc
+    raise CurationError(
+        f"merge_insert on {key_column!r} kept hitting commit conflicts "
+        f"after {_VIEW_MERGE_INSERT_ATTEMPTS} attempts: {last_error}"
+    )
+
+
+def _iter_view_table_rows(
+    lake: Lake,
+    table: str,
+    *,
+    columns: Sequence[str] | None = None,
+    batch_size: int = _VIEW_TABLE_SCAN_BATCH_SIZE,
+) -> Iterable[dict[str, Any]]:
+    """Stream rows of a curation table, projecting only ``columns``.
+
+    Bounded by ``batch_size``. The fallback for backends whose ``search()``
+    cannot project/stream still projects scalar columns through the Lance
+    dataset scanner, so we never materialize an unbounded list column; only a
+    backend exposing neither path degrades to a full read.
+    """
+    handle = lake.table(table)
+    try:
+        query = handle.search()
+        if columns:
+            query = query.select(list(columns))
+        for batch in query.to_batches(batch_size=batch_size):
+            yield from batch.to_pylist()
+        return
+    except Exception:
+        pass
+    try:
+        dataset = handle.to_lance()
+        scanner = dataset.scanner(columns=list(columns)) if columns else dataset.scanner()
+        for batch in scanner.to_reader():
+            yield from batch.to_pylist()
+        return
+    except Exception:
+        pass
+    for row in handle.to_arrow().to_pylist():
+        yield {column: row.get(column) for column in columns} if columns else row
+
+
+def _view_id_delete_predicate_batches(view_ids: Sequence[str]) -> Iterable[str]:
+    """Yield bounded ``view_id IN (...)`` predicates for the given view ids."""
+    unique = list(dict.fromkeys(str(v) for v in view_ids if str(v)))
+    for start in range(0, len(unique), _VIEW_ID_DELETE_BATCH):
+        yield _sql_in_predicate("view_id", unique[start : start + _VIEW_ID_DELETE_BATCH])
+
+
+def _walk_view_id_references(value: Any, found: set[str]) -> None:
+    """Recursively collect every ``view_id`` string value nested in JSON."""
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key == "view_id" and isinstance(item, str) and item:
+                found.add(item)
+            else:
+                _walk_view_id_references(item, found)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _walk_view_id_references(item, found)
+
+
+def _snapshot_referenced_view_ids(lake: Lake) -> set[str]:
+    """View ids referenced by any live dataset snapshot's source metadata.
+
+    Belt-and-suspenders: snapshot as-of reads already pin table *versions*, so
+    deleting current-version orphan/superseded chunk rows does not break pinned
+    reads. We still refuse to delete chunks for a view a snapshot points at, and
+    surface them as retained.
+    """
+    referenced: set[str] = set()
+    try:
+        for row in _iter_view_table_rows(lake, "dataset_snapshots", columns=["query_spec"]):
+            raw = row.get("query_spec")
+            if not raw:
+                continue
+            try:
+                spec = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            _walk_view_id_references(spec, referenced)
+    except Exception:  # noqa: BLE001 - snapshots table may be absent on a fresh lake
+        return referenced
+    return referenced
+
+
+def validate_view_membership(
+    lake: Lake,
+    *,
+    view_name: str | None = None,
+) -> ViewMembershipValidationReport:
+    """Validate chunk integrity for chunked saved views without repairing.
+
+    Checks contiguous ordinals, expected scenario counts, per-chunk and
+    whole-membership digests, duplicate/missing chunks, and orphaned chunk rows.
+    Read-only: it never rewrites chunks; each issue carries repair guidance.
+    """
+    header_ids: set[str] = set()
+    chunked: list[tuple[str, str, dict[str, Any]]] = []
+    for row in _iter_view_table_rows(
+        lake, "curation_views", columns=["view_id", "name", "query_spec"]
+    ):
+        view_id = str(row.get("view_id") or "")
+        if not view_id:
+            continue
+        header_ids.add(view_id)
+        name = str(row.get("name") or "")
+        if view_name is not None and name != view_name:
+            continue
+        storage = _view_membership_storage_from_row(row)
+        if storage["kind"] == _VIEW_STORAGE_CHUNKED:
+            chunked.append((view_id, name, storage))
+
+    issues: list[ViewMembershipChunkIssue] = []
+    healthy = 0
+    for view_id, name, storage in chunked:
+        view_issues = _validate_one_view_chunks(lake, view_id, name, storage)
+        if view_issues:
+            issues.extend(view_issues)
+        else:
+            healthy += 1
+
+    # Orphan chunk rows: a view_id present in the chunk table but with no live
+    # header (view deleted/replaced under a different content-addressed id).
+    orphans: set[str] = set()
+    for row in _iter_view_table_rows(
+        lake, _VIEW_MEMBERSHIP_CHUNK_TABLE, columns=["view_id"]
+    ):
+        chunk_view_id = str(row.get("view_id") or "")
+        if chunk_view_id and chunk_view_id not in header_ids:
+            orphans.add(chunk_view_id)
+
+    return ViewMembershipValidationReport(
+        lake_uri=lake.uri,
+        views_checked=len(chunked),
+        chunked_views=len(chunked),
+        healthy_views=healthy,
+        issues=tuple(issues),
+        orphan_view_ids=tuple(sorted(orphans)),
+    )
+
+
+def _validate_one_view_chunks(
+    lake: Lake,
+    view_id: str,
+    view_name: str,
+    storage: dict[str, Any],
+) -> list[ViewMembershipChunkIssue]:
+    rows = _view_membership_chunk_rows_for(lake, view_id)
+
+    def issue(code: str, detail: str, repair: str) -> ViewMembershipChunkIssue:
+        return ViewMembershipChunkIssue(
+            view_id=view_id, view_name=view_name, code=code, detail=detail, repair=repair
+        )
+
+    # A damaged/duplicated chunk set on a *live* view cannot be fixed by
+    # `migrate-views` (a no-op once chunked) or `compact-chunks` (only reclaims
+    # orphan/superseded view ids, never partial chunks of a live view). The
+    # honest remediation is a rebuild from authoritative membership (backlog
+    # 0469); orphan/superseded *view* cleanup remains `compact-chunks`.
+    rebuild_hint = (
+        "rebuild this view's chunk rows from authoritative membership "
+        "(backlog 0469 `curate repair-chunks`); `migrate-views`/`compact-chunks` "
+        "do not repair a live chunked view"
+    )
+    compact_hint = rebuild_hint
+
+    found: list[ViewMembershipChunkIssue] = []
+    if not rows:
+        found.append(
+            issue(
+                "missing-chunks",
+                f"chunked view has no chunk rows (expected {storage.get('chunk_count', 0)})",
+                rebuild_hint,
+            )
+        )
+        return found
+
+    ordered = sorted(
+        rows,
+        key=lambda r: (
+            int(r.get("start_ordinal") or 0),
+            int(r.get("chunk_index") or 0),
+            str(r.get("chunk_id") or ""),
+        ),
+    )
+
+    seen_index: set[int] = set()
+    seen_start: set[int] = set()
+    expected_start = 0
+    reconstructed: list[str] = []
+    for row in ordered:
+        chunk_index = int(row.get("chunk_index") or 0)
+        start = int(row.get("start_ordinal") or 0)
+        chunk_ids = [str(item) for item in row.get("scenario_ids") or ()]
+        end = int(row.get("end_ordinal") or (start + len(chunk_ids)))
+        stored_count = int(row.get("scenario_count") or 0)
+        stored_digest = str(row.get("chunk_digest") or "")
+
+        if chunk_index in seen_index or start in seen_start:
+            found.append(
+                issue(
+                    "duplicate-chunk",
+                    f"duplicate chunk (index={chunk_index}, start_ordinal={start})",
+                    compact_hint,
+                )
+            )
+        seen_index.add(chunk_index)
+        seen_start.add(start)
+
+        if stored_count != len(chunk_ids):
+            found.append(
+                issue(
+                    "chunk-count-mismatch",
+                    f"chunk {chunk_index} scenario_count={stored_count} "
+                    f"but holds {len(chunk_ids)} ids",
+                    rebuild_hint,
+                )
+            )
+        if end != start + len(chunk_ids):
+            found.append(
+                issue(
+                    "chunk-bounds-mismatch",
+                    f"chunk {chunk_index} end_ordinal={end} != start {start} + {len(chunk_ids)}",
+                    rebuild_hint,
+                )
+            )
+        expected_digest = _digest(
+            {
+                "view_id": view_id,
+                "chunk_index": chunk_index,
+                "start_ordinal": start,
+                "scenario_ids": chunk_ids,
+            }
+        )
+        if stored_digest != expected_digest:
+            found.append(
+                issue(
+                    "digest-mismatch",
+                    f"chunk {chunk_index} digest {stored_digest!r} != recomputed {expected_digest!r}",
+                    rebuild_hint,
+                )
+            )
+        if start != expected_start:
+            found.append(
+                issue(
+                    "non-contiguous",
+                    f"chunk {chunk_index} starts at {start}, expected {expected_start}",
+                    rebuild_hint,
+                )
+            )
+        reconstructed.extend(chunk_ids)
+        expected_start = max(expected_start, end)
+
+    expected_count = int(storage.get("scenario_count") or 0)
+    if expected_count and len(reconstructed) != expected_count:
+        found.append(
+            issue(
+                "total-count-mismatch",
+                f"reconstructed {len(reconstructed)} ids, header expects {expected_count}",
+                rebuild_hint,
+            )
+        )
+    expected_chunk_count = int(storage.get("chunk_count") or 0)
+    if expected_chunk_count and len(ordered) != expected_chunk_count:
+        found.append(
+            issue(
+                "chunk-count-drift",
+                f"found {len(ordered)} chunks, header expects {expected_chunk_count}",
+                compact_hint if len(ordered) > expected_chunk_count else rebuild_hint,
+            )
+        )
+    stored_membership_digest = str(storage.get("scenario_ids_digest") or "")
+    if stored_membership_digest:
+        actual = _digest({"scenario_ids": reconstructed})
+        if actual != stored_membership_digest:
+            found.append(
+                issue(
+                    "membership-digest-mismatch",
+                    "reconstructed membership digest does not match header",
+                    rebuild_hint,
+                )
+            )
+    return found
+
+
+def migrate_view_membership(
+    lake: Lake,
+    *,
+    view_name: str | None = None,
+    inline_scenario_limit: int = _VIEW_INLINE_SCENARIO_ID_LIMIT,
+    chunk_size: int = _VIEW_MEMBERSHIP_CHUNK_SIZE,
+    dry_run: bool = False,
+    created_by: str = "lancedb-robotics",
+) -> ViewMembershipMigrationReport:
+    """Relocate legacy inline saved-view membership into chunk rows, idempotently.
+
+    A view is migrated only when its inline ``scenario_ids`` exceeds
+    ``inline_scenario_limit``. View identity (``view_id``), transform lineage,
+    ``table_versions`` pins, and every other header field are preserved; only
+    the physical membership location changes. Already-chunked views are skipped.
+    Re-running is a no-op (idempotent).
+    """
+    if inline_scenario_limit < 0:
+        raise CurationError("inline_scenario_limit must be non-negative")
+    if chunk_size <= 0:
+        raise CurationError("chunk_size must be positive")
+
+    results: list[ViewMembershipMigrationResult] = []
+    for row in _iter_view_table_rows(lake, "curation_views"):
+        name = str(row.get("name") or "")
+        if view_name is not None and name != view_name:
+            continue
+        view_id = str(row.get("view_id") or "")
+        if not view_id:
+            continue
+        storage = _view_membership_storage_from_row(row)
+        if storage["kind"] == _VIEW_STORAGE_CHUNKED:
+            results.append(
+                ViewMembershipMigrationResult(
+                    view_id=view_id,
+                    view_name=name,
+                    status="already-chunked",
+                    scenario_count=int(storage.get("scenario_count") or 0),
+                    chunk_count=int(storage.get("chunk_count") or 0),
+                )
+            )
+            continue
+        scenario_ids = tuple(str(item) for item in row.get("scenario_ids") or ())
+        if not scenario_ids:
+            results.append(
+                ViewMembershipMigrationResult(
+                    view_id=view_id, view_name=name, status="skipped-empty",
+                    scenario_count=0, chunk_count=0,
+                )
+            )
+            continue
+        if len(scenario_ids) <= inline_scenario_limit:
+            results.append(
+                ViewMembershipMigrationResult(
+                    view_id=view_id, view_name=name, status="skipped-below-threshold",
+                    scenario_count=len(scenario_ids), chunk_count=0,
+                )
+            )
+            continue
+
+        new_storage = _view_membership_storage_payload(
+            scenario_ids,
+            inline_scenario_limit=inline_scenario_limit,
+            chunk_size=chunk_size,
+        )
+        chunk_count = int(new_storage["chunk_count"])
+        if dry_run:
+            results.append(
+                ViewMembershipMigrationResult(
+                    view_id=view_id, view_name=name, status="would-migrate",
+                    scenario_count=len(scenario_ids), chunk_count=chunk_count,
+                )
+            )
+            continue
+
+        transform_id = _record_curation_transform(
+            lake,
+            operation="migrate-view-membership",
+            input_scenario_ids=scenario_ids,
+            output_scenario_ids=scenario_ids,
+            report={
+                "operation": "migrate-view-membership",
+                "view_id": view_id,
+                "name": name,
+                "from_storage": _VIEW_STORAGE_INLINE,
+                "to_storage": _VIEW_STORAGE_CHUNKED,
+                "membership_storage": new_storage,
+                "chunk_count": chunk_count,
+                "chunk_size": chunk_size,
+            },
+            prior_transform_ids=tuple(str(t) for t in row.get("parent_transform_ids") or ()),
+            created_by=created_by,
+            output_tables=("curation_views", _VIEW_MEMBERSHIP_CHUNK_TABLE),
+        )
+        now = datetime.now(UTC)
+
+        # Crash-safe order: write chunks FIRST, then flip the header. If we crash
+        # after chunks but before the flip, the header is still inline and fully
+        # readable (chunks are harmless until referenced); a re-run redoes the
+        # deterministic chunk_ids. Flipping first would leave a "chunked" header
+        # with missing chunks -> a read error.
+        chunk_table = lake.table(_VIEW_MEMBERSHIP_CHUNK_TABLE)
+        chunk_rows = _view_membership_chunk_rows(
+            view_id=view_id,
+            scenario_ids=scenario_ids,
+            chunk_size=chunk_size,
+            created_by=created_by,
+            transform_id=transform_id,
+            created_at=now,
+        )
+        # Idempotent, concurrent-safe chunk write: merge_insert keyed on the
+        # content-addressed chunk_id (insert-only) collapses duplicate writes
+        # from a retried job or a second migrator into one row instead of
+        # appending copies -- never a delete-then-add a race can double
+        # (SKILLS.md BUG-04). Batched into bounded commits (BUG-02) because the
+        # migration targets are the largest inline views.
+        for start in range(0, len(chunk_rows), _VIEW_CHUNK_WRITE_BATCH):
+            batch = chunk_rows[start : start + _VIEW_CHUNK_WRITE_BATCH]
+            _merge_insert_view_rows_with_retry(
+                chunk_table,
+                "chunk_id",
+                pa.Table.from_pylist(batch, schema=CURATION_VIEW_MEMBERSHIP_CHUNKS_SCHEMA),
+                update_matched=False,
+            )
+        _flip_view_header_to_chunked(lake, row, new_storage, transform_id)
+        results.append(
+            ViewMembershipMigrationResult(
+                view_id=view_id, view_name=name, status="migrated",
+                scenario_count=len(scenario_ids), chunk_count=chunk_count,
+                transform_id=transform_id,
+            )
+        )
+
+    return ViewMembershipMigrationReport(
+        lake_uri=lake.uri,
+        inline_scenario_limit=inline_scenario_limit,
+        chunk_size=chunk_size,
+        dry_run=dry_run,
+        results=tuple(results),
+    )
+
+
+def _flip_view_header_to_chunked(
+    lake: Lake,
+    row: dict[str, Any],
+    new_storage: dict[str, Any],
+    migration_transform_id: str,
+) -> None:
+    """Rewrite one view header to chunked storage, preserving all identity fields."""
+    view_id = str(row["view_id"])
+    try:
+        query_spec = json.loads(row.get("query_spec") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        query_spec = {}
+    query_spec["scenario_ids"] = []
+    query_spec["membership_storage"] = new_storage
+    parents = [str(t) for t in row.get("parent_transform_ids") or ()]
+    if migration_transform_id not in parents:
+        parents.append(migration_transform_id)
+    header = {
+        "view_id": view_id,
+        "name": str(row.get("name") or ""),
+        "owner": str(row.get("owner") or ""),
+        "tags": [str(t) for t in row.get("tags") or ()],
+        "description": str(row.get("description") or ""),
+        "source_kind": str(row.get("source_kind") or ""),
+        "scope": str(row.get("scope") or ""),
+        "query_spec": json.dumps(query_spec, sort_keys=True),
+        "scenario_ids": [],
+        "table_versions": [
+            {
+                "table": str(item["table"]),
+                "version": int(item["version"]),
+                "tag": str(item.get("tag") or ""),
+            }
+            for item in row.get("table_versions") or ()
+        ],
+        "parent_transform_ids": parents,
+        "status": str(row.get("status") or "active"),
+        "created_by": str(row.get("created_by") or "lancedb-robotics"),
+        "transform_id": str(row.get("transform_id") or ""),
+        "created_at": row.get("created_at") or datetime.now(UTC),
+    }
+    # Single-commit atomic replace of the existing live header. A delete-then-add
+    # here would, on a crash or a losing concurrent writer between the two
+    # commits, permanently drop a live view's header (identity + pins + lineage);
+    # merge_insert keyed on view_id updates the row in one commit (SKILLS.md BUG-04).
+    _merge_insert_view_rows_with_retry(
+        lake.table("curation_views"),
+        "view_id",
+        pa.Table.from_pylist([header], schema=CURATION_VIEWS_SCHEMA),
+        update_matched=True,
+    )
+
+
+def compact_view_membership(
+    lake: Lake,
+    *,
+    include_superseded: bool = False,
+    dry_run: bool = False,
+    created_by: str = "lancedb-robotics",
+) -> ViewMembershipCompactionReport:
+    """Reclaim orphaned (and opt-in superseded) chunk rows.
+
+    Orphans -- chunk rows whose ``view_id`` has no live header -- are always
+    eligible. Superseded rows -- chunks for a non-latest revision of a still-live
+    view name -- are eligible only when ``include_superseded`` is set. Chunks for
+    any snapshot-referenced view are always retained. Deletion is bounded (the
+    ``view_id IN (...)`` predicate is chunked) and creates a new version; historical
+    snapshot pins remain readable at their pinned versions.
+    """
+    # Header ids + newest-created_at-per-name (bounded scalar projection). A view
+    # is "superseded" only if it is STRICTLY older than the newest created_at for
+    # its name -- ties (and views with no created_at) are retained, so a weak
+    # microsecond-timestamp signal never gates a destructive delete.
+    header_ids: set[str] = set()
+    view_created: dict[str, Any] = {}
+    view_name_of: dict[str, str] = {}
+    max_created_by_name: dict[str, Any] = {}
+    for row in _iter_view_table_rows(
+        lake, "curation_views", columns=["view_id", "name", "created_at"]
+    ):
+        view_id = str(row.get("view_id") or "")
+        if not view_id:
+            continue
+        header_ids.add(view_id)
+        name = str(row.get("name") or "")
+        created = row.get("created_at")
+        view_created[view_id] = created
+        view_name_of[view_id] = name
+        current_max = max_created_by_name.get(name)
+        if created is not None and (current_max is None or created > current_max):
+            max_created_by_name[name] = created
+    superseded_header_ids = {
+        view_id
+        for view_id in header_ids
+        if view_created.get(view_id) is not None
+        and max_created_by_name.get(view_name_of.get(view_id, "")) is not None
+        and view_created[view_id] < max_created_by_name[view_name_of[view_id]]
+    }
+
+    # Chunk row counts per view_id (project only view_id -- never the id lists).
+    chunk_counts: dict[str, int] = {}
+    for row in _iter_view_table_rows(
+        lake, _VIEW_MEMBERSHIP_CHUNK_TABLE, columns=["view_id"]
+    ):
+        view_id = str(row.get("view_id") or "")
+        if view_id:
+            chunk_counts[view_id] = chunk_counts.get(view_id, 0) + 1
+
+    protected = _snapshot_referenced_view_ids(lake)
+
+    orphan_ids = sorted(
+        v for v in chunk_counts if v not in header_ids and v not in protected
+    )
+    superseded_ids = sorted(
+        v
+        for v in chunk_counts
+        if v in superseded_header_ids and v not in protected
+    ) if include_superseded else []
+    retained = sorted(
+        v for v in chunk_counts
+        if v in protected and (v not in header_ids or v in superseded_header_ids)
+    )
+
+    orphan_removed = sum(chunk_counts[v] for v in orphan_ids)
+    superseded_removed = sum(chunk_counts[v] for v in superseded_ids)
+
+    if not dry_run:
+        to_delete = list(orphan_ids) + list(superseded_ids)
+        if to_delete:
+            chunk_table = lake.table(_VIEW_MEMBERSHIP_CHUNK_TABLE)
+            for predicate in _view_id_delete_predicate_batches(to_delete):
+                chunk_table.delete(predicate)
+
+    return ViewMembershipCompactionReport(
+        lake_uri=lake.uri,
+        dry_run=dry_run,
+        include_superseded=include_superseded,
+        orphan_view_ids=tuple(orphan_ids),
+        orphan_chunks_removed=orphan_removed,
+        superseded_view_ids=tuple(superseded_ids),
+        superseded_chunks_removed=superseded_removed,
+        retained_snapshot_pinned_view_ids=tuple(retained),
+    )
 
 
 def _membership_rows(
@@ -10564,7 +12963,12 @@ def _writeback_row_from_outcome(
     return row
 
 
-def _view_from_row(row: dict[str, Any], *, lake: Lake | None = None) -> CurationView:
+def _view_from_row(
+    row: dict[str, Any],
+    *,
+    lake: Lake | None = None,
+    chunk_version: int | None = None,
+) -> CurationView:
     storage = _view_membership_storage_from_row(row)
     inline_ids = tuple(str(item) for item in row["scenario_ids"] or ())
     scenario_ids = inline_ids
@@ -10572,7 +12976,12 @@ def _view_from_row(row: dict[str, Any], *, lake: Lake | None = None) -> Curation
         if lake is None:
             scenario_ids = ()
         else:
-            scenario_ids = _scenario_ids_from_view_chunks(lake, str(row["view_id"]))
+            # `chunk_version` is set only on the as-of replay path (0143), so a
+            # chunked view resolves to its snapshot-pinned membership; live
+            # callers pass None and read the current chunk rows unchanged.
+            scenario_ids = _scenario_ids_from_view_chunks(
+                lake, str(row["view_id"]), version=chunk_version
+            )
         expected = int(storage.get("scenario_count") or 0)
         if expected and len(scenario_ids) != expected:
             raise CurationError(
@@ -10699,37 +13108,120 @@ def _compile_curation_row_plan(
             if row.get("transform_id")
         )
     )
-    selected, rejected, conflicts, label_intents = _resolve_row_plan_membership(
-        candidate_rows,
-        latest_by_target=latest_by_target,
-        target_grain=normalized_grain,
-        include_decisions=normalized_includes,
-        excluding_decisions=normalized_excludes,
-    )
-    if not selected:
+    # Pass 1: resolve membership to learn the plan's identity (streaming target-id
+    # digest + exact count) and its bounded diagnostics, without holding the
+    # selected id list unless the plan is small enough to materialize. The
+    # resolver is pure over (candidates, latest_by_target), so pass 2 below
+    # replays it deterministically with no further table reads (backlog 0146).
+    diagnostics = _RowPlanDiagnostics()
+
+    def _resolve() -> Iterator[dict[str, Any]]:
+        return _iter_row_plan_membership(
+            candidate_rows,
+            latest_by_target=latest_by_target,
+            target_grain=normalized_grain,
+            include_decisions=normalized_includes,
+            excluding_decisions=normalized_excludes,
+            diagnostics=diagnostics,
+        )
+
+    materialize_limit = _row_plan_catalog.MATERIALIZE_SOFT_LIMIT
+    ids_digest = _row_plan_catalog.TargetIdsDigest()
+    inline_target_ids: list[str] = []
+    inline_row_ids: list[int | None] = []
+    selected_rows_sample: list[dict[str, Any]] = []
+    scenario_id_order: dict[str, None] = {}
+    saw_lance_row_id = False
+    for item in _resolve():
+        target_id = str(item["target_id"])
+        ids_digest.update(target_id)
+        if item.get("row_id") is not None:
+            saw_lance_row_id = True
+        for scenario_id in item.get("scenario_ids", ()):
+            if scenario_id:
+                scenario_id_order.setdefault(scenario_id, None)
+        if ids_digest.count <= materialize_limit:
+            inline_target_ids.append(target_id)
+            inline_row_ids.append(item.get("row_id"))
+        if len(selected_rows_sample) < diagnostics.sample_limit:
+            selected_rows_sample.append(
+                {
+                    "target_id": target_id,
+                    "scenario_id": str(item.get("scenario_id") or ""),
+                    "scenario_ids": list(item.get("scenario_ids") or ()),
+                    "lance_row_id": item.get("row_id"),
+                    "table": _row_plan_target_table(normalized_grain),
+                    "decision": item.get("decision") or "",
+                    "scenario_decision": item.get("scenario_decision") or "",
+                    "resolution": item.get("resolution") or "included",
+                }
+            )
+    target_count = ids_digest.count
+    if not target_count:
         raise CurationError(
             f"membership decisions removed every {normalized_grain} row from the plan"
         )
-    selected_target_ids = tuple(str(item["target_id"]) for item in selected)
-    selected_scenario_ids = tuple(
-        dict.fromkeys(
-            scenario_id
-            for item in selected
-            for scenario_id in item.get("scenario_ids", ())
-            if scenario_id
-        )
-    )
+    materialized = target_count <= materialize_limit
+    selected_target_ids = tuple(inline_target_ids) if materialized else ()
+    selected_lance_row_ids = tuple(inline_row_ids) if materialized else ()
+    selected_scenario_ids = tuple(scenario_id_order)
+    rejected = diagnostics.rejected
+    conflicts = diagnostics.conflicts
+    label_intents = diagnostics.label_intents
     table_versions = _row_plan_table_versions(selection.lake, normalized_grain)
-    supersession_chains = [
+    # Membership-side diagnostics scale with the number of row-grain decisions on
+    # the branch, which is just as unbounded as the target count. Sample them with
+    # exact counts alongside so the compile report stays a fixed size.
+    ordered_latest = sorted(latest_by_target.values(), key=_membership_sort_key)
+    superseding_rows = [row for row in ordered_latest if row.get("supersedes_membership_id")]
+    supersession_chain_count = len(superseding_rows)
+    # Walk chains for the SAMPLE only, against an index built once. Building the
+    # index per chain is O(memberships) per call -- quadratic in the branch's
+    # decision count (BUG-01) -- and walking every chain would be unbounded work
+    # thrown away by the sampling below.
+    chain_rows, supersession_chains_truncated = _row_plan_catalog.sample(
+        superseding_rows, limit=diagnostics.sample_limit
+    )
+    # Index built once, and only when there is a chain to walk at all.
+    membership_index = _supersession_index(membership_rows) if chain_rows else {}
+    supersession_chain_sample = [
         {
             "target_grain": str(row.get("target_grain") or ""),
             "target_id": str(row.get("target_id") or ""),
             "latest_membership_id": str(row.get("membership_id") or ""),
-            "chain": _supersession_chain(membership_rows, row),
+            "chain": _supersession_chain_indexed(
+                membership_index,
+                row,
+                max_depth=_ROW_PLAN_MAX_CHAIN_DEPTH,
+            ),
         }
-        for row in sorted(latest_by_target.values(), key=_membership_sort_key)
-        if row.get("supersedes_membership_id")
+        for row in chain_rows
     ]
+    latest_membership_ids = [
+        str(row.get("membership_id") or "")
+        for row in ordered_latest
+        if row.get("membership_id")
+    ]
+    latest_membership_id_count = len(latest_membership_ids)
+    latest_membership_id_sample, latest_membership_ids_truncated = _row_plan_catalog.sample(
+        latest_membership_ids, limit=diagnostics.sample_limit
+    )
+    ordered_superseded_ids = sorted(superseded_ids)
+    # Both the identity payload and the frozen artifact metadata carry this digest.
+    membership_transform_ids_digest = _row_plan_catalog.target_ids_digest(
+        membership_transform_ids
+    )
+    superseded_membership_id_sample, superseded_membership_ids_truncated = (
+        _row_plan_catalog.sample(ordered_superseded_ids, limit=diagnostics.sample_limit)
+    )
+    # One entry per distinct transform that wrote a row-grain decision, i.e. it
+    # grows with the number of review batches on the branch. Same treatment as the
+    # superseded-id set: count + digest for identity, capped sample for reporting.
+    membership_transform_id_sample, membership_transform_ids_truncated = (
+        _row_plan_catalog.sample(
+            list(membership_transform_ids), limit=diagnostics.sample_limit
+        )
+    )
     base_policy = (
         "row-include-decisions"
         if any(
@@ -10743,33 +13235,53 @@ def _compile_curation_row_plan(
         {"table": table, "version": version, "tag": ""}
         for table, version in table_versions
     ]
+    target_table = _row_plan_target_table(normalized_grain)
+    # Resolved once: each call scans the whole ``dataset_snapshots`` table
+    # unprojected (``_latest_snapshot_row``), and the value is needed in three
+    # places below (report, lineage fan-in, plan header).
+    source_snapshot_transform_id = _source_snapshot_transform_id(
+        selection.lake, source_snapshot_name
+    )
+    # v2 carries the streaming ``target_ids_digest`` + ``target_count`` where v1
+    # embedded the whole ordered id list. Same content, same content-addressing --
+    # but the plan's identity is now computable at O(1) memory, which is the whole
+    # point of a multi-million-target plan (backlog 0146).
     plan_payload = {
-        "schema_version": "lancedb-robotics/curation-row-plan/v1",
+        "schema_version": "lancedb-robotics/curation-row-plan/v2",
         "lake_uri": selection.lake.uri,
         "view_id": view.view_id,
         "target_grain": normalized_grain,
         "source_snapshot_name": source_snapshot_name or "",
         "base_policy": base_policy,
         "table_versions": read_versions,
-        "target_ids": list(selected_target_ids),
-        "membership_transform_ids": list(membership_transform_ids),
-        "superseded_membership_ids": sorted(superseded_ids),
+        "target_count": target_count,
+        "target_ids_digest": ids_digest.hexdigest(),
+        # The *physical* chunk width is part of the plan's identity. Without it,
+        # recompiling after retuning the width reuses the same plan_id, and the
+        # insert-only chunk write leaves both chunkings coexisting -- a plan whose
+        # ordinals no longer line up and can never be read again.
+        "chunk_size": _row_plan_catalog.CHUNK_SIZE,
+        "inline_target_limit": _row_plan_catalog.INLINE_TARGET_LIMIT,
+        # Folded to digests for the same reason as the target ids: both sets grow
+        # with the branch's decision history (one entry per review batch for the
+        # transform ids), and the plan's identity must be computable -- and
+        # serializable -- without holding them.
+        "membership_transform_count": len(membership_transform_ids),
+        "membership_transform_ids_digest": membership_transform_ids_digest,
+        "superseded_membership_count": len(superseded_ids),
+        "superseded_membership_ids_digest": _row_plan_catalog.target_ids_digest(
+            ordered_superseded_ids
+        ),
     }
     plan_id = "curation-rowplan-" + _digest(plan_payload)
+    plan_digest = _digest({**plan_payload, "plan_id": plan_id})
     artifact_id = f"lancedb-robotics:curation-row-plan:{plan_id}" if freeze else ""
-    selected_rows = [
-        {
-            "target_id": str(item["target_id"]),
-            "scenario_id": str(item.get("scenario_id") or ""),
-            "scenario_ids": list(item.get("scenario_ids") or ()),
-            "lance_row_id": item.get("row_id"),
-            "table": _row_plan_target_table(normalized_grain),
-            "decision": item.get("decision") or "",
-            "scenario_decision": item.get("scenario_decision") or "",
-            "resolution": item.get("resolution") or "included",
-        }
-        for item in selected
-    ]
+    storage = _row_plan_catalog.storage_payload(
+        plan_id=plan_id,
+        target_count=target_count,
+        target_ids_digest=ids_digest.hexdigest(),
+    )
+    chunked = storage["kind"] == "chunked"
     report = {
         **plan_payload,
         "operation": "compile-row-plan",
@@ -10777,51 +13289,81 @@ def _compile_curation_row_plan(
         "artifact_id": artifact_id,
         "frozen": bool(freeze),
         "view": _view_report(view),
-        "target_table": _row_plan_target_table(normalized_grain),
+        "target_table": target_table,
         "source_snapshot_name": source_snapshot_name or "",
         "include_decisions": list(normalized_includes),
         "excluding_decisions": list(normalized_excludes),
         "conflict_policy": "scenario-exclude-unless-later-row-include",
-        "candidate_count": len(candidate_rows),
-        "selected_count": len(selected),
-        "rejected_count": len(rejected),
-        "selected_rows": selected_rows,
-        "selected_target_ids": list(selected_target_ids),
+        "candidate_count": diagnostics.candidate_count,
+        "selected_count": target_count,
+        "rejected_count": diagnostics.rejected_count,
+        "conflict_count": diagnostics.conflict_count,
+        "label_intent_count": diagnostics.label_intent_count,
+        # Bounded samples only -- this report is serialized into
+        # ``transform_runs.params`` and must not grow with the target count.
+        "selected_rows": selected_rows_sample,
+        "selected_rows_truncated": target_count > len(selected_rows_sample),
+        # The ids ride in the report only while the plan is small enough for the
+        # compact inline shape. Above that they live in the chunk table, and
+        # copying them here would put an O(plan) list into ``transform_runs.params``
+        # -- the oversized-cell shape this task exists to remove.
+        "selected_target_ids": list(selected_target_ids) if not chunked else [],
         "selected_scenario_ids": list(selected_scenario_ids),
-        "lance_row_ids": [item.get("row_id") for item in selected],
+        "lance_row_ids": list(selected_lance_row_ids) if not chunked else [],
+        "targets_materialized": materialized,
+        "targets_storage": storage,
         "rejected": rejected,
+        "rejected_truncated": diagnostics.rejected_truncated,
         "conflicts": conflicts,
+        "conflicts_truncated": diagnostics.conflicts_truncated,
         "label_intents": label_intents,
-        "latest_membership_ids": [
-            str(row.get("membership_id") or "")
-            for row in sorted(latest_by_target.values(), key=_membership_sort_key)
-            if row.get("membership_id")
-        ],
-        "superseded_membership_ids": sorted(superseded_ids),
-        "supersession_chains": supersession_chains,
-        "membership_transform_ids": list(membership_transform_ids),
+        "label_intents_truncated": diagnostics.label_intents_truncated,
+        "reject_reason_counts": dict(sorted(diagnostics.reject_reasons.items())),
+        "resolution_counts": dict(sorted(diagnostics.resolutions.items())),
+        "sample_limit": diagnostics.sample_limit,
+        # Membership diagnostics grow with the number of row-grain *decisions*, not
+        # the target count, but that is just as unbounded on a mature branch -- so
+        # they are sampled with exact counts alongside.
+        "latest_membership_ids": latest_membership_id_sample,
+        "latest_membership_ids_truncated": latest_membership_ids_truncated,
+        "latest_membership_id_count": latest_membership_id_count,
+        "superseded_membership_ids": superseded_membership_id_sample,
+        "superseded_membership_ids_truncated": superseded_membership_ids_truncated,
+        "superseded_membership_id_count": len(superseded_ids),
+        "supersession_chains": supersession_chain_sample,
+        "supersession_chains_truncated": supersession_chains_truncated,
+        "supersession_chain_count": supersession_chain_count,
+        "membership_transform_ids": membership_transform_id_sample,
+        "membership_transform_ids_truncated": membership_transform_ids_truncated,
+        "membership_transform_count": len(membership_transform_ids),
         "source_table_versions": read_versions,
         "source_view_transform_id": view.transform_id,
-        "source_snapshot_transform_id": _source_snapshot_transform_id(
-            selection.lake,
-            source_snapshot_name,
-        ),
+        "source_snapshot_transform_id": source_snapshot_transform_id,
         "payload_copy_policy": "logical-reference",
         "copied_payload_bytes": 0,
         "metadata_only": True,
-        "input_count": len(candidate_rows),
-        "output_count": len(selected),
+        "input_count": diagnostics.candidate_count,
+        "output_count": target_count,
     }
+    # Lineage fan-in is capped for the same reason the report is: one edge per
+    # membership transform per compile means a branch with thousands of review
+    # batches emits thousands of edges on every recompile. The full set stays
+    # recoverable from the plan header's digest + the membership rows themselves.
     prior_transform_ids = tuple(
         dict.fromkeys(
             (
                 *selection.operation_transform_ids,
                 view.transform_id,
-                *membership_transform_ids,
-                _source_snapshot_transform_id(selection.lake, source_snapshot_name),
+                *membership_transform_id_sample,
+                source_snapshot_transform_id,
             )
         )
     )
+    output_tables = ["curation_row_plans"]
+    if chunked:
+        output_tables.append("curation_row_plan_chunks")
+    if freeze:
+        output_tables.append("lineage_artifacts")
     transform_id = _record_curation_transform(
         selection.lake,
         operation="compile-row-plan",
@@ -10830,32 +13372,171 @@ def _compile_curation_row_plan(
         report=report,
         prior_transform_ids=tuple(item for item in prior_transform_ids if item),
         created_by=created_by,
-        output_tables=("lineage_artifacts",) if freeze else (),
+        output_tables=tuple(output_tables),
     )
     report = {**report, "transform_id": transform_id}
+    # Pass 2: stream the same selected sequence into bounded chunk commits. Written
+    # *before* the header so a crash leaves unreferenced chunks (which the next
+    # identical compile converges onto, and which ``curate compact-row-plans``
+    # reclaims) rather than a header promising rows that were never persisted.
+    if chunked:
+        # Pass 1 already produced every diagnostic; pass 2 only needs the same
+        # *selection*. ``sample_limit=0`` keeps the counters (cheap, and the
+        # post-write count/digest check compares against them) without building a
+        # single sample payload that would be thrown away.
+        replay_diagnostics = _RowPlanDiagnostics(sample_limit=0)
+        written = _row_plan_catalog.write_row_plan_chunks(
+            selection.lake,
+            plan_id,
+            (
+                (str(item["target_id"]), item.get("row_id"))
+                for item in _iter_row_plan_membership(
+                    candidate_rows,
+                    latest_by_target=latest_by_target,
+                    target_grain=normalized_grain,
+                    include_decisions=normalized_includes,
+                    excluding_decisions=normalized_excludes,
+                    diagnostics=replay_diagnostics,
+                )
+            ),
+            created_by=created_by,
+            transform_id=transform_id,
+        )
+        if (
+            written["target_count"] != target_count
+            or written["target_ids_digest"] != ids_digest.hexdigest()
+        ):
+            raise CurationError(
+                f"row plan {plan_id!r} chunk write disagreed with the compiled plan: "
+                f"wrote {written['target_count']} targets "
+                f"(digest {written['target_ids_digest']}), expected {target_count} "
+                f"(digest {ids_digest.hexdigest()})"
+            )
+        # Read the persisted chunks back before publishing the header. Publishing
+        # a header that promises rows the chunk table does not actually hold
+        # (contiguously, at the expected width) would report success on a plan that
+        # can never be read -- the failure mode BUG-04 is about.
+        persisted = _row_plan_catalog.persisted_chunk_shape(selection.lake, plan_id)
+        if persisted != (written["chunk_count"], target_count):
+            raise CurationError(
+                f"row plan {plan_id!r} chunk storage did not persist as written: "
+                f"found {persisted[0]} chunks / {persisted[1]} targets, expected "
+                f"{written['chunk_count']} chunks / {target_count} targets. The "
+                "header was not published; rerun the compile (chunk rows are "
+                "content-addressed, so a retry converges)."
+            )
+        storage = written
+    summary = {
+        "schema_version": _row_plan_catalog.ROW_PLAN_CATALOG_SCHEMA_VERSION,
+        **diagnostics.to_summary(),
+        "selected_rows": selected_rows_sample,
+        "selected_rows_truncated": target_count > len(selected_rows_sample),
+        "include_decisions": list(normalized_includes),
+        "excluding_decisions": list(normalized_excludes),
+        "supersession_chains": supersession_chain_sample,
+        "supersession_chains_truncated": supersession_chains_truncated,
+        "supersession_chain_count": supersession_chain_count,
+        "max_chain_depth": _ROW_PLAN_MAX_CHAIN_DEPTH,
+        "storage": storage,
+    }
+    if materialized and not chunked:
+        # Inline plans keep their ids on the header so the compact-handle read path
+        # needs no chunk table at all. Bounded by ``INLINE_TARGET_LIMIT``.
+        summary["target_ids"] = list(selected_target_ids)
+        summary["lance_row_ids"] = list(selected_lance_row_ids)
+    _row_plan_catalog.publish_row_plan(
+        selection.lake,
+        _row_plan_catalog.plan_header_row(
+            plan_id=plan_id,
+            view_id=view.view_id,
+            view_name=view.name,
+            target_grain=normalized_grain,
+            target_table=target_table,
+            source_snapshot_name=source_snapshot_name or "",
+            base_policy=base_policy,
+            conflict_policy="scenario-exclude-unless-later-row-include",
+            storage=storage,
+            counts={
+                "candidate_count": diagnostics.candidate_count,
+                "selected_count": target_count,
+                "rejected_count": diagnostics.rejected_count,
+                "conflict_count": diagnostics.conflict_count,
+                "label_intent_count": diagnostics.label_intent_count,
+                "scenario_count": len(selected_scenario_ids),
+                "membership_transform_count": len(membership_transform_ids),
+                "superseded_membership_count": len(superseded_ids),
+                # Reflects what the scan actually resolved: a backend that cannot
+                # attach row ids yields a plan whose consumers use target ids.
+                "lance_row_ids_present": saw_lance_row_id,
+            },
+            plan_digest=plan_digest,
+            artifact_id=artifact_id,
+            frozen=bool(freeze),
+            transform_id=transform_id,
+            source_view_transform_id=view.transform_id,
+            source_snapshot_transform_id=source_snapshot_transform_id,
+            table_versions=table_versions,
+            summary=summary,
+            created_by=created_by,
+            # Pin the target table's fragment set, so a reader can tell a plan whose
+            # row ids were remapped by compaction from one that merely predates an
+            # append (an append extends the fragment set; compaction rewrites it).
+            target_fragment_ids=_row_plan_catalog.current_fragment_ids(
+                selection.lake, target_table
+            ),
+        ),
+    )
+    _build_row_plan_indexes(selection.lake)
     if freeze:
+        # The compact lineage row stays the canonical handle. Below the inline
+        # threshold it keeps the ids exactly as 0084 wrote them; above it, it
+        # carries a *pointer* to chunked storage instead of an unbounded cell.
+        artifact_metadata: dict[str, Any] = {
+            "view_id": view.view_id,
+            "view_name": view.name,
+            "target_grain": normalized_grain,
+            "source_snapshot_name": source_snapshot_name or "",
+            # Capped sample + count + digest: this list grows with the number of
+            # review batches on the branch, and the artifact metadata cell must not
+            # grow with it any more than the ``row_ids`` cell does.
+            "membership_transform_ids": list(membership_transform_id_sample),
+            "membership_transform_ids_truncated": membership_transform_ids_truncated,
+            "membership_transform_count": len(membership_transform_ids),
+            "membership_transform_ids_digest": membership_transform_ids_digest,
+            "selected_count": target_count,
+            "copied_payload_bytes": 0,
+            "payload_copy_policy": "logical-reference",
+            "row_plan_id": plan_id,
+            "row_plan_catalog_table": "curation_row_plans",
+            "row_plan_storage": storage["kind"],
+            "row_plan_target_count": target_count,
+            "row_plan_target_ids_digest": ids_digest.hexdigest(),
+        }
+        if chunked:
+            artifact_metadata.update(
+                {
+                    "row_plan_chunk_table": storage["table"],
+                    "row_plan_chunk_count": storage["chunk_count"],
+                    "row_plan_chunk_size": storage["chunk_size"],
+                    "row_plan_chunk_order": storage["order"],
+                    "row_ids_inline": False,
+                }
+            )
+        else:
+            artifact_metadata["row_ids_inline"] = True
         selection.lake.lineage.record_artifact(
             kind="curation-row-plan",
             artifact_id=artifact_id,
             name=plan_id,
-            table_name=_row_plan_target_table(normalized_grain),
-            table_version=_version_for_table(table_versions, _row_plan_target_table(normalized_grain)),
+            table_name=target_table,
+            table_version=_version_for_table(table_versions, target_table),
             row_grain=normalized_grain,
-            row_ids=selected_target_ids,
+            row_ids=() if chunked else selected_target_ids,
             source_uri=f"{selection.lake.uri}#curation-row-plan/{plan_id}",
             source_id=source_snapshot_name or view.view_id,
-            digest=_digest({**plan_payload, "plan_id": plan_id}),
+            digest=plan_digest,
             producer_execution_id=transform_id,
-            metadata={
-                "view_id": view.view_id,
-                "view_name": view.name,
-                "target_grain": normalized_grain,
-                "source_snapshot_name": source_snapshot_name or "",
-                "membership_transform_ids": list(membership_transform_ids),
-                "selected_count": len(selected),
-                "copied_payload_bytes": 0,
-                "payload_copy_policy": "logical-reference",
-            },
+            metadata=artifact_metadata,
         )
     return CurationCompiledRowPlan(
         plan_id=plan_id,
@@ -10863,14 +13544,32 @@ def _compile_curation_row_plan(
         view=view,
         target_ids=selected_target_ids,
         scenario_ids=selected_scenario_ids,
-        lance_row_ids=tuple(item.get("row_id") for item in selected),
+        lance_row_ids=selected_lance_row_ids,
         table_versions=table_versions,
         membership_transform_ids=membership_transform_ids,
         transform_id=transform_id,
         report=report,
         artifact_id=artifact_id,
         frozen=bool(freeze),
+        storage=storage,
+        lake=selection.lake,
     )
+
+
+def _build_row_plan_indexes(lake: Lake) -> None:
+    """Best-effort predicate indexes for the row-plan catalog after a write.
+
+    Index coverage does not auto-extend to new fragments (BUG-15), and the chunk
+    table's ``(plan_id, start_ordinal)`` BTREE is what keeps a deep target page
+    from degenerating into a chunk-table scan. Failures are non-fatal: predicate
+    pushdown still applies, and ``lake maintain`` builds the same indexes.
+    """
+    try:
+        from lancedb_robotics.indexing import build_curation_row_plan_predicate_indexes
+
+        build_curation_row_plan_predicate_indexes(lake)
+    except Exception:  # noqa: BLE001 - indexing is an optimization, never a gate.
+        return
 
 
 def _row_plan_view(
@@ -10989,28 +13688,31 @@ def _observation_row_plan_candidates(
                 (scenario_order.get(scenario_id, 10**9), ordinal, obs_id),
             )
     candidates: list[dict[str, Any]] = []
-    rows = _table_rows_with_row_id(lake, "observations")
-    rows_by_id = {str(row["observation_id"]): row for row in rows}
-    for observation_id, scenario_id in observation_to_scenario.items():
-        row = rows_by_id.get(observation_id)
-        if row is None:
-            continue
-        candidates.append(
-            _row_plan_candidate(
-                "observation",
-                "observations",
-                row,
-                target_id=observation_id,
-                scenario_ids=(scenario_id,),
-                sort_key=observation_order[observation_id],
-            )
-        )
+    columns = _ROW_PLAN_CANDIDATE_COLUMNS["observations"]
     if observation_to_scenario:
+        # Scenario-referenced path: stream once and keep only the referenced
+        # observations, rather than building a whole-table id index first
+        # (SKILLS.md §2 "scope to what's referenced, not the whole grain").
+        for row in _stream_rows_with_row_id(lake, "observations", columns):
+            observation_id = str(row.get("observation_id") or "")
+            scenario_id = observation_to_scenario.get(observation_id)
+            if scenario_id is None:
+                continue
+            candidates.append(
+                _row_plan_candidate(
+                    "observation",
+                    "observations",
+                    row,
+                    target_id=observation_id,
+                    scenario_ids=(scenario_id,),
+                    sort_key=observation_order[observation_id],
+                )
+            )
         return sorted(candidates, key=lambda item: item["sort_key"])
     known = set(observation_to_scenario)
     scenario_set = set(scenario_ids)
     scenario_windows = list(scenario_rows.values())
-    for row in rows:
+    for row in _stream_rows_with_row_id(lake, "observations", columns):
         observation_id = str(row.get("observation_id") or "")
         if not observation_id or observation_id in known:
             continue
@@ -11048,7 +13750,7 @@ def _episode_row_plan_candidates(
     scenario_rows = _selected_rows(lake, scenario_ids)
     scenario_set = set(scenario_ids)
     candidates = []
-    for row in _table_rows_with_row_id(lake, "episodes"):
+    for row in _stream_rows_with_row_id(lake, "episodes", _ROW_PLAN_CANDIDATE_COLUMNS["episodes"]):
         episode_id = str(row.get("episode_id") or "")
         scenario_id = _scenario_for_window(
             scenario_rows,
@@ -11083,7 +13785,9 @@ def _aligned_frame_row_plan_candidates(
     scenario_rows = _selected_rows(lake, scenario_ids)
     scenario_set = set(scenario_ids)
     candidates = []
-    for row in _table_rows_with_row_id(lake, "aligned_frames"):
+    for row in _stream_rows_with_row_id(
+        lake, "aligned_frames", _ROW_PLAN_CANDIDATE_COLUMNS["aligned_frames"]
+    ):
         aligned_frame_id = str(row.get("aligned_frame_id") or "")
         timestamp_ns = int(row.get("timestamp_ns") or row.get("source_time_ns") or 0)
         scenario_id = _scenario_for_window(
@@ -11120,7 +13824,9 @@ def _snapshot_row_plan_candidates(
 ) -> list[dict[str, Any]]:
     scenario_set = set(scenario_ids)
     candidates = []
-    for row in _table_rows_with_row_id(lake, "dataset_snapshots"):
+    for row in _stream_rows_with_row_id(
+        lake, "dataset_snapshots", _ROW_PLAN_CANDIDATE_COLUMNS["dataset_snapshots"]
+    ):
         if source_snapshot_name and str(row.get("name") or "") != source_snapshot_name:
             continue
         snapshot_scenario_ids = _scenario_ids_from_snapshot_row(row)
@@ -11153,6 +13859,9 @@ def _row_plan_candidate(
     scenario_ids: Sequence[str],
     sort_key: tuple[Any, ...],
 ) -> dict[str, Any]:
+    # Deliberately does *not* keep ``row``: no consumer of a candidate reads the
+    # source row, and retaining it made candidate memory scale with row width
+    # rather than candidate count (backlog 0146).
     return {
         "target_grain": target_grain,
         "table": table,
@@ -11160,34 +13869,231 @@ def _row_plan_candidate(
         "scenario_id": str(next((item for item in scenario_ids if item), "")),
         "scenario_ids": tuple(str(item) for item in scenario_ids if str(item)),
         "row_id": row.get(_ROW_ID_COLUMN),
-        "row": row,
         "sort_key": sort_key,
     }
 
 
-def _table_rows_with_row_id(lake: Lake, table_name: str) -> list[dict[str, Any]]:
-    query = lake.table(table_name).search()
-    rows: list[dict[str, Any]] = []
-    for batch in query.with_row_id(True).to_batches(batch_size=4096):
-        for row in batch.to_pylist():
-            row_id = row.get(_ROW_ID_COLUMN)
-            rows.append(
-                {
-                    **row,
-                    _ROW_ID_COLUMN: int(row_id) if row_id is not None else None,
-                }
-            )
-    return rows
+def _stream_rows_with_row_id(
+    lake: Lake,
+    table_name: str,
+    columns: Sequence[str],
+) -> Iterator[dict[str, Any]]:
+    """Stream ``table_name`` rows projected to ``columns`` plus the Lance row id.
+
+    0084 read every candidate table with a bare ``search()`` -- no projection --
+    and accumulated whole rows (payload columns included) into one Python list,
+    then kept each full row inside its candidate dict. Nothing downstream of the
+    candidate builders ever read that row, so the projection here is the
+    load-bearing fix for reading a large grain table (SKILLS.md §2 / BUG-06):
+    candidate memory becomes O(candidates x few small fields) instead of
+    O(table x full row).
+    """
+    handle = lake.table(table_name)
+    available = set(handle.schema.names)
+    projected = [column for column in columns if column in available]
+    batches = None
+    try:
+        query = handle.search()
+        if projected:
+            query = query.select(projected)
+        batches = query.with_row_id(True).to_batches(batch_size=_ROW_PLAN_SCAN_BATCH)
+    except Exception:
+        batches = None
+    if batches is not None:
+        try:
+            for batch in batches:
+                for row in batch.to_pylist():
+                    yield _with_int_row_id(row)
+            return
+        except Exception:
+            pass
+    # A backend that cannot attach row ids still gets the *projection* -- dropping
+    # it here would reintroduce the whole-row read this function exists to avoid.
+    # Losing the row ids is an explicit, reported degradation: the plan records
+    # ``lance_row_ids_present=False`` and a consumer falls back to target ids.
+    try:
+        query = handle.search()
+        if projected:
+            query = query.select(projected)
+        fallback = query.to_batches(batch_size=_ROW_PLAN_SCAN_BATCH)
+    except Exception:
+        fallback = None
+    if fallback is not None:
+        warnings.warn(
+            f"row-plan candidate scan on {table_name!r} could not attach Lance row "
+            "ids; continuing with the same column projection and no row ids "
+            "(consumers fall back to target ids)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        try:
+            for batch in fallback:
+                for row in batch.to_pylist():
+                    yield _with_int_row_id(row)
+            return
+        except Exception:
+            pass
+    # A backend that can push neither a column projection nor row ids cannot serve
+    # a bounded row-plan compile: the only remaining read is every column of the
+    # whole grain table, which is exactly the cost this function exists to avoid.
+    # Per the repo's conformance invariant that is a typed error, not a silent
+    # degradation to the expensive path (SKILLS.md §1).
+    raise CurationError(
+        f"cannot compile a row plan over {table_name!r}: the resolved backend "
+        f"pushed neither a column projection ({', '.join(projected) or 'none'}) "
+        "nor Lance row ids, so the only available read is every column of the "
+        "whole table. Use a backend with projection pushdown, or narrow the "
+        "compile to a smaller source snapshot."
+    )
 
 
-def _resolve_row_plan_membership(
-    candidates: Sequence[dict[str, Any]],
+def _with_int_row_id(row: dict[str, Any]) -> dict[str, Any]:
+    row_id = row.get(_ROW_ID_COLUMN)
+    return {**row, _ROW_ID_COLUMN: int(row_id) if row_id is not None else None}
+
+
+class _RowPlanDiagnostics:
+    """Exact counts plus *bounded* diagnostic samples from a membership resolve.
+
+    0084 accumulated one entry per rejected candidate, conflict, and label intent
+    and embedded all three whole in the compile report -- which is then serialized
+    into ``transform_runs.params``. At millions of candidates that alone is an
+    oversized commit (BUG-02). Counts here are exact; the samples are capped and
+    flagged, so a reader is never handed an unbounded list nor silently shown a
+    partial one (backlog 0146).
+    """
+
+    def __init__(self, *, sample_limit: int | None = None) -> None:
+        # Read the tunable at call time, not as a frozen default argument.
+        # ``sample_limit=0`` means counts only -- no sample payload is ever built.
+        self.sample_limit = int(
+            _row_plan_catalog.SAMPLE_LIMIT if sample_limit is None else sample_limit
+        )
+        self.candidate_count = 0
+        self.selected_count = 0
+        self._rejected = _CappedSample(self.sample_limit, keyed=True)
+        self._conflicts = _CappedSample(self.sample_limit)
+        self._label_intents = _CappedSample(self.sample_limit)
+        self.reject_reasons: dict[str, int] = {}
+        self.resolutions: dict[str, int] = {}
+
+    # Exact counts and capped samples, named as the report reads them.
+    @property
+    def rejected(self) -> dict[str, dict[str, Any]]:
+        return self._rejected.entries
+
+    @property
+    def rejected_count(self) -> int:
+        return self._rejected.count
+
+    @property
+    def rejected_truncated(self) -> bool:
+        return self._rejected.truncated
+
+    @property
+    def conflicts(self) -> list[dict[str, Any]]:
+        return self._conflicts.entries
+
+    @property
+    def conflict_count(self) -> int:
+        return self._conflicts.count
+
+    @property
+    def conflicts_truncated(self) -> bool:
+        return self._conflicts.truncated
+
+    @property
+    def label_intents(self) -> list[dict[str, Any]]:
+        return self._label_intents.entries
+
+    @property
+    def label_intent_count(self) -> int:
+        return self._label_intents.count
+
+    @property
+    def label_intents_truncated(self) -> bool:
+        return self._label_intents.truncated
+
+    def add_rejected(
+        self, target_id: str, reason: str, build: Callable[[], dict[str, Any]]
+    ) -> None:
+        self.reject_reasons[reason] = self.reject_reasons.get(reason, 0) + 1
+        self._rejected.add(build, key=target_id)
+
+    def add_conflict(self, build: Callable[[], dict[str, Any]]) -> None:
+        self._conflicts.add(build)
+
+    def add_label_intent(self, build: Callable[[], dict[str, Any]]) -> None:
+        self._label_intents.add(build)
+
+    def add_selected(self, resolution: str) -> None:
+        self.selected_count += 1
+        self.resolutions[resolution] = self.resolutions.get(resolution, 0) + 1
+
+    def to_summary(self) -> dict[str, Any]:
+        return {
+            "candidate_count": self.candidate_count,
+            "selected_count": self.selected_count,
+            "rejected_count": self.rejected_count,
+            "conflict_count": self.conflict_count,
+            "label_intent_count": self.label_intent_count,
+            "sample_limit": self.sample_limit,
+            "rejected": self.rejected,
+            "rejected_truncated": self.rejected_truncated,
+            "conflicts": self.conflicts,
+            "conflicts_truncated": self.conflicts_truncated,
+            "label_intents": self.label_intents,
+            "label_intents_truncated": self.label_intents_truncated,
+            "reject_reason_counts": dict(sorted(self.reject_reasons.items())),
+            "resolution_counts": dict(sorted(self.resolutions.items())),
+        }
+
+
+class _CappedSample:
+    """An exact count plus a bounded sample of the things counted.
+
+    The payload is passed as a *builder* and invoked only while the sample is under
+    its cap. That matters on the row-plan compile path: a 10M-candidate plan with 9M
+    rejections would otherwise allocate 9M diagnostic dicts in order to keep 200.
+    """
+
+    __slots__ = ("limit", "count", "truncated", "entries", "_keyed")
+
+    def __init__(self, limit: int, *, keyed: bool = False) -> None:
+        self.limit = max(0, int(limit))
+        self.count = 0
+        self.truncated = False
+        self._keyed = keyed
+        self.entries: Any = {} if keyed else []
+
+    def add(self, build: Callable[[], Any], *, key: str = "") -> None:
+        self.count += 1
+        if self.limit and len(self.entries) < self.limit:
+            if self._keyed:
+                self.entries[key] = build()
+            else:
+                self.entries.append(build())
+        elif self.limit:
+            self.truncated = True
+
+
+def _iter_row_plan_membership(
+    candidates: Iterable[dict[str, Any]],
     *,
     latest_by_target: Mapping[tuple[str, str], dict[str, Any]],
     target_grain: str,
     include_decisions: Sequence[str],
     excluding_decisions: Sequence[str],
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    diagnostics: _RowPlanDiagnostics,
+) -> Iterator[dict[str, Any]]:
+    """Yield selected candidates one at a time, folding diagnostics as it goes.
+
+    Carries 0084's conflict semantics unchanged -- the include/exclude precedence,
+    the ``scenario-<v>-after-row-<v>`` tie-break, and the rejected-entry shape. This
+    is the single definition of those rules; what 0146 changed is only that the
+    selected set streams to the chunk writer instead of accumulating in a list, and
+    that the diagnostics are bounded.
+    """
     scenario_latest = {
         target_id: row
         for (grain, target_id), row in latest_by_target.items()
@@ -11202,11 +14108,8 @@ def _resolve_row_plan_membership(
         str(row.get("decision") or "") in include_decisions
         for row in row_latest.values()
     )
-    selected: list[dict[str, Any]] = []
-    rejected: dict[str, dict[str, Any]] = {}
-    conflicts: list[dict[str, Any]] = []
-    label_intents: list[dict[str, Any]] = []
     for candidate in candidates:
+        diagnostics.candidate_count += 1
         target_id = str(candidate["target_id"])
         scenario_id = str(candidate.get("scenario_id") or "")
         row_decision = row_latest.get(target_id)
@@ -11218,17 +14121,18 @@ def _resolve_row_plan_membership(
             include = False
             reason = f"scenario-{scenario_value}"
         if row_value in _ROW_PLAN_INTENT_DECISIONS:
-            label_intents.append(_row_plan_decision_summary(row_decision, candidate))
+            diagnostics.add_label_intent(
+                lambda d=row_decision, c=candidate: _row_plan_decision_summary(d, c)
+            )
         elif row_value in excluding_decisions:
             include = False
             reason = f"row-{row_value}"
             if scenario_value in excluding_decisions:
-                conflicts.append(
-                    _row_plan_conflict(
-                        candidate,
-                        scenario_decision=scenario_decision,
-                        row_decision=row_decision,
-                        resolution=reason,
+                diagnostics.add_conflict(
+                    lambda c=candidate, s=scenario_decision, r=row_decision, res=reason: (
+                        _row_plan_conflict(
+                            c, scenario_decision=s, row_decision=r, resolution=res
+                        )
                     )
                 )
         elif row_value in include_decisions:
@@ -11242,37 +14146,36 @@ def _resolve_row_plan_membership(
                 include = True
                 reason = f"row-{row_value}"
             if scenario_value in excluding_decisions:
-                conflicts.append(
-                    _row_plan_conflict(
-                        candidate,
-                        scenario_decision=scenario_decision,
-                        row_decision=row_decision,
-                        resolution=reason,
+                diagnostics.add_conflict(
+                    lambda c=candidate, s=scenario_decision, r=row_decision, res=reason: (
+                        _row_plan_conflict(
+                            c, scenario_decision=s, row_decision=r, resolution=res
+                        )
                     )
                 )
         if include:
-            selected.append(
-                {
-                    **candidate,
-                    "decision": row_value,
-                    "scenario_decision": scenario_value,
-                    "resolution": reason,
-                }
-            )
-        else:
-            rejected[target_id] = {
-                "target_grain": target_grain,
-                "scenario_id": scenario_id,
-                "scenario_ids": list(candidate.get("scenario_ids") or ()),
+            diagnostics.add_selected(reason)
+            yield {
+                **candidate,
                 "decision": row_value,
                 "scenario_decision": scenario_value,
-                "reason": reason,
-                "row_membership_id": str((row_decision or {}).get("membership_id") or ""),
-                "scenario_membership_id": str(
-                    (scenario_decision or {}).get("membership_id") or ""
-                ),
+                "resolution": reason,
             }
-    return selected, rejected, conflicts, label_intents
+        else:
+            diagnostics.add_rejected(
+                target_id,
+                reason,
+                lambda c=candidate, rv=row_value, sv=scenario_value, res=reason, rd=row_decision, sd=scenario_decision: {
+                    "target_grain": target_grain,
+                    "scenario_id": str(c.get("scenario_id") or ""),
+                    "scenario_ids": list(c.get("scenario_ids") or ()),
+                    "decision": rv,
+                    "scenario_decision": sv,
+                    "reason": res,
+                    "row_membership_id": str((rd or {}).get("membership_id") or ""),
+                    "scenario_membership_id": str((sd or {}).get("membership_id") or ""),
+                },
+            )
 
 
 def _initial_row_plan_membership(include_mode: bool) -> tuple[bool, str]:
@@ -11388,6 +14291,7 @@ def _resolve_membership(
     )
     view_version = context.table_versions.get("curation_views")
     membership_version = context.table_versions.get("curation_memberships")
+    chunk_version = context.table_versions.get("curation_view_membership_chunks")
     view_row = _view_row_for_replay(
         lake,
         view_name=view_name,
@@ -11412,7 +14316,11 @@ def _resolve_membership(
         row for row in scoped_rows if str(row["membership_id"]) not in latest_ids
     )
     history_rows = tuple(scoped_rows if policy == "history" else latest_rows)
-    view = _view_from_row(view_row, lake=lake) if view_row else None
+    view = (
+        _view_from_row(view_row, lake=lake, chunk_version=chunk_version)
+        if view_row
+        else None
+    )
     latest_decisions = tuple(_membership_audit_row(row) for row in latest_rows)
     membership_history = tuple(_membership_audit_row(row) for row in history_rows)
     superseded_decisions = tuple(_membership_audit_row(row) for row in superseded_rows)
@@ -11494,6 +14402,20 @@ def _trace_membership(
         transform_ids.add(str(row.get("transform_id") or ""))
     transforms = _transform_audit_rows(lake, transform_ids, as_of=context.as_of)
     chain = _supersession_chain(resolution.membership_history, scenario_latest)
+    # Replay-readiness hints (0143): whether the backend supports as-of curation
+    # replay and whether this snapshot's pinned curation versions are still
+    # protected/readable, so a reviewer sees the operational status before
+    # trusting the trace. Scoped to this snapshot; best-effort (never fails a
+    # trace). Lazy import avoids a module import cycle with curate.
+    replay_readiness: dict[str, Any] | None
+    try:
+        from lancedb_robotics.curation_replay_retention import curation_replay_readiness
+
+        replay_readiness = curation_replay_readiness(
+            lake, snapshot_name=str(snapshot_row["name"])
+        ).to_dict()
+    except Exception as exc:  # noqa: BLE001 - readiness is a diagnostic, not the trace.
+        replay_readiness = {"status": "failed", "reason": str(exc)}
     report = {
         "schema_version": "lancedb-robotics/curation-membership-trace/v1",
         "lake_uri": lake.uri,
@@ -11513,6 +14435,7 @@ def _trace_membership(
         "supersession_chain": chain,
         "transforms": transforms,
         "table_version_validation": context.validation,
+        "replay_readiness": replay_readiness,
     }
     return CurationMembershipTrace(
         snapshot_name=str(snapshot_row["name"]),
@@ -11666,7 +14589,10 @@ def _validate_replay_table_versions(lake: Lake, snapshot: dict[str, Any]) -> dic
             current_version = int(table.version)
         except Exception as exc:
             raise CurationError(
-                f"snapshot {snapshot['name']!r} pins missing table {table_name!r}"
+                f"snapshot {snapshot['name']!r} pins missing table {table_name!r}; "
+                "the table is gone from this backend -- replay from a backend that "
+                "owns the dataset, or treat the snapshot as non-replayable "
+                "(see `curate replay-readiness`)"
             ) from exc
         checked_out = False
         try:
@@ -11675,7 +14601,10 @@ def _validate_replay_table_versions(lake: Lake, snapshot: dict[str, Any]) -> dic
         except Exception as exc:
             raise CurationError(
                 f"snapshot {snapshot['name']!r} pins unreadable table version "
-                f"{table_name}@{pinned_version}"
+                f"{table_name}@{pinned_version}: the pinned version is no longer "
+                "on disk (pruned by a version cleanup) or unreadable on this "
+                "backend. Run `lake maintain` before cleanup to tag snapshot-pinned "
+                "versions, or check `curate replay-readiness` for the backend status"
             ) from exc
         finally:
             if checked_out:
@@ -11824,7 +14753,10 @@ def _view_report(view: CurationView | None) -> dict[str, Any] | None:
 
 
 def _replay_read_versions(lake: Lake, pinned_versions: Mapping[str, int]) -> list[dict[str, Any]]:
-    tables = ("curation_views", "curation_memberships")
+    # Report the chunk table too (0143): chunked saved-view replay reads its
+    # membership at the snapshot-pinned `curation_view_membership_chunks`
+    # version, so an audit envelope must record which version was read.
+    tables = ("curation_views", "curation_view_membership_chunks", "curation_memberships")
     rows = []
     for table_name in tables:
         version = pinned_versions.get(table_name)
@@ -11861,23 +14793,682 @@ def _final_membership_result(
     return decision or "exclude"
 
 
+# --- 0142: bounded paginated membership-history replay implementation -------
+
+
+def _normalize_membership_history_page_size(page_size: int | None) -> int:
+    try:
+        value = (
+            int(page_size)
+            if page_size is not None
+            else _MEMBERSHIP_HISTORY_DEFAULT_PAGE_SIZE
+        )
+    except (TypeError, ValueError) as exc:
+        raise CurationError("page_size must be an integer") from exc
+    if value <= 0:
+        raise CurationError("page_size must be positive")
+    return min(value, _MEMBERSHIP_HISTORY_MAX_PAGE_SIZE)
+
+
+def _encode_membership_history_cursor(created_at: Any, membership_id: str) -> str:
+    if isinstance(created_at, datetime):
+        created_repr = created_at.astimezone(UTC).isoformat()
+    else:
+        created_repr = str(created_at or "")
+    payload = {"created_at": created_repr, "membership_id": str(membership_id or "")}
+    return base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+
+
+def _decode_membership_history_cursor(cursor: str | None) -> tuple[datetime, str] | None:
+    if not cursor:
+        return None
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(str(cursor).encode("ascii")).decode("utf-8")
+        )
+        membership_id = str(payload["membership_id"])
+        created_at = _normalize_replay_datetime(payload.get("created_at"), "cursor.created_at")
+    except Exception as exc:  # noqa: BLE001 - opaque token, any decode error is invalid
+        raise CurationError("invalid curation membership history cursor") from exc
+    return (created_at or _MIN_REPLAY_DATETIME, membership_id)
+
+
+def _membership_history_key(row: Mapping[str, Any]) -> tuple[datetime, str]:
+    created_at = _normalize_replay_datetime(row.get("created_at"), "membership.created_at")
+    return (created_at or _MIN_REPLAY_DATETIME, str(row.get("membership_id") or ""))
+
+
+def _membership_history_scope(
+    *,
+    view_id: str | None,
+    target_grain: str,
+    target_ids: Sequence[str],
+    scenario_ids: Sequence[str],
+    sources: Sequence[str],
+    decisions: Sequence[str],
+    reviewers: Sequence[str],
+) -> tuple[str | None, Callable[[dict[str, Any]], bool]]:
+    """Build the pushed-down scope predicate and its Python fallback matcher.
+
+    Every clause is string equality / ``IN`` over an indexed
+    ``curation_memberships`` column (see
+    :data:`CURATION_MEMBERSHIP_PREDICATE_INDEX_COLUMNS`), so the scope narrows at the
+    storage layer and unrelated views/targets are never read. ``as_of`` and the
+    keyset cursor are applied by the caller (created_at stays Python-side -- the repo
+    never pushes timestamp literals into a SQL predicate).
+    """
+    target_set = {str(item) for item in target_ids if str(item)}
+    scenario_set = {str(item) for item in scenario_ids if str(item)}
+    source_set = {str(item) for item in sources if str(item)}
+    decision_set = {str(item) for item in decisions if str(item)}
+    reviewer_set = {str(item) for item in reviewers if str(item)}
+    clauses: list[str] = []
+    if view_id:
+        clauses.append(f"view_id = {_sql_literal(view_id)}")
+    if target_grain:
+        clauses.append(f"target_grain = {_sql_literal(target_grain)}")
+    if target_set:
+        clauses.append(_sql_in_predicate("target_id", sorted(target_set)))
+    if scenario_set:
+        scenario_clause = _sql_in_predicate("scenario_id", sorted(scenario_set))
+        target_clause = _sql_in_predicate("target_id", sorted(scenario_set))
+        clauses.append(
+            f"({scenario_clause} OR "
+            f"(target_grain = {_sql_literal('scenario')} AND {target_clause}))"
+        )
+    if source_set:
+        clauses.append(_sql_in_predicate("source", sorted(source_set)))
+    if decision_set:
+        clauses.append(_sql_in_predicate("decision", sorted(decision_set)))
+    if reviewer_set:
+        clauses.append(_sql_in_predicate("reviewer", sorted(reviewer_set)))
+    where_sql = " AND ".join(clauses) if clauses else None
+
+    def matches(row: dict[str, Any]) -> bool:
+        if view_id and str(row.get("view_id") or "") != view_id:
+            return False
+        if target_grain and str(row.get("target_grain") or "") != target_grain:
+            return False
+        if target_set and str(row.get("target_id") or "") not in target_set:
+            return False
+        if scenario_set and not _membership_row_matches_scenario(row, scenario_set):
+            return False
+        if source_set and str(row.get("source") or "") not in source_set:
+            return False
+        if decision_set and str(row.get("decision") or "") not in decision_set:
+            return False
+        if reviewer_set and str(row.get("reviewer") or "") not in reviewer_set:
+            return False
+        return True
+
+    return where_sql, matches
+
+
+class _MembershipHeapKey:
+    """Reversed-order key so a min-heap keeps the smallest ``page_size+1`` rows.
+
+    ``heapq`` is a min-heap; inverting the comparison makes ``heap[0]`` the current
+    *largest* real key, which is what a bounded top-k-smallest fallback must evict.
+    """
+
+    __slots__ = ("created_at", "membership_id")
+
+    def __init__(self, key: tuple[datetime, str]) -> None:
+        self.created_at, self.membership_id = key
+
+    def __lt__(self, other: "_MembershipHeapKey") -> bool:
+        return (self.created_at, self.membership_id) > (other.created_at, other.membership_id)
+
+
+def _read_membership_history_page(
+    lake: Lake,
+    *,
+    version: int | None,
+    where_sql: str | None,
+    matcher: Callable[[dict[str, Any]], bool],
+    as_of: datetime | None,
+    cursor_key: tuple[datetime, str] | None,
+    page_size: int,
+    stats: "_ComparisonExecutionStats | None" = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read one deterministic ``(created_at, membership_id)``-ordered page, bounded.
+
+    Primary path pushes the scope predicate + ``order_by`` into Lance and streams
+    only until ``page_size+1`` rows past the cursor are gathered (early break on the
+    as-of upper bound, since the scan is ascending). If the backend cannot order the
+    scan, a bounded top-``page_size+1`` heap over the streamed/full scan produces the
+    same page with O(page_size) client memory. Either way, unrelated views/targets
+    are excluded by the pushed-down scope predicate and never materialized.
+    """
+    handle = lake.table("curation_memberships")
+    checked_out = False
+    if version is not None:
+        require_lake_capability(
+            lake, VERSIONING, operation="curation membership history as-of replay"
+        )
+        handle.checkout(int(version))
+        checked_out = True
+    try:
+        ordered = _read_membership_history_ordered(
+            handle,
+            where_sql=where_sql,
+            as_of=as_of,
+            cursor_key=cursor_key,
+            page_size=page_size,
+            stats=stats,
+        )
+        if ordered is not None:
+            return ordered
+        # The backend could not order the scan (order_by unavailable / raised). Fall
+        # back to a bounded top-(page_size+1) heap -- still O(page_size) client memory,
+        # but O(scope) rows scanned per page instead of an early-broken ordered read.
+        # SKILLS.md sec 1: never take a costlier path silently.
+        warnings.warn(
+            "curation membership history paging could not order the scan in the backend; "
+            "using a bounded heap over a scoped scan (deterministic, O(page_size) client "
+            "memory, but O(scope) rows scanned per page).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _read_membership_history_bounded_heap(
+            handle,
+            where_sql=where_sql,
+            matcher=matcher,
+            as_of=as_of,
+            cursor_key=cursor_key,
+            page_size=page_size,
+            stats=stats,
+        )
+    finally:
+        if checked_out:
+            handle.checkout_latest()
+
+
+def _read_membership_history_ordered(
+    handle: Any,
+    *,
+    where_sql: str | None,
+    as_of: datetime | None,
+    cursor_key: tuple[datetime, str] | None,
+    page_size: int,
+    stats: "_ComparisonExecutionStats | None",
+) -> tuple[list[dict[str, Any]], bool] | None:
+    want = page_size + 1
+    try:
+        from lancedb.query import ColumnOrdering
+
+        query = handle.search()
+        if where_sql:
+            query = query.where(where_sql)
+        query = query.select(list(_MEMBERSHIP_HISTORY_COLUMNS))
+        query = query.order_by(
+            [
+                ColumnOrdering(column_name="created_at", ascending=True),
+                ColumnOrdering(column_name="membership_id", ascending=True),
+            ]
+        )
+        batches = query.to_batches(batch_size=_MEMBERSHIP_HISTORY_SCAN_BATCH)
+    except Exception:
+        return None
+    collected: list[dict[str, Any]] = []
+    has_more = False
+    try:
+        stop = False
+        for batch in batches:
+            rows = batch.to_pylist()
+            if stats is not None:
+                stats.record_batch("curation_memberships", len(rows))
+            for row in rows:
+                key = _membership_history_key(row)
+                if as_of is not None and key[0] > as_of:
+                    stop = True
+                    break
+                if cursor_key is not None and key <= cursor_key:
+                    continue
+                collected.append(row)
+                if len(collected) >= want:
+                    has_more = True
+                    stop = True
+                    break
+            if stop:
+                break
+    except Exception:
+        return None
+    if has_more:
+        collected = collected[:page_size]
+    return collected, has_more
+
+
+def _read_membership_history_bounded_heap(
+    handle: Any,
+    *,
+    where_sql: str | None,
+    matcher: Callable[[dict[str, Any]], bool],
+    as_of: datetime | None,
+    cursor_key: tuple[datetime, str] | None,
+    page_size: int,
+    stats: "_ComparisonExecutionStats | None",
+) -> tuple[list[dict[str, Any]], bool]:
+    want = page_size + 1
+    rows_iter, mode = _membership_history_row_source(
+        handle, where_sql=where_sql, stats=stats
+    )
+    if mode == "materialized":
+        warnings.warn(
+            "curation membership history paging fell back to a full table materialization "
+            "(backend supports neither predicate pushdown nor batched streaming); this page "
+            "holds the whole table in memory. Build the curation predicate indexes "
+            "(lake.curate.index_predicates() / lake maintain) and use a streaming backend.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    elif mode == "unfiltered":
+        warnings.warn(
+            "curation membership history paging could not push the scope predicate; "
+            "scanning the whole table streamed (bounded O(page_size) client memory, but "
+            "O(table) rows scanned per page). Build the curation predicate indexes "
+            "(lake.curate.index_predicates() / lake maintain) for scoped reads.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    heap: list[tuple[_MembershipHeapKey, int, dict[str, Any]]] = []
+    seq = 0
+    qualifying = 0
+    for row in rows_iter:
+        if not matcher(row):
+            continue
+        key = _membership_history_key(row)
+        if as_of is not None and key[0] > as_of:
+            continue
+        if cursor_key is not None and key <= cursor_key:
+            continue
+        qualifying += 1
+        entry = (_MembershipHeapKey(key), seq, row)
+        seq += 1
+        if len(heap) < want:
+            heapq.heappush(heap, entry)
+        elif key < (heap[0][0].created_at, heap[0][0].membership_id):
+            heapq.heapreplace(heap, entry)
+    ordered_rows = [
+        entry[2] for entry in sorted(heap, key=lambda item: _membership_history_key(item[2]))
+    ]
+    has_more = qualifying > page_size
+    return ordered_rows[:page_size], has_more
+
+
+def _stream_membership_batches(
+    batches: Any, stats: "_ComparisonExecutionStats | None"
+) -> Iterable[dict[str, Any]]:
+    for batch in batches:
+        rows = batch.to_pylist()
+        if stats is not None:
+            stats.record_batch("curation_memberships", len(rows))
+        yield from rows
+
+
+def _membership_history_row_source(
+    handle: Any,
+    *,
+    where_sql: str | None,
+    stats: "_ComparisonExecutionStats | None",
+) -> tuple[Iterable[dict[str, Any]], str]:
+    """Yield a bounded-memory row source for the heap fallback and how it degraded.
+
+    Returns ``(rows, mode)`` where ``mode`` is one of ``"pushdown"`` (scoped or
+    nothing-to-scope streamed scan -- the healthy fallback), ``"unfiltered"`` (a scope
+    predicate exists but the backend could not push it, so the whole table is streamed
+    and the Python matcher filters -- still O(page_size) client memory), or
+    ``"materialized"`` (the backend supports neither predicate pushdown nor batched
+    streaming, so the whole table is read into memory -- the only unbounded-memory tier,
+    reached only by a backend without ``to_batches``). ``created_at`` bounds are always
+    applied by the caller; this only produces rows.
+    """
+    # Tier 1: filtered streamed pushdown -- scoped and bounded.
+    if where_sql:
+        try:
+            query = handle.search()
+            query = query.where(where_sql)
+            query = query.select(list(_MEMBERSHIP_HISTORY_COLUMNS))
+            batches = query.to_batches(batch_size=_MEMBERSHIP_HISTORY_SCAN_BATCH)
+            return _stream_membership_batches(batches, stats), "pushdown"
+        except Exception:
+            pass
+    # Tier 2: unfiltered streamed scan -- bounded memory, matcher filters in Python.
+    try:
+        query = handle.search()
+        query = query.select(list(_MEMBERSHIP_HISTORY_COLUMNS))
+        batches = query.to_batches(batch_size=_MEMBERSHIP_HISTORY_SCAN_BATCH)
+        return _stream_membership_batches(batches, stats), ("unfiltered" if where_sql else "pushdown")
+    except Exception:
+        pass
+    # Tier 3: last-resort full materialization (only if to_batches is unavailable).
+    rows = handle.to_arrow().to_pylist()
+    if stats is not None:
+        stats.record_full_scan("curation_memberships", len(rows))
+    return iter(rows), "materialized"
+
+
+@dataclass(frozen=True)
+class CurationMembershipHistoryPage:
+    """One deterministic page of as-of membership-history decision rows (0142)."""
+
+    records: tuple[dict[str, Any], ...]
+    page_size: int
+    page_index: int = 0
+    cursor: str = ""
+    next_cursor: str = ""
+    has_more: bool = False
+
+    @property
+    def first_key(self) -> dict[str, Any] | None:
+        if not self.records:
+            return None
+        row = self.records[0]
+        return {"created_at": row.get("created_at"), "membership_id": row.get("membership_id")}
+
+    @property
+    def last_key(self) -> dict[str, Any] | None:
+        if not self.records:
+            return None
+        row = self.records[-1]
+        return {"created_at": row.get("created_at"), "membership_id": row.get("membership_id")}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "page_index": self.page_index,
+            "page_size": self.page_size,
+            "cursor": self.cursor,
+            "next_cursor": self.next_cursor,
+            "has_more": self.has_more,
+            "record_count": len(self.records),
+            "first_key": self.first_key,
+            "last_key": self.last_key,
+            "records": [dict(row) for row in self.records],
+        }
+
+
+@dataclass(frozen=True)
+class CurationMembershipHistory:
+    """Lazy, resumable replay of the as-of curation membership decision log (0142).
+
+    Returned by :meth:`LakeCurate.resolve_membership_pages`. Holds only the pinned
+    replay scope (resolved view, target/scenario/source/decision/reviewer filters,
+    as-of bound, pinned ``curation_memberships`` version, page size). No decision
+    rows are read until :meth:`page`/:meth:`iter_pages` is called, and each call
+    holds at most ``page_size+1`` rows in memory.
+    """
+
+    lake: Lake
+    view: CurationView | None
+    view_id: str | None
+    target_grain: str
+    target_ids: tuple[str, ...]
+    scenario_ids: tuple[str, ...]
+    sources: tuple[str, ...]
+    decisions: tuple[str, ...]
+    reviewers: tuple[str, ...]
+    as_of: datetime | None
+    as_of_transform_id: str
+    snapshot_name: str
+    snapshot_dataset_id: str
+    membership_version: int | None
+    page_size: int
+    validation: dict[str, Any]
+    read_table_versions: tuple[dict[str, Any], ...]
+
+    def _scope(self) -> tuple[str | None, Callable[[dict[str, Any]], bool]]:
+        return _membership_history_scope(
+            view_id=self.view_id,
+            target_grain=self.target_grain,
+            target_ids=self.target_ids,
+            scenario_ids=self.scenario_ids,
+            sources=self.sources,
+            decisions=self.decisions,
+            reviewers=self.reviewers,
+        )
+
+    def manifest(self) -> dict[str, Any]:
+        """The scan-free audit manifest header (scope, ordering, pinned versions)."""
+        return {
+            "schema_version": _MEMBERSHIP_HISTORY_SCHEMA_VERSION,
+            "kind": "curation-membership-history",
+            "lake_uri": self.lake.uri,
+            "view": _view_report(self.view),
+            "scope": {
+                "view_id": self.view_id or "",
+                "target_grain": self.target_grain or "all",
+                "target_ids": list(self.target_ids),
+                "scenario_ids": list(self.scenario_ids),
+                "sources": list(self.sources),
+                "decisions": list(self.decisions),
+                "reviewers": list(self.reviewers),
+                "as_of": _jsonable(self.as_of),
+                "as_of_transform_id": self.as_of_transform_id,
+                "snapshot_name": self.snapshot_name,
+                "snapshot_dataset_id": self.snapshot_dataset_id,
+            },
+            "ordering": list(_MEMBERSHIP_HISTORY_ORDER_COLUMNS),
+            "page_size": self.page_size,
+            "membership_table_version": self.membership_version,
+            "table_version_validation": self.validation,
+            "read_table_versions": [dict(row) for row in self.read_table_versions],
+        }
+
+    def scope_row_count(self) -> int:
+        """Count rows matching the pushed-down scope predicate (bounded, indexed).
+
+        This is the scope-predicate row count *before* the as-of/cursor filter -- a
+        cheap ``count_rows`` denominator for audit dashboards, not a page total. It
+        never materializes the table.
+        """
+        where_sql, matcher = self._scope()
+        handle = self.lake.table("curation_memberships")
+        checked_out = False
+        if self.membership_version is not None:
+            require_lake_capability(
+                self.lake, VERSIONING, operation="curation membership history count"
+            )
+            handle.checkout(int(self.membership_version))
+            checked_out = True
+        try:
+            try:
+                if where_sql:
+                    return int(handle.count_rows(where_sql))
+                return int(handle.count_rows())
+            except Exception:
+                # count_rows unsupported: stream-count (bounded memory), never
+                # to_arrow().to_pylist() the whole table (SKILLS.md sec 2 / BUG-06).
+                rows_iter, _mode = _membership_history_row_source(
+                    handle, where_sql=where_sql, stats=None
+                )
+                return sum(1 for row in rows_iter if matcher(row))
+        finally:
+            if checked_out:
+                handle.checkout_latest()
+
+    def page(
+        self,
+        *,
+        page_size: int | None = None,
+        cursor: str | None = None,
+        page_index: int = 0,
+        stats: "_ComparisonExecutionStats | None" = None,
+    ) -> CurationMembershipHistoryPage:
+        """Read one bounded, deterministic page starting after ``cursor``."""
+        size = _normalize_membership_history_page_size(
+            page_size if page_size is not None else self.page_size
+        )
+        cursor_key = _decode_membership_history_cursor(cursor)
+        where_sql, matcher = self._scope()
+        rows, has_more = _read_membership_history_page(
+            self.lake,
+            version=self.membership_version,
+            where_sql=where_sql,
+            matcher=matcher,
+            as_of=self.as_of,
+            cursor_key=cursor_key,
+            page_size=size,
+            stats=stats,
+        )
+        records = tuple(_membership_audit_row(row) for row in rows)
+        next_cursor = ""
+        if has_more and rows:
+            last = rows[-1]
+            _, last_membership_id = _membership_history_key(last)
+            next_cursor = _encode_membership_history_cursor(
+                last.get("created_at"), last_membership_id
+            )
+        return CurationMembershipHistoryPage(
+            records=records,
+            page_size=size,
+            page_index=int(page_index),
+            cursor=cursor or "",
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
+    def iter_pages(
+        self,
+        *,
+        page_size: int | None = None,
+        cursor: str | None = None,
+        stats: "_ComparisonExecutionStats | None" = None,
+    ) -> Iterable[CurationMembershipHistoryPage]:
+        """Yield every page from ``cursor`` to the end, each bounded to ``page_size``."""
+        current = cursor
+        index = 0
+        while True:
+            page = self.page(
+                page_size=page_size, cursor=current, page_index=index, stats=stats
+            )
+            yield page
+            if not page.has_more or not page.next_cursor:
+                return
+            current = page.next_cursor
+            index += 1
+
+
+def _resolve_membership_history(
+    lake: Lake,
+    *,
+    view_name: str | None,
+    view_id: str | None,
+    target_grain: str | None,
+    target_ids: Sequence[str],
+    scenario_ids: Sequence[str],
+    as_of: datetime | str | None,
+    transform_id: str | None,
+    snapshot_name: str | None,
+    sources: Sequence[str],
+    decisions: Sequence[str],
+    reviewers: Sequence[str],
+    page_size: int | None,
+) -> CurationMembershipHistory:
+    size = _normalize_membership_history_page_size(page_size)
+    context = _replay_context(
+        lake,
+        as_of=as_of,
+        transform_id=transform_id,
+        snapshot_name=snapshot_name,
+    )
+    normalized_grain = _normalize_target_grain(target_grain) if target_grain else ""
+    normalized_targets = tuple(dict.fromkeys(str(item) for item in target_ids if str(item)))
+    normalized_scenarios = tuple(
+        dict.fromkeys(str(item) for item in scenario_ids if str(item))
+    )
+    normalized_sources = tuple(dict.fromkeys(str(item) for item in sources if str(item)))
+    normalized_decisions = tuple(dict.fromkeys(str(item) for item in decisions if str(item)))
+    normalized_reviewers = tuple(
+        dict.fromkeys(str(item) for item in reviewers if str(item))
+    )
+    view_version = context.table_versions.get("curation_views")
+    membership_version = context.table_versions.get("curation_memberships")
+    chunk_version = context.table_versions.get("curation_view_membership_chunks")
+    view_row = _view_row_for_replay(
+        lake,
+        view_name=view_name,
+        view_id=view_id,
+        as_of=context.as_of,
+        table_version=view_version,
+    )
+    resolved_view_id = str(view_row["view_id"]) if view_row else (view_id or None)
+    view = (
+        _view_from_row(view_row, lake=lake, chunk_version=chunk_version)
+        if view_row
+        else None
+    )
+    snapshot_row = context.snapshot_row
+    return CurationMembershipHistory(
+        lake=lake,
+        view=view,
+        view_id=resolved_view_id,
+        target_grain=normalized_grain,
+        target_ids=normalized_targets,
+        scenario_ids=normalized_scenarios,
+        sources=normalized_sources,
+        decisions=normalized_decisions,
+        reviewers=normalized_reviewers,
+        as_of=context.as_of,
+        as_of_transform_id=context.as_of_transform_id,
+        snapshot_name=str(snapshot_row["name"]) if snapshot_row else "",
+        snapshot_dataset_id=str(snapshot_row["dataset_id"]) if snapshot_row else "",
+        membership_version=membership_version,
+        page_size=size,
+        validation=context.validation,
+        read_table_versions=tuple(_replay_read_versions(lake, context.table_versions)),
+    )
+
+
+def _supersession_index(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index membership rows by id, so a chain walk does not rebuild it per call."""
+    return {str(row["membership_id"]): row for row in rows}
+
+
+def _supersession_chain_indexed(
+    by_id: Mapping[str, dict[str, Any]],
+    latest_decision: dict[str, Any] | None,
+    *,
+    max_depth: int | None = None,
+) -> list[str]:
+    """Walk one target's supersession chain against a prebuilt index.
+
+    ``max_depth`` bounds the walk: a target re-decided thousands of times would
+    otherwise put an unbounded chain into the plan summary. Membership in the walk
+    is tracked with a set, not a list scan, so depth stays linear.
+    """
+    if latest_decision is None:
+        return []
+    chain: list[str] = []
+    seen: set[str] = set()
+    cursor: dict[str, Any] | None = latest_decision
+    while cursor:
+        membership_id = str(cursor.get("membership_id") or "")
+        if not membership_id or membership_id in seen:
+            break
+        chain.append(membership_id)
+        seen.add(membership_id)
+        if max_depth is not None and len(chain) >= max_depth:
+            break
+        previous_id = str(cursor.get("supersedes_membership_id") or "")
+        cursor = by_id.get(previous_id)
+    return list(reversed(chain))
+
+
 def _supersession_chain(
     rows: Sequence[dict[str, Any]],
     latest_decision: dict[str, Any] | None,
 ) -> list[str]:
+    """Convenience wrapper for a single chain walk (builds the index itself).
+
+    Callers walking many chains must build the index once via
+    :func:`_supersession_index` instead -- rebuilding it per call is O(rows) per
+    chain, i.e. quadratic in the branch's decision count (BUG-01 shape).
+    """
     if latest_decision is None:
         return []
-    by_id = {str(row["membership_id"]): row for row in rows}
-    chain = []
-    cursor: dict[str, Any] | None = latest_decision
-    while cursor:
-        membership_id = str(cursor.get("membership_id") or "")
-        if not membership_id or membership_id in chain:
-            break
-        chain.append(membership_id)
-        previous_id = str(cursor.get("supersedes_membership_id") or "")
-        cursor = by_id.get(previous_id)
-    return list(reversed(chain))
+    return _supersession_chain_indexed(_supersession_index(rows), latest_decision)
 
 
 def _transform_ids_from_payload(value: Any) -> set[str]:
@@ -12931,6 +16522,12 @@ def _materialization_summary(
     stats: _ComparisonExecutionStats | None = None,
     batch_size: int = _COMPARISON_DEFAULT_BATCH_SIZE,
 ) -> dict[str, Any]:
+    # Fast path (backlog 0145): read the indexed rollup catalog's promoted
+    # columns and never parse report_json. Falls back to the compat source-stream
+    # path only when the dataset has no rollup rows yet (an un-synced old lake).
+    rollup = _rollup_dataset_summary(lake, dataset_id, stats=stats, batch_size=batch_size)
+    if rollup is not None:
+        return rollup
     rows = _dataset_scoped_rows(
         lake, "curation_materializations", dataset_id, stats=stats, batch_size=batch_size
     )

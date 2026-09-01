@@ -22,7 +22,8 @@ def test_init_creates_all_canonical_tables(lake_path):
 def test_init_creates_empty_tables(lake_path):
     lake = Lake.init(lake_path)
     for name in lake.table_names():
-        assert lake.table(name).count_rows() == 0
+        expected = 1 if name == "rlds_ingest_claims" else 0
+        assert lake.table(name).count_rows() == expected
 
 
 def test_init_is_idempotent(lake_path):
@@ -30,7 +31,16 @@ def test_init_is_idempotent(lake_path):
     lake = Lake.init(lake_path)  # second init must not fail or duplicate
     assert lake.table_names() == list(CANONICAL_TABLES)
     for name in lake.table_names():
-        assert lake.table(name).count_rows() == 0
+        expected = 1 if name == "rlds_ingest_claims" else 0
+        assert lake.table(name).count_rows() == expected
+
+
+def test_init_rejects_a_missing_rlds_claim_gate(lake_path):
+    lake = Lake.init(lake_path)
+    lake.table("rlds_ingest_claims").delete("claim_key = 'global'")
+
+    with pytest.raises(LakeError, match="exactly one `global` gate row"):
+        Lake.init(lake_path)
 
 
 def test_init_preserves_existing_rows(lake_path):
@@ -60,6 +70,7 @@ def test_init_adds_post_v0_tables_to_existing_lake(lake_path):
             "lineage_delivery_attempts",
             "lineage_audit_reports",
             "keyframe_map_artifact_referrers",
+            "rlds_ingest_claims",
         }:
             db.create_table(name, schema=schema, exist_ok=True)
 
@@ -80,6 +91,10 @@ def test_init_adds_post_v0_tables_to_existing_lake(lake_path):
     assert lake.table("lineage_delivery_attempts").count_rows() == 0
     assert lake.table("lineage_audit_reports").count_rows() == 0
     assert lake.table("keyframe_map_artifact_referrers").count_rows() == 0
+    claim = lake.table("rlds_ingest_claims").to_arrow().to_pylist()
+    assert len(claim) == 1
+    assert claim[0]["claim_key"] == "global"
+    assert claim[0]["owner_token"] is None
 
 
 def test_schema_versions_inspectable_after_reopen(lake_path):
@@ -111,7 +126,8 @@ class _RemoteDb:
     def list_tables(self):
         return _ListTables(self.tables)
 
-    def create_table(self, name, *, schema, exist_ok):
+    def create_table(self, name, *, schema=None, data=None, exist_ok):
+        del schema, data, exist_ok
         if name not in self.tables:
             self.tables.append(name)
 

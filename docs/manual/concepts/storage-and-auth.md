@@ -55,6 +55,34 @@ credentials. It is the storage-and-auth half of the
 defines the reference contract; how a deployment resolves a reference (a secrets
 manager, a namespace service, an env chain) is a deployment concern.
 
+## Exporting to an object store, and reconciliation
+
+Dataset exports and projections can materialize to an object store as well as a
+local directory. `lake.projections.<format>.export(snapshot, out="s3://…")`,
+`export_dataset_snapshot(..., out_dir="gs://…")`, and the
+`lancedb-robotics dataset export`/`dataset project --mode export` commands all
+accept an `s3://` / `gs://` / `az://` destination. Object-store credentials
+resolve the same way as everywhere else — pass `storage_options` (or repeatable
+`--storage-option key=value`) and/or an `auth_ref` (`--auth-ref`); nothing is
+persisted in the lake.
+
+An object-store export stages the projection locally, publishes each file, then
+**reconciles** the written objects: it stats every object, compares its content
+length against what was staged, and records a stable, secret-free provider
+fingerprint (ETag / version / generation). The export **fails with a typed error**
+if an expected object is missing or its size does not match — so the accounting
+report reflects the boundary artifacts actually written, not just the local plan.
+Because accounting is computed from the staged tree, a local export and an
+object-store export of the same snapshot produce identical payload/media,
+logical-reference, and copy-ratio accounting. The per-object detail (URI, content
+length, checksum, payload-vs-metadata classification, container/compression
+notes) is written into the export and projection manifests and into the
+`curation_materializations` report body.
+
+Manifest-only projection **plans** (`lake.projections.<format>.plan(...)`) and
+live projections never resolve a destination: they stay zero-copy and require no
+object-store credentials or backend.
+
 ## Caveats
 
 - Object-store URIs need the matching fsspec backend installed (`s3fs` for
@@ -62,3 +90,7 @@ manager, a namespace service, an env chain) is a deployment concern.
   backend surfaces a clear install error, not a stack trace.
 - `db://` and REST-namespace features are enterprise paths; a purely local or
   object-store lake uses only `storage_auth_ref` / `storage_options`.
+- Export reconciliation verifies **object presence and size** from provider
+  metadata; it does not download and re-hash object bytes. Byte-level content
+  verification is the strict-content-hash validation policy used on the ingest
+  side, not the default export path.

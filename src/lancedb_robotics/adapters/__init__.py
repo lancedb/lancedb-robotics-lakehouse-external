@@ -111,10 +111,12 @@ def list_adapters() -> list[AdapterInfo]:
 def _register_builtins() -> None:
     from lancedb_robotics.adapters.lerobot_adapter import LeRobotAdapter
     from lancedb_robotics.adapters.mcap_adapter import McapAdapter
+    from lancedb_robotics.adapters.rlds_adapter import RldsAdapter
     from lancedb_robotics.adapters.rosbag_adapter import RosBagAdapter
 
     registry.register(LeRobotAdapter())
     registry.register(McapAdapter())
+    registry.register(RldsAdapter())
     registry.register(RosBagAdapter())
 
 

@@ -70,6 +70,26 @@ from lancedb_robotics.materialization import (
     json_metadata_bytes,
     payload_size,
 )
+from lancedb_robotics.predicate_index_telemetry import (
+    IndexRecommendation,
+    RecommendationPolicy,
+    apply_index_recommendations,
+    build_predicate_telemetry,
+    recommend_from_reports,
+)
+from lancedb_robotics.predicate_index_telemetry import (
+    recommendation_from_dict as _recommendation_from_dict,
+)
+from lancedb_robotics.scalar_index_jobs import (
+    ScalarIndexJobError,
+    ScalarIndexRequiredError,
+    open_scalar_index_job_store,
+    probe_scalar_index_capability,
+    reconcile_scalar_index_jobs,
+    request_aligned_predicate_index_jobs,
+    request_scalar_index,
+    scalar_index_jobs_for_table,
+)
 from lancedb_robotics.schemas import ALIGNED_TICKS_SCHEMA
 from lancedb_robotics.training_plan_artifacts import (
     DEFAULT_PLAN_PAGE_SIZE,
@@ -1061,6 +1081,13 @@ class EpochExecutionBackend:
     reason: str | None = None
     capabilities: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    # Backlog 0131: whether the internal permutation table was reused from a
+    # prior build (vs newly materialized this build), and its ordered row count.
+    # Deliberately excluded from ``to_dict`` so they never enter the epoch-plan
+    # digest -- two identical builds must share one ``epoch_plan_id`` regardless
+    # of whether the second reused the first's table.
+    permutation_reused: bool | None = None
+    permutation_row_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -4118,6 +4145,11 @@ class LanceTrainingDataset:
             payload_copy_policy="logical-reference",
             dry_run=False,
         ).to_dict()
+        # Backlog 0131: report whether this build reused a cataloged internal
+        # permutation artifact or materialized a fresh one, plus its size.
+        accounting["permutation_artifact"] = _permutation_artifact_accounting(
+            self.epoch_plan.backend
+        )
         self.backend_report = _training_backend_report(
             lake,
             backend=backend,
@@ -4526,10 +4558,12 @@ class AlignedFrameTrainingDataset:
         prewarm_options: Mapping[str, Any] | None = None,
         allow_fallback: bool = False,
         fallback: str | bool | None = None,
+        require_predicate_indexes: bool = False,
     ) -> None:
         if alignment is not None and (alignment_id is not None or name is not None):
             raise TrainingError("pass either alignment or alignment_id/name, not both")
         self.lake = lake
+        self.require_predicate_indexes = bool(require_predicate_indexes)
         self._job = _resolve_alignment_job(
             lake,
             alignment=alignment,
@@ -4678,6 +4712,10 @@ class AlignedFrameTrainingDataset:
             epoch_backend=self.epoch_plan.backend.to_dict(),
             backend=self.backend_report.to_dict(),
         )
+        if self.require_predicate_indexes:
+            _enforce_predicate_index_requirement(
+                self.manifest.output_table, self.manifest.predicate_indexes
+            )
         self._hydration_executor.manifest_backend = self.manifest.backend
         self._prewarm_executor = _PageCachePrewarmExecutor(
             lake,
@@ -5092,6 +5130,85 @@ class LakeTraining:
         from lancedb_robotics.training_permutation import native_permutation_capability
 
         return native_permutation_capability(self._lake)
+
+    def permutation_artifacts(self) -> list[dict[str, Any]]:
+        """List internal epoch-permutation artifacts tracked for this lake (0131).
+
+        Returns one summary per internal ``__lancedb_robotics_epoch_perm_*`` table:
+        cataloged tables with full lifecycle metadata (owner row/epoch plan,
+        seed, epoch, worker partition, row count, created/last-used, use count,
+        retention policy), plus any prefix-discovered orphan left by an older
+        writer (reported with ``cataloged=False``). Empty when the lake has no
+        LanceDB connection.
+        """
+        from lancedb_robotics.training_permutation_catalog import open_permutation_catalog
+
+        catalog = open_permutation_catalog(self._lake)
+        return catalog.list() if catalog is not None else []
+
+    def permutation_artifact(self, permutation_table: str) -> dict[str, Any] | None:
+        """Return one internal permutation artifact summary by table name, or None."""
+        from lancedb_robotics.training_permutation_catalog import open_permutation_catalog
+
+        catalog = open_permutation_catalog(self._lake)
+        return catalog.get(permutation_table) if catalog is not None else None
+
+    def permutation_artifact_accounting(self) -> dict[str, Any]:
+        """Report internal permutation artifact count / rows / estimated bytes (0131).
+
+        Suitable for training accounting and benchmark outputs. Estimated bytes
+        are the logical ordered-row-id size (16 bytes/row), not on-disk size.
+        """
+        from lancedb_robotics.training_permutation_catalog import open_permutation_catalog
+
+        catalog = open_permutation_catalog(self._lake)
+        if catalog is None:
+            return {
+                "artifact_count": 0,
+                "cataloged_count": 0,
+                "uncataloged_count": 0,
+                "total_rows": 0,
+                "estimated_bytes": 0,
+                "by_backend": {},
+            }
+        return catalog.accounting()
+
+    def cleanup_permutation_artifacts(
+        self, *, dry_run: bool = False, include_uncataloged: bool = False
+    ) -> dict[str, Any]:
+        """Reclaim unreferenced internal epoch-permutation tables (0131).
+
+        Drops internal ``__lancedb_robotics_epoch_perm_*`` tables that are
+        *cataloged* and provably unreferenced -- no retained training run/report
+        references them (by ``row_plan_id``/``epoch_plan_id``) and they are not
+        pinned by a ``keep`` retention policy -- deleting their catalog entries
+        too. An uncataloged orphan table (no catalog metadata, so no plan-id to
+        reference-check) is kept by default and reported under
+        ``skipped_uncataloged``; pass ``include_uncataloged=True`` to also reclaim
+        orphans (they cannot be reference-checked, so use only when stray tables
+        are known safe). Set ``dry_run`` to report the plan without changing
+        anything. Idempotent. Returns a report dict.
+        """
+        from lancedb_robotics.training_permutation_catalog import open_permutation_catalog
+
+        catalog = open_permutation_catalog(self._lake)
+        if catalog is None:
+            return {
+                "dry_run": dry_run,
+                "scanned": 0,
+                "kept": [],
+                "removed": [],
+                "kept_count": 0,
+                "removed_count": 0,
+                "reclaimed_bytes": 0,
+                "protected_plan_ids": 0,
+                "skipped_uncataloged": [],
+                "skipped_uncataloged_count": 0,
+                "errors": [],
+            }
+        return catalog.cleanup(
+            dry_run=dry_run, include_uncataloged=include_uncataloged
+        ).to_dict()
 
     def permutation_plan(
         self,
@@ -5547,6 +5664,7 @@ class LakeTraining:
         prewarm_options: Mapping[str, Any] | None = None,
         allow_fallback: bool = False,
         fallback: str | bool | None = None,
+        require_predicate_indexes: bool = False,
     ) -> AlignedFrameTrainingDataset:
         return AlignedFrameTrainingDataset(
             self._lake,
@@ -5575,6 +5693,7 @@ class LakeTraining:
             prewarm_options=prewarm_options,
             allow_fallback=allow_fallback,
             fallback=fallback,
+            require_predicate_indexes=require_predicate_indexes,
         )
 
     def backfill_aligned_ticks(
@@ -5597,6 +5716,43 @@ class LakeTraining:
             verify=verify,
         )
 
+    def migrate_aligned_ticks(
+        self,
+        *,
+        alignments: Sequence[str] | None = None,
+        dry_run: bool = False,
+        verify: bool = True,
+        replace: bool = False,
+        create_missing_table: bool = False,
+        tick_window: int | None = None,
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Batch-migrate recorded alignments into ``aligned_ticks`` (backlog 0134).
+
+        The lake-scale, resumable companion to :meth:`backfill_aligned_ticks`:
+        it sweeps all (or selected) recorded alignment jobs in bounded
+        tick-index windows, writes only missing tick rows, validates JSONB
+        round-trips and summary columns, and records per-job migration lineage
+        in ``transform_runs``. Returns an ``aligned-tick-migration/1`` report.
+        """
+        from lancedb_robotics.aligned_tick_migration import (
+            DEFAULT_TICK_WINDOW,
+            DEFAULT_WRITE_BATCH_SIZE,
+            migrate_aligned_ticks,
+        )
+
+        return migrate_aligned_ticks(
+            self._lake,
+            alignments=alignments,
+            dry_run=dry_run,
+            verify=verify,
+            replace=replace,
+            create_missing_table=create_missing_table,
+            tick_window=DEFAULT_TICK_WINDOW if tick_window is None else tick_window,
+            batch_size=DEFAULT_WRITE_BATCH_SIZE if batch_size is None else batch_size,
+            created_by="lake.training.migrate_aligned_ticks",
+        )
+
     def index_aligned_predicates(
         self,
         *,
@@ -5611,6 +5767,276 @@ class LakeTraining:
                 include_frames=include_frames,
                 replace=refresh,
             )
+        )
+
+    # -- scalar predicate index job lifecycle (backlog 0136) --------------- #
+
+    def scalar_index_capability(self) -> dict[str, Any]:
+        """Report how this backend builds scalar predicate indexes (0136).
+
+        One of ``synchronous`` (inline local build), ``asynchronous`` (remote
+        submit + poll), ``unsupported``, or ``permission_denied``, with the reason
+        and recommended fallbacks for the non-buildable modes.
+        """
+        return probe_scalar_index_capability(self._lake).to_dict()
+
+    def request_scalar_index_job(
+        self,
+        *,
+        table: str,
+        column: str,
+        index_type: str = SCALAR_INDEX_TYPE,
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        """Request one scalar predicate index build as a durable, idempotent job.
+
+        Synchronous backends build inline and record a ``complete`` job; async
+        backends submit (or plan) a remote build and record a pending job;
+        unsupported/permission-denied backends return an ephemeral ``skipped``
+        result and persist nothing. Repeated requests for the same
+        table/version/column/index-type reuse the existing job.
+        """
+        return request_scalar_index(
+            self._lake, table=table, column=column, index_type=index_type, replace=replace
+        ).to_dict()
+
+    def request_aligned_index_jobs(
+        self, *, include_frames: bool = True, replace: bool = False
+    ) -> list[dict[str, Any]]:
+        """Request jobs for every recommended aligned hot-predicate column (0136).
+
+        The automatic path for researchers: builds/submits the ``aligned_ticks``
+        (and optionally ``aligned_frames``) hot-predicate indexes without naming a
+        column. Used by ``lake maintain`` and alignment materialization.
+        """
+        return [
+            result.to_dict()
+            for result in request_aligned_predicate_index_jobs(
+                self._lake, include_frames=include_frames, replace=replace
+            )
+        ]
+
+    def scalar_index_jobs(
+        self,
+        *,
+        status: str | None = None,
+        table: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List durable scalar predicate index jobs, most-recently-updated first.
+
+        Returns ``[]`` when no job table exists (never created one). Read-only.
+        """
+        store = open_scalar_index_job_store(self._lake)
+        if store is None:
+            return []
+        return [record.to_dict() for record in store.list(status=status, table=table, limit=limit)]
+
+    def scalar_index_job(self, job_id: str) -> dict[str, Any] | None:
+        """Return a single scalar-index job by id (with full status history)."""
+        store = open_scalar_index_job_store(self._lake)
+        if store is None:
+            return None
+        record = store.get(job_id)
+        return record.to_dict() if record is not None else None
+
+    def retry_scalar_index_job(self, job_id: str) -> dict[str, Any]:
+        """Re-submit a failed/canceled/expired scalar-index job (increments retry).
+
+        Raises :class:`ScalarIndexJobError` for an unknown id or a non-retryable
+        (complete / in-flight) job.
+        """
+        return self._scalar_index_coordinator(job_id).retry(job_id).status_dict()
+
+    def cancel_scalar_index_job(
+        self, job_id: str, *, reason: str | None = None
+    ) -> dict[str, Any]:
+        """Cancel a no-longer-needed scalar-index job; complete jobs are left as-is."""
+        return self._scalar_index_coordinator(job_id).cancel(job_id, reason=reason).status_dict()
+
+    def reconcile_scalar_index_jobs(self) -> list[dict[str, Any]]:
+        """Poll pending scalar-index jobs and expire stale ones (maintenance)."""
+        return reconcile_scalar_index_jobs(self._lake)
+
+    # -- predicate-index selectivity telemetry + recommendations (0137) ----- #
+
+    def _recent_aligned_reports(self, *, limit: int) -> list[dict[str, Any]]:
+        """Recent persisted aligned loader-report bodies (see telemetry module)."""
+        from lancedb_robotics.predicate_index_telemetry import recent_aligned_reports
+
+        return recent_aligned_reports(self._lake, limit=limit)
+
+    def recommend_predicate_indexes(
+        self,
+        *,
+        reports: Sequence[Mapping[str, Any]] | None = None,
+        limit: int = 200,
+        policy: RecommendationPolicy | None = None,
+        min_observations: int | None = None,
+        min_total_rows: int | None = None,
+        max_selectivity_fraction: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Recommend scalar indexes / JSONB promotions from predicate telemetry (0137).
+
+        Aggregates the ``predicate_telemetry`` carried by aligned training loader
+        reports and returns ranked recommendations, most-actionable first. Pass
+        ``reports`` explicitly (each a loader-report or aligned-manifest dict), or
+        leave it ``None`` to pull the most recent ``limit`` persisted aligned
+        reports from the ``training_reports`` catalog. Guardrails (small tables,
+        low-selectivity predicates, rarely-used predicates, unsupported backends)
+        suppress noise by default; override the thresholds inline or with a full
+        ``policy``. Read-only: never builds an index and never writes.
+        """
+        resolved_policy = policy or RecommendationPolicy(
+            **{
+                key: value
+                for key, value in {
+                    "min_observations": min_observations,
+                    "min_total_rows": min_total_rows,
+                    "max_selectivity_fraction": max_selectivity_fraction,
+                }.items()
+                if value is not None
+            }
+        )
+        report_bodies = (
+            list(reports) if reports is not None else self._recent_aligned_reports(limit=limit)
+        )
+        return [
+            recommendation.to_dict()
+            for recommendation in recommend_from_reports(
+                report_bodies, policy=resolved_policy
+            )
+        ]
+
+    def apply_predicate_index_recommendations(
+        self,
+        *,
+        recommendations: Sequence[Mapping[str, Any]] | None = None,
+        reports: Sequence[Mapping[str, Any]] | None = None,
+        limit: int = 200,
+        policy: RecommendationPolicy | None = None,
+        force: bool = False,
+        suppress: Sequence[str] | None = None,
+        min_confidence: str = "high",
+        replace: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Route safe predicate-index recommendations into 0136 index jobs (0137).
+
+        The researcher-facing automatic path: it computes recommendations (or
+        accepts a pre-computed list) and requests durable, idempotent scalar-index
+        jobs for the safe, high-confidence typed-column ones only. JSONB-path
+        predicates are surfaced as advisory promotions and never auto-applied.
+        ``force`` lifts the confidence bar and applies guardrail-suppressed
+        *forceable* columns; ``suppress`` (``"table.column"`` or ``"column"``)
+        always wins. Returns one auditable outcome record per recommendation.
+        """
+        if recommendations is None:
+            objects = self._compute_recommendation_objects(
+                reports=reports, limit=limit, policy=policy
+            )
+        else:
+            objects = [_recommendation_from_dict(payload) for payload in recommendations]
+        return apply_index_recommendations(
+            self._lake,
+            objects,
+            force=force,
+            suppress=suppress,
+            min_confidence=min_confidence,
+            replace=replace,
+        )
+
+    def _compute_recommendation_objects(
+        self,
+        *,
+        reports: Sequence[Mapping[str, Any]] | None,
+        limit: int,
+        policy: RecommendationPolicy | None,
+    ) -> list[IndexRecommendation]:
+        report_bodies = (
+            list(reports) if reports is not None else self._recent_aligned_reports(limit=limit)
+        )
+        return recommend_from_reports(report_bodies, policy=policy or RecommendationPolicy())
+
+    def _scalar_index_coordinator(self, job_id: str):
+        from lancedb_robotics.scalar_index_jobs import (
+            DEFAULT_SCALAR_INDEX_JOB_TTL_S,
+            _coordinator_for,
+        )
+
+        store = open_scalar_index_job_store(self._lake)
+        if store is None:
+            raise ScalarIndexJobError(
+                f"no scalar-index job store for id {job_id!r}; request an index job "
+                "first (lake.training.request_scalar_index_job / request_aligned_index_jobs)"
+            )
+        capability = probe_scalar_index_capability(self._lake)
+        return _coordinator_for(
+            self._lake, store, capability, ttl_s=DEFAULT_SCALAR_INDEX_JOB_TTL_S, now_fn=None
+        )
+
+    def diagnose_aligned_ticks(
+        self,
+        *,
+        alignments: Sequence[str] | None = None,
+        include_frames: bool = True,
+        tick_window: int | None = None,
+    ) -> dict[str, Any]:
+        """Report ``aligned_ticks``/``aligned_frames`` size and posture (0135).
+
+        Read-only diagnostics: per-alignment tick/frame row counts, duplicate
+        and stale-row counts, ticks that carry only stale rows, orphan
+        alignments, and the table versions pinned by snapshots/lineage/holds.
+        Returns an ``aligned-tick-lifecycle/1`` report.
+        """
+        from lancedb_robotics.aligned_tick_lifecycle import (
+            DEFAULT_TICK_WINDOW,
+            diagnose_aligned_ticks,
+        )
+
+        return diagnose_aligned_ticks(
+            self._lake,
+            alignments=alignments,
+            include_frames=include_frames,
+            tick_window=DEFAULT_TICK_WINDOW if tick_window is None else tick_window,
+        )
+
+    def cleanup_aligned_ticks(
+        self,
+        *,
+        alignments: Sequence[str] | None = None,
+        dry_run: bool = True,
+        remove_duplicates: bool = True,
+        remove_orphans: bool = False,
+        include_frames: bool = True,
+        tick_window: int | None = None,
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Compact and retention-clean ``aligned_ticks`` (+frames) (0135).
+
+        Dry-run by default. Collapses duplicate ``aligned_tick_id`` rows to a
+        single canonical row (preferring the current recipe), optionally removes
+        orphan-alignment rows, then compacts and refreshes the aligned scalar
+        indexes, recording an idempotent ``transform_runs`` row on apply. Row
+        removal touches only the current table version, so any
+        snapshot/lineage/hold-pinned version keeps its rows. Returns an
+        ``aligned-tick-lifecycle/1`` report.
+        """
+        from lancedb_robotics.aligned_tick_lifecycle import (
+            DEFAULT_TICK_WINDOW,
+            DEFAULT_WRITE_BATCH_SIZE,
+            cleanup_aligned_ticks,
+        )
+
+        return cleanup_aligned_ticks(
+            self._lake,
+            alignments=alignments,
+            dry_run=dry_run,
+            remove_duplicates=remove_duplicates,
+            remove_orphans=remove_orphans,
+            include_frames=include_frames,
+            tick_window=DEFAULT_TICK_WINDOW if tick_window is None else tick_window,
+            batch_size=DEFAULT_WRITE_BATCH_SIZE if batch_size is None else batch_size,
+            created_by="lake.training.cleanup_aligned_ticks",
         )
 
 
@@ -8124,6 +8550,36 @@ def _build_epoch_plan(
     }
     plan_id = "epoch-" + _stable_digest(plan_payload)
     backend = replace(backend, epoch_plan_id=plan_id)
+    # Backlog 0131: register the internal permutation artifact in the durable
+    # lifecycle catalog (owner row/epoch plan, seed, epoch, worker, row count),
+    # keyed on the deterministic table name. Best-effort and never fatal: a
+    # dataset build must not fail on lifecycle bookkeeping.
+    if (
+        lake is not None
+        and backend.kind == EPOCH_BACKEND_LANCEDB_PERMUTATION
+        and backend.permutation_table
+    ):
+        from lancedb_robotics.training_permutation_catalog import record_permutation_artifact
+
+        record_permutation_artifact(
+            lake,
+            permutation_table=backend.permutation_table,
+            permutation_ref=backend.permutation_ref or f"lancedb://{backend.permutation_table}",
+            backend_kind=backend.kind,
+            permutation_source="materialized" if not backend.permutation_reused else "reused",
+            row_plan=row_plan,
+            epoch_plan_id=plan_id,
+            shuffle_seed=seed if shuffle else None,
+            epoch=epoch,
+            worker_id=worker_id,
+            num_workers=num_workers,
+            resume_from=resume_from,
+            row_count=(
+                backend.permutation_row_count
+                if backend.permutation_row_count is not None
+                else len(global_order)
+            ),
+        )
     return EpochPlan(
         plan_id=plan_id,
         row_plan_id=row_plan.plan_id,
@@ -8252,7 +8708,7 @@ def _persist_lancedb_epoch_permutation(
         shuffle_seed=shuffle_seed,
         epoch=epoch,
     )
-    table = _create_or_reuse_epoch_permutation_table(db, permutation_table, ordered_row_ids)
+    table, created = _create_or_reuse_epoch_permutation_table(db, permutation_table, ordered_row_ids)
     row_id_to_index = {
         int(row_id): index for index, row_id in enumerate(row_ids) if row_id is not None
     }
@@ -8276,8 +8732,32 @@ def _persist_lancedb_epoch_permutation(
         permutation_ref=f"lancedb://{permutation_table}",
         reason="ordered row ids are persisted in a LanceDB permutation table",
         capabilities=capabilities,
+        permutation_reused=not created,
+        permutation_row_count=len(ordered_row_ids),
     )
     return descriptor, ordered_indices
+
+
+def _permutation_artifact_accounting(backend: EpochExecutionBackend) -> dict[str, Any]:
+    """Reuse/size summary of this epoch's internal permutation artifact (0131).
+
+    Reported in the dataset manifest's ``accounting`` so a caller can see whether
+    a shuffled epoch reused a prior ordering table or paid to materialize a fresh
+    one, and how large that artifact is.
+    """
+    if backend.kind != EPOCH_BACKEND_LANCEDB_PERMUTATION or not backend.permutation_table:
+        return {"backend_kind": backend.kind, "reused": None, "permutation_table": None}
+    from lancedb_robotics.training_permutation_catalog import PERMUTATION_ROW_BYTES
+
+    row_count = int(backend.permutation_row_count or 0)
+    return {
+        "backend_kind": backend.kind,
+        "reused": bool(backend.permutation_reused),
+        "permutation_table": backend.permutation_table,
+        "permutation_ref": backend.permutation_ref,
+        "row_count": row_count,
+        "estimated_bytes": row_count * PERMUTATION_ROW_BYTES,
+    }
 
 
 def _epoch_permutation_table_name(
@@ -8302,13 +8782,19 @@ def _create_or_reuse_epoch_permutation_table(
     db: Any,
     table_name: str,
     ordered_row_ids: tuple[int, ...],
-) -> Any:
+) -> tuple[Any, bool]:
+    """Return ``(table, created)`` where ``created`` is ``False`` on reuse.
+
+    ``created`` lets the caller record in the 0131 lifecycle catalog whether the
+    physical ordering table was materialized this build or reused from a prior
+    one (surfaced as ``reused`` in dataset accounting).
+    """
     table_names = _db_table_names(db)
     if table_name in table_names:
         table = db.open_table(table_name)
         stored = tuple(int(row["row_id"]) for row in table.to_arrow().to_pylist())
         if stored == ordered_row_ids:
-            return table
+            return table, False
     data = pa.table(
         {
             "row_id": pa.array(ordered_row_ids, type=pa.uint64()),
@@ -8316,7 +8802,7 @@ def _create_or_reuse_epoch_permutation_table(
         }
     )
     mode = "overwrite" if table_name in table_names else "create"
-    return db.create_table(table_name, data=data, mode=mode)
+    return db.create_table(table_name, data=data, mode=mode), True
 
 
 def _indices_from_lancedb_permutation_table(
@@ -8733,7 +9219,58 @@ def _predicate_index_params(
             else "hot-column"
         )
         params.append(payload)
-    return tuple(params)
+    return _merge_scalar_index_job_refs(lake, table, tuple(params))
+
+
+def _merge_scalar_index_job_refs(
+    lake: Lake, table: str, params: tuple[dict[str, Any], ...]
+) -> tuple[dict[str, Any], ...]:
+    """Fold durable scalar-index job references into per-column predicate dicts (0136).
+
+    Read-only: uses ``open_scalar_index_job_store`` (returns ``None`` until a write
+    path created the table), so it never mutates the lake and never blocks a read.
+    Surfaces ``job_id``/``job_status``/``job_build_mode``/``job_reason`` so pending
+    and failed index jobs appear in aligned training manifests with reasons.
+    """
+    try:
+        jobs = scalar_index_jobs_for_table(lake, table)
+    except Exception:  # noqa: BLE001 - job diagnostics must not block reads
+        return params
+    if not jobs:
+        return params
+    for payload in params:
+        job = jobs.get(payload.get("column"))
+        if job is not None:
+            payload.update(job.manifest_ref())
+    return params
+
+
+def _predicate_index_backed(payload: Mapping[str, Any]) -> bool:
+    """True when a predicate column is served by a present index or completed job."""
+    if payload.get("status") in {"built", "already_present"}:
+        return True
+    return payload.get("job_status") == "complete"
+
+
+def _enforce_predicate_index_requirement(
+    table: str, predicate_indexes: Sequence[Mapping[str, Any]]
+) -> None:
+    """Raise :class:`ScalarIndexRequiredError` if a hot filter predicate is unbacked.
+
+    Strict opt-in (``require_predicate_indexes=True``): only ``filter``-role
+    predicates that are actually used in the filter must be index-backed. Diagnostic
+    and hot-column predicates never gate a read. Default behavior (strict off) never
+    calls this, so predicate-pushdown reads are never blocked (backlog 0136).
+    """
+    missing = [
+        dict(payload)
+        for payload in predicate_indexes
+        if payload.get("predicate_role") == "filter"
+        and payload.get("used_in_filter")
+        and not _predicate_index_backed(payload)
+    ]
+    if missing:
+        raise ScalarIndexRequiredError(table, missing)
 
 
 def _aligned_tick_diagnostic_index_columns(
@@ -10595,6 +11132,10 @@ def _aligned_loader_report_payload(
                 ),
                 "fallback_events": _fallback_events(backend),
                 "disabled_capabilities": _disabled_capabilities(backend),
+                # 0137: additive predicate-planning telemetry (identifiers + shape
+                # only, never literal predicate values) so the recommender can learn
+                # which columns are hot/selective from persisted reports.
+                "predicate_telemetry": build_predicate_telemetry(manifest),
                 "run": dict(run or {}),
             }
         )

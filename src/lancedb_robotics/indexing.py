@@ -107,6 +107,11 @@ CURATION_MEMBERSHIP_PREDICATE_INDEX_COLUMNS = (
     "scenario_id",
     "decision",
     "queue",
+    # 0142: source/reviewer are hot audit-slice predicates for paged membership
+    # history replay (resolve_membership_pages); index them so an enterprise-scale
+    # curation_memberships table filters by source/reviewer at storage (BUG-15).
+    "source",
+    "reviewer",
     "created_at",
 )
 CURATION_VIEW_CHUNK_PREDICATE_INDEX_COLUMNS = (
@@ -226,6 +231,67 @@ EVALUATION_RUN_METRICS_PREDICATE_INDEX_COLUMNS = (
     ("score", "BTREE"),
     ("scope", "BITMAP"),
     ("created_at", "BTREE"),
+)
+
+# Curation materialization rollup hot predicates (backlog 0145). The rollup
+# catalog is filtered and grouped by snapshot/branch, target format, mode,
+# transform lineage, and time range, and paged by ``(created_at,
+# materialization_id)``. High-cardinality id/name columns take BTREE (sorted,
+# range-friendly cursor pagination on ``created_at``); the low-cardinality
+# classification columns (``mode``, ``payload_copy_policy``,
+# ``reconciliation_status``, ``state``) take BITMAP. Unsupported backends report
+# ``skipped`` so predicate pushdown still applies (see ``build_scalar_index``).
+CURATION_MATERIALIZATION_ROLLUP_PREDICATE_INDEX_COLUMNS = (
+    ("materialization_id", "BTREE"),
+    ("dataset_id", "BTREE"),
+    ("snapshot_name", "BTREE"),
+    ("target_format", "BTREE"),
+    ("projection_transform_id", "BTREE"),
+    ("transform_id", "BTREE"),
+    ("mode", "BITMAP"),
+    ("payload_copy_policy", "BITMAP"),
+    ("reconciliation_status", "BITMAP"),
+    ("state", "BITMAP"),
+    ("created_at", "BTREE"),
+)
+# Per-output-file accounting chunks (backlog 0145). Lookups fetch a parent
+# materialization's files (``materialization_id``) or a dataset's files, and
+# filter by ``classification`` (payload/metadata/mixed). ``created_at`` BTREE
+# keeps chunk scans range-friendly.
+CURATION_MATERIALIZATION_FILE_PREDICATE_INDEX_COLUMNS = (
+    ("file_accounting_id", "BTREE"),
+    ("materialization_id", "BTREE"),
+    ("dataset_id", "BTREE"),
+    ("classification", "BITMAP"),
+    ("created_at", "BTREE"),
+)
+# Compiled row-plan headers (backlog 0146). Lookups fetch one plan by id, list a
+# saved view's plans, or filter a retention series by
+# ``(view_id, target_grain, source_snapshot_name)``. ``target_grain`` /
+# ``storage_kind`` / ``state`` / ``frozen`` are low-cardinality categoricals, so
+# BITMAP; ``created_at`` BTREE keeps the keyset page ordering range-friendly.
+CURATION_ROW_PLAN_PREDICATE_INDEX_COLUMNS = (
+    ("plan_id", "BTREE"),
+    ("view_id", "BTREE"),
+    ("view_name", "BTREE"),
+    ("source_snapshot_name", "BTREE"),
+    ("transform_id", "BTREE"),
+    ("artifact_id", "BTREE"),
+    ("target_grain", "BITMAP"),
+    ("storage_kind", "BITMAP"),
+    ("state", "BITMAP"),
+    ("base_policy", "BITMAP"),
+    ("created_at", "BTREE"),
+)
+# Row-plan target chunks (backlog 0146). Every read is
+# ``plan_id = ? AND start_ordinal >= lo AND start_ordinal < hi`` -- the windowed
+# ordinal keyset the target pager uses -- so both columns need a BTREE or a deep
+# page turns into a chunk-table scan.
+CURATION_ROW_PLAN_CHUNK_PREDICATE_INDEX_COLUMNS = (
+    ("chunk_id", "BTREE"),
+    ("plan_id", "BTREE"),
+    ("start_ordinal", "BTREE"),
+    ("chunk_index", "BTREE"),
 )
 
 
@@ -758,6 +824,10 @@ PREDICATE_INDEX_COLUMNS_BY_TABLE: dict[str, tuple[tuple[str, str], ...]] = {
     "model_artifacts": MODEL_ARTIFACT_PREDICATE_INDEX_COLUMNS,
     "evaluation_runs": EVALUATION_RUN_PREDICATE_INDEX_COLUMNS,
     "evaluation_run_metrics": EVALUATION_RUN_METRICS_PREDICATE_INDEX_COLUMNS,
+    "curation_materialization_rollups": CURATION_MATERIALIZATION_ROLLUP_PREDICATE_INDEX_COLUMNS,
+    "curation_materialization_files": CURATION_MATERIALIZATION_FILE_PREDICATE_INDEX_COLUMNS,
+    "curation_row_plans": CURATION_ROW_PLAN_PREDICATE_INDEX_COLUMNS,
+    "curation_row_plan_chunks": CURATION_ROW_PLAN_CHUNK_PREDICATE_INDEX_COLUMNS,
 }
 
 
@@ -828,6 +898,78 @@ def build_eval_metric_catalog_predicate_indexes(
         columns=EVAL_METRIC_CATALOG_PREDICATE_INDEX_COLUMNS,
         replace=replace,
     )
+
+
+def build_curation_materialization_rollup_predicate_indexes(
+    lake: Lake,
+    *,
+    replace: bool = False,
+) -> tuple[ScalarIndexResult, ...]:
+    """Build hot scalar predicate indexes for the rollup catalog (backlog 0145).
+
+    Covers ``curation_materialization_rollups`` and the per-output-file
+    ``curation_materialization_files`` chunk table. Called by ``curate
+    sync-materialization-rollups`` after a catalog rebuild and by ``lake
+    maintain`` via :data:`PREDICATE_INDEX_COLUMNS_BY_TABLE`. Unsupported backends
+    report ``skipped``; predicate pushdown still applies.
+    """
+    results = list(
+        _build_typed_predicate_indexes(
+            lake,
+            table="curation_materialization_rollups",
+            columns=CURATION_MATERIALIZATION_ROLLUP_PREDICATE_INDEX_COLUMNS,
+            replace=replace,
+        )
+    )
+    results.extend(
+        _build_typed_predicate_indexes(
+            lake,
+            table="curation_materialization_files",
+            columns=CURATION_MATERIALIZATION_FILE_PREDICATE_INDEX_COLUMNS,
+            replace=replace,
+        )
+    )
+    return tuple(results)
+
+
+def build_curation_row_plan_predicate_indexes(
+    lake: Lake,
+    *,
+    replace: bool = False,
+) -> tuple[ScalarIndexResult, ...]:
+    """Build hot scalar predicate indexes for the row-plan catalog (backlog 0146).
+
+    Covers the ``curation_row_plans`` header and the ``curation_row_plan_chunks``
+    target chunks. Called inline after a plan is compiled and by ``lake maintain``
+    via :data:`PREDICATE_INDEX_COLUMNS_BY_TABLE`. The chunk-table indexes are the
+    load-bearing ones: without a BTREE on ``(plan_id, start_ordinal)`` a deep
+    target page degenerates into a chunk-table scan. Unsupported backends report
+    ``skipped``; predicate pushdown still applies.
+
+    Because the inline caller runs on *every* compile, each table's existing index
+    coverage is checked once up front and a fully-covered table is skipped outright.
+    Otherwise the per-column builder re-opens the table, counts its rows, and lists
+    its indices once per column -- 15 no-op round trips per compile from the second
+    compile onward.
+    """
+    results: list[ScalarIndexResult] = []
+    for table, columns in (
+        ("curation_row_plans", CURATION_ROW_PLAN_PREDICATE_INDEX_COLUMNS),
+        ("curation_row_plan_chunks", CURATION_ROW_PLAN_CHUNK_PREDICATE_INDEX_COLUMNS),
+    ):
+        if not replace:
+            try:
+                covered = set(scalar_index_columns(lake.table(table)))
+            except Exception:
+                covered = set()
+            if covered and {column for column, _ in columns} <= covered:
+                continue
+        results.extend(
+            _build_typed_predicate_indexes(
+                lake, table=table, columns=columns, replace=replace
+            )
+        )
+    return tuple(results)
 
 
 def build_predicate_indexes_for_table(

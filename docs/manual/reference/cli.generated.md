@@ -9,9 +9,21 @@ Every `lancedb-robotics` command group and subcommand, generated from the Typer 
 
 Create multi-rate temporally aligned observation views.
 
+### `align cleanup-ticks`
+
+Compact and retention-clean aligned_ticks (dry-run unless --apply).
+
 ### `align create`
 
 Create a deterministic aligned observation view and record lineage.
+
+### `align diagnose-ticks`
+
+Report aligned_ticks/aligned_frames size, duplicates, and stale rows.
+
+### `align migrate-ticks`
+
+Batch-migrate recorded alignments into aligned_ticks with a validation report.
 
 ## `bench`
 
@@ -44,6 +56,14 @@ Validate retained public LeRobot benchmark artifacts and claims.
 ## `curate`
 
 Curate, sample, mine, and snapshot scenario selections.
+
+### `curate compact-chunks`
+
+Reclaim orphaned (and opt-in superseded) view membership chunk rows.
+
+### `curate compact-row-plans`
+
+Reclaim orphan row-plan chunk rows whose header never landed (0146).
 
 ### `curate compare`
 
@@ -105,13 +125,25 @@ Import eval metrics and link them to a curated snapshot.
 
 Build or inspect scalar indexes for curation saved-view hot paths.
 
+### `curate materialization-history`
+
+List materialization history from the indexed rollup catalog, bounded + paged.
+
 ### `curate materialization-report`
 
 Record copy accounting for a boundary projection/export.
 
+### `curate materialization-rollup`
+
+Aggregate copy-cost over the indexed rollup catalog (branch/format trends).
+
 ### `curate membership-history`
 
 Inspect saved-view membership decisions with as-of replay semantics.
+
+### `curate migrate-views`
+
+Migrate legacy inline saved views into chunked membership storage.
 
 ### `curate mine-failures`
 
@@ -133,13 +165,37 @@ Apply the comparison retention lifecycle (active -> archived -> pruned).
 
 Apply the eval-metric retention lifecycle (active -> superseded -> pruned).
 
+### `curate prune-materializations`
+
+Compact superseded plan/dry-run reports (active -> superseded -> pruned).
+
+### `curate prune-row-plans`
+
+Compact superseded, unreferenced compiled row plans (backlog 0146).
+
 ### `curate quality-filter`
 
 Filter scenarios by quality flags and optional quality score.
 
+### `curate replay-readiness`
+
+Report whether snapshot-pinned curation versions are still replayable (0143).
+
 ### `curate review-queue`
 
 Create and export logical review queues.
+
+### `curate row-plan`
+
+Show one compiled row plan's header plus its bounded compile summary.
+
+### `curate row-plan-targets`
+
+Page a compiled plan's targets in stable ordinal order (backlog 0146).
+
+### `curate row-plans`
+
+List compiled row plans, newest key last, in bounded pages (backlog 0146).
 
 ### `curate save-view`
 
@@ -153,9 +209,25 @@ Create a balanced per-slice scenario snapshot.
 
 Rebuild the eval metric catalog from model_outputs (pre-0095 lakes, drift repair).
 
+### `curate sync-materialization-rollups`
+
+Rebuild the rollup catalog from ``curation_materializations`` (backlog 0145).
+
 ### `curate trace-membership`
 
 Explain why a scenario is included in or excluded from a snapshot.
+
+### `curate validate-chunks`
+
+Validate chunk integrity for chunked saved views and report repairs.
+
+### `curate validate-row-plans`
+
+Check chunked row-plan storage against its header (backlog 0146).
+
+### `curate view-membership`
+
+Page a saved view's membership lazily and report scale diagnostics.
 
 ## `dataset`
 
@@ -305,6 +377,10 @@ Recommend LeRobot media-inspection timeout and retry settings from telemetry.
 
 Register an MCAP file as a source and ingest it into canonical lake rows.
 
+### `ingest rlds`
+
+Ingest prepared RLDS/TFDS episodes and steps into canonical lake rows.
+
 ### `ingest rosbag`
 
 Register a ROS1 `.bag` or ROS2 sqlite `.db3` source and ingest it.
@@ -328,6 +404,10 @@ Probe LeRobot object-store auth, listing, metadata, and ingest preflight behavio
 ### `inspect mcap`
 
 Describe an MCAP file or split recording (topics, counts, range) without ingesting.
+
+### `inspect rlds`
+
+Describe RLDS/TFDS splits, shards, and feature metadata without ingesting.
 
 ### `inspect rosbag`
 
@@ -632,6 +712,14 @@ List evaluation-run manifests (deterministic paging).
 ### `train expire`
 
 Delete a manifest row; refuses protected rows unless --force is passed.
+
+### `train index-advice`
+
+Recommend (and optionally apply) scalar indexes from predicate-planning telemetry in persisted training reports.
+
+### `train index-jobs`
+
+Enterprise scalar predicate index job lifecycle: capability, request, list, status, retry, cancel, reconcile.
 
 ### `train metrics`
 

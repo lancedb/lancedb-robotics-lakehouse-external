@@ -174,6 +174,17 @@ corpus never fits in RAM.** Concretely, on every new read path:
   row is null. For any new write path, ask: if two of these run at once, or one
   crashes mid-write, does the table end up fully written, unchanged, or loudly
   errored — never partially written and silently reported as success?
+- **A process-local mutex is not coordination for a multi-table write.** Backlog
+  **0258** initially protected RLDS cleanup + streaming appends + finalization
+  with a Python lock; a second process could still delete a winner's partial
+  rows and let that winner report success. When a write cannot be expressed as
+  one atomic Lance commit, gate the whole destructive/multi-commit section with
+  a pre-seeded, lake-resident CAS row (`rlds_ingest_claims` is the reference),
+  acquired by a predicate-gated `Table.update()` whose loser updates zero rows.
+  Acquire before cleanup, release on every ordinary exit, and fail closed when
+  the gate is missing, held, or cannot be released. Leases and stale-owner
+  recovery must be explicit and auditable; never infer safety from a PID,
+  container, or in-process lock.
 - **Batch large commits; don't stage one oversized write.** BUG-02: a single
   oversized commit deterministically panicked Lance's Rust-layer mini-block
   encoder. The fix batched the write into bounded `merge_insert` calls rather
@@ -300,6 +311,7 @@ corpus never fits in RAM.** Concretely, on every new read path:
 | BUG-14 | Per-flush ingest = one fragment + one version; ~100 rows/fragment left an ~79x per-row scan tax | Compact once at end of ingest, not per flush; compact → index → prune ordering |
 | BUG-15 | `observations` (352K rows) and `lineage_edges` (1.29M rows) had zero scalar indexes; filters were full scans | New filter/join-key columns need a scalar index (BTREE high-card / BITMAP low-card), refreshed on every append |
 | backlog 0183 | IVF_PQ recall was ~0 at default params; the lever was `refine_factor`, not `nprobes`; index also correctly no-ops below `MIN_INDEX_ROWS`=256 | Measure recall@k explicitly; know your knob and your floor before trusting an ANN index |
+| backlog 0258 | RLDS ingest used only a Python mutex around destructive cleanup and multi-table appends; another process/container could race it and delete rows the winner was still writing | Put a pre-seeded CAS gate in the lake, acquire it before cleanup, release it on ordinary exit, and fail closed on contention/stale ownership |
 
 ## 5. Pre-merge checklist
 

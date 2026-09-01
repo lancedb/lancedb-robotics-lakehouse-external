@@ -100,13 +100,19 @@ class DecodeResult:
     ``status`` is one of ``decoded`` | ``raw`` | ``failed``. ``payload_json`` is
     populated only on ``decoded``; ``payload_blob`` holds hoisted large-binary
     bytes (NULL for scalar messages); ``error`` is set only on ``failed``/``raw``
-    to explain the outcome.
+    to explain the outcome. ``blobs`` is the same hoisted bytes, in message-field
+    order (usually one entry, e.g. a `CompressedImage.data`) rather than
+    re-serialized as the whole envelope — for a caller that already has
+    ``(message_encoding, schema)`` in hand (e.g. re-reading a message straight
+    from its source file) and wants the real field bytes directly, without
+    persisting ``payload_blob`` and redoing the same decode to unwrap it again.
     """
 
     status: str
     payload_json: str | None = None
     payload_blob: bytes | None = None
     error: str | None = None
+    blobs: tuple[bytes, ...] = ()
 
 
 class PayloadDecoder:
@@ -203,7 +209,12 @@ class PayloadDecoder:
             payload_json = json.dumps(jsonable, separators=(",", ":"), sort_keys=True)
         except (TypeError, ValueError) as exc:
             return DecodeResult(status="failed", error=f"json-serialize: {exc}")
-        return DecodeResult(status="decoded", payload_json=payload_json, payload_blob=payload_blob)
+        return DecodeResult(
+            status="decoded",
+            payload_json=payload_json,
+            payload_blob=payload_blob,
+            blobs=tuple(blobs),
+        )
 
     def _factory_for(self, message_encoding: str) -> Any | None:
         if message_encoding in self._factories:

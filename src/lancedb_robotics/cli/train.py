@@ -15,6 +15,8 @@ plan_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 permutation_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 prewarm_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 warm_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+index_jobs_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+index_advice_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 train_app.add_typer(preview_app, name="preview", help="Preview a snapshot as a training dataset.")
 train_app.add_typer(remote_app, name="remote", help="Inspect Enterprise remote training setup.")
 train_app.add_typer(
@@ -51,6 +53,18 @@ train_app.add_typer(
     warm_app,
     name="warm",
     help="Query-driven cache warming: warm exactly what training reads via queries.",
+)
+train_app.add_typer(
+    index_jobs_app,
+    name="index-jobs",
+    help="Enterprise scalar predicate index job lifecycle: capability, request, "
+    "list, status, retry, cancel, reconcile.",
+)
+train_app.add_typer(
+    index_advice_app,
+    name="index-advice",
+    help="Recommend (and optionally apply) scalar indexes from predicate-planning "
+    "telemetry in persisted training reports.",
 )
 
 _LAKE_OPTION = typer.Option(..., "--lake", help="Path or object-store URI to the lake.")
@@ -1382,6 +1396,75 @@ def permutation_build(
         typer.echo(f"warning: {warning}")
 
 
+def _permutation_artifact_line(item: dict) -> str:
+    tag = "" if item.get("cataloged", True) else " (uncataloged)"
+    return (
+        f"  {item['permutation_table']}{tag}  rows={item.get('row_count', 0)} "
+        f"use={item.get('use_count', 0)} retention={item.get('retention_policy', 'auto')} "
+        f"row_plan={item.get('row_plan_id') or '-'}"
+    )
+
+
+@permutation_app.command("artifacts")
+def permutation_artifacts(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """List internal epoch-permutation artifacts and their lifecycle metadata (0131)."""
+    opened = _open_lake_or_exit(lake)
+    artifacts = opened.training.permutation_artifacts()
+    accounting = opened.training.permutation_artifact_accounting()
+    if output_format == "json":
+        _emit_json({"accounting": accounting, "artifacts": artifacts})
+        return
+    typer.echo(
+        f"permutation artifacts: {accounting['artifact_count']} "
+        f"(rows={accounting['total_rows']} est_bytes={accounting['estimated_bytes']})"
+    )
+    if not artifacts:
+        typer.echo("no internal epoch-permutation artifacts recorded")
+        return
+    for item in artifacts:
+        typer.echo(_permutation_artifact_line(item))
+
+
+@permutation_app.command("cleanup")
+def permutation_cleanup(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    apply: bool = typer.Option(
+        False,
+        "--apply/--dry-run",
+        help="Actually drop unreferenced tables; default is a dry-run plan.",
+    ),
+    include_uncataloged: bool = typer.Option(
+        False,
+        "--include-uncataloged/--catalog-only",
+        help="Also reclaim orphan tables with no catalog metadata (cannot be "
+        "reference-checked); default keeps them.",
+    ),
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Reclaim unreferenced internal epoch-permutation tables; keep referenced/pinned (0131)."""
+    opened = _open_lake_or_exit(lake)
+    report = opened.training.cleanup_permutation_artifacts(
+        dry_run=not apply, include_uncataloged=include_uncataloged
+    )
+    if output_format == "json":
+        _emit_json(report)
+        return
+    verb = "would remove" if report["dry_run"] else "removed"
+    typer.echo(
+        f"scanned {report['scanned']} artifact(s); {verb} {report['removed_count']}, "
+        f"kept {report['kept_count']} (reclaimed_bytes={report['reclaimed_bytes']}, "
+        f"protected_plan_ids={report['protected_plan_ids']}, "
+        f"skipped_uncataloged={report.get('skipped_uncataloged_count', 0)})"
+    )
+    for name in report["removed"]:
+        typer.echo(f"  - {name}")
+    for entry in report.get("errors", []):
+        typer.echo(f"error: {entry['permutation_table']}: {entry['error']}", err=True)
+
+
 _PREWARM_ID_OPTION = typer.Option(..., "--id", help="Prewarm JobRun id (the opaque prewarm-* id).")
 
 
@@ -1391,6 +1474,317 @@ def _prewarm_job_line(job: dict) -> str:
         f"attach={job['attach_count']} retry={job['retry_count']} "
         f"workers={len(job['workers'])}"
     )
+
+
+_INDEX_JOB_ID_OPTION = typer.Option(..., "--id", help="Scalar-index job id (the scix-* id).")
+
+
+def _index_job_line(job: dict) -> str:
+    return (
+        f"  {job['job_id']}  {job['status']:9s} {job['table']}.{job['column']} "
+        f"mode={job['build_mode']:14s} retry={job['retry_count']} "
+        f"reason={job.get('terminal_reason') or '-'}"
+    )
+
+
+@index_jobs_app.command("capability")
+def index_jobs_capability(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Report how this backend builds scalar predicate indexes (backlog 0136)."""
+    opened = _open_lake_or_exit(lake)
+    capability = opened.training.scalar_index_capability()
+    if output_format == "json":
+        _emit_json(capability)
+        return
+    typer.echo(f"scalar-index build mode: {capability['mode']}")
+    typer.echo(f"backend: {capability['backend_kind']}")
+    if capability.get("reason"):
+        typer.echo(f"reason: {capability['reason']}")
+    if capability.get("fallbacks"):
+        typer.echo(f"fallbacks: {', '.join(capability['fallbacks'])}")
+
+
+@index_jobs_app.command("request")
+def index_jobs_request(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    table: str = typer.Option(
+        None, "--table", help="Table to index (omit to request all aligned hot predicates)."
+    ),
+    column: str = typer.Option(None, "--column", help="Column to index (requires --table)."),
+    index_type: str = typer.Option("BTREE", "--index-type", help="Scalar index type."),
+    include_frames: bool = typer.Option(
+        True, "--include-frames/--no-include-frames", help="Include aligned_frames predicates."
+    ),
+    replace: bool = typer.Option(False, "--replace", help="Force a rebuild of an existing index."),
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Request scalar predicate index build job(s) (backlog 0136).
+
+    With no --table, requests every recommended aligned hot-predicate index. With
+    --table/--column, requests a single job. Idempotent: repeated requests reuse
+    the existing job for the same table/version/column/index-type.
+    """
+    opened = _open_lake_or_exit(lake)
+    if column and not table:
+        typer.echo("error: --column requires --table", err=True)
+        raise typer.Exit(code=1)
+    if table and column:
+        results = [
+            opened.training.request_scalar_index_job(
+                table=table, column=column, index_type=index_type, replace=replace
+            )
+        ]
+    elif table:
+        typer.echo("error: pass --column with --table, or omit both for aligned defaults", err=True)
+        raise typer.Exit(code=1)
+    else:
+        results = opened.training.request_aligned_index_jobs(
+            include_frames=include_frames, replace=replace
+        )
+    if output_format == "json":
+        _emit_json(results)
+        return
+    typer.echo(f"requested {len(results)} scalar-index job(s):")
+    for result in results:
+        typer.echo(_index_job_line(result["job"]))
+
+
+@index_jobs_app.command("list")
+def index_jobs_list(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    status: str = typer.Option(None, "--status", help="Filter by lifecycle status."),
+    table: str = typer.Option(None, "--table", help="Filter by table."),
+    limit: int = typer.Option(None, "--limit", help="Max jobs to return."),
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """List durable scalar predicate index jobs for a lake (backlog 0136)."""
+    opened = _open_lake_or_exit(lake)
+    jobs = opened.training.scalar_index_jobs(status=status, table=table, limit=limit)
+    if output_format == "json":
+        _emit_json(jobs)
+        return
+    if not jobs:
+        typer.echo("no scalar-index jobs recorded")
+        return
+    typer.echo(f"scalar-index jobs ({len(jobs)}):")
+    for job in jobs:
+        typer.echo(_index_job_line(job))
+
+
+@index_jobs_app.command("status")
+def index_jobs_status(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    job_id: str = _INDEX_JOB_ID_OPTION,
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Show a single scalar-index job by id (full status history)."""
+    opened = _open_lake_or_exit(lake)
+    job = opened.training.scalar_index_job(job_id)
+    if job is None:
+        typer.echo(f"error: no scalar-index job for id {job_id!r}", err=True)
+        raise typer.Exit(code=1)
+    if output_format == "json":
+        _emit_json(job)
+        return
+    typer.echo(f"scalar-index job: {job['job_id']}")
+    typer.echo(f"target: {job['table']}.{job['column']} ({job['index_type']})")
+    typer.echo(f"status: {job['status']} (reason={job.get('terminal_reason')})")
+    typer.echo(f"build_mode/backend: {job['build_mode']}/{job['backend_kind']}")
+    typer.echo(f"retry_count: {job['retry_count']}  request_count: {job['request_count']}")
+    for entry in job["status_history"]:
+        typer.echo(f"  - {entry['at']}  {entry['status']}  {entry.get('reason') or ''}")
+
+
+@index_jobs_app.command("retry")
+def index_jobs_retry(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    job_id: str = _INDEX_JOB_ID_OPTION,
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Re-submit a failed/canceled/expired scalar-index job (increments retry)."""
+    from lancedb_robotics.scalar_index_jobs import ScalarIndexJobError
+
+    opened = _open_lake_or_exit(lake)
+    try:
+        status = opened.training.retry_scalar_index_job(job_id)
+    except ScalarIndexJobError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if output_format == "json":
+        _emit_json(status)
+        return
+    typer.echo(f"retried {job_id}: status={status['status']} retry_count={status['retry_count']}")
+
+
+@index_jobs_app.command("cancel")
+def index_jobs_cancel(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    job_id: str = _INDEX_JOB_ID_OPTION,
+    reason: str = typer.Option(None, "--reason", help="Optional cancellation reason."),
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Cancel a no-longer-needed scalar-index job (complete jobs are left as-is)."""
+    from lancedb_robotics.scalar_index_jobs import ScalarIndexJobError
+
+    opened = _open_lake_or_exit(lake)
+    try:
+        status = opened.training.cancel_scalar_index_job(job_id, reason=reason)
+    except ScalarIndexJobError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if output_format == "json":
+        _emit_json(status)
+        return
+    typer.echo(f"canceled {job_id}: status={status['status']}")
+
+
+@index_jobs_app.command("reconcile")
+def index_jobs_reconcile(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Poll pending scalar-index jobs and expire stale ones (backlog 0136).
+
+    Safe on any backend that exposes index management: does not run the direct-IO
+    lake maintenance path, so it works on remote db:// lakes where `lake maintain`
+    is gated.
+    """
+    opened = _open_lake_or_exit(lake)
+    changed = opened.training.reconcile_scalar_index_jobs()
+    if output_format == "json":
+        _emit_json(changed)
+        return
+    typer.echo(f"reconciled {len(changed)} scalar-index job(s)")
+    for job in changed:
+        typer.echo(_index_job_line(job))
+
+
+def _recommendation_line(rec: dict) -> str:
+    fraction = rec.get("selectivity_fraction")
+    frac = f"{fraction:.3f}" if isinstance(fraction, (int, float)) else "n/a"
+    return (
+        f"  - {rec['action']:<20} {rec['table']}.{rec['column']} "
+        f"[{rec['column_kind']}] conf={rec['confidence']} "
+        f"obs={rec['observations']} retains={frac} "
+        f"scan_rows~{rec['estimated_unindexed_scan_rows']}: {rec['reason']}"
+    )
+
+
+def _load_report_bodies(reports_path: str | None) -> list | None:
+    """Load report bodies from a JSON file (a single report or a list)."""
+    if reports_path is None:
+        return None
+    payload = json.loads(Path(reports_path).read_text())
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        return payload
+    raise typer.BadParameter("--reports must be a JSON object or array of report bodies")
+
+
+@index_advice_app.command("recommend")
+def index_advice_recommend(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    reports: str = typer.Option(
+        None,
+        "--reports",
+        help="Path to a JSON report body (or array) instead of the report catalog.",
+    ),
+    limit: int = typer.Option(
+        200, "--limit", help="Max recent aligned reports to read from the catalog."
+    ),
+    min_observations: int = typer.Option(
+        None, "--min-observations", help="Override: min repeated uses to recommend."
+    ),
+    min_total_rows: int = typer.Option(
+        None, "--min-total-rows", help="Override: min table rows to recommend (small-table guard)."
+    ),
+    max_selectivity: float = typer.Option(
+        None,
+        "--max-selectivity",
+        help="Override: max retained fraction a predicate may keep and still be selective.",
+    ),
+    action: str = typer.Option(
+        None, "--action", help="Filter to one action (create_scalar_index/refresh_stale_index/promote_jsonb_column/none)."
+    ),
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Recommend scalar indexes / JSONB promotions from predicate telemetry (backlog 0137).
+
+    Read-only. Aggregates the ``predicate_telemetry`` in persisted aligned training
+    reports (or a ``--reports`` file) and prints ranked recommendations. Guardrails
+    suppress small tables, low-selectivity predicates, rarely-used predicates, and
+    unsupported backends by default.
+    """
+    opened = _open_lake_or_exit(lake)
+    recommendations = opened.training.recommend_predicate_indexes(
+        reports=_load_report_bodies(reports),
+        limit=limit,
+        min_observations=min_observations,
+        min_total_rows=min_total_rows,
+        max_selectivity_fraction=max_selectivity,
+    )
+    if action:
+        recommendations = [rec for rec in recommendations if rec["action"] == action]
+    if output_format == "json":
+        _emit_json(recommendations)
+        return
+    if not recommendations:
+        typer.echo("no predicate-index recommendations (no telemetry, or all guardrails suppressed)")
+        return
+    typer.echo(f"predicate-index recommendations ({len(recommendations)}):")
+    for rec in recommendations:
+        typer.echo(_recommendation_line(rec))
+
+
+@index_advice_app.command("apply")
+def index_advice_apply(
+    lake: str = _MANIFEST_LAKE_OPTION,
+    reports: str = typer.Option(
+        None, "--reports", help="Path to a JSON report body (or array) instead of the catalog."
+    ),
+    limit: int = typer.Option(200, "--limit", help="Max recent aligned reports to read."),
+    force: bool = typer.Option(
+        False, "--force", help="Apply guardrail-suppressed forceable columns and lower the confidence bar."
+    ),
+    suppress: str = typer.Option(
+        None, "--suppress", help="Comma-separated 'table.column' or 'column' to never apply."
+    ),
+    min_confidence: str = typer.Option(
+        "high", "--min-confidence", help="Minimum confidence to auto-apply (high/medium/low)."
+    ),
+    replace: bool = typer.Option(False, "--replace", help="Rebuild indexes that already exist."),
+    output_format: str = _MANIFEST_FORMAT_OPTION,
+) -> None:
+    """Apply safe predicate-index recommendations as durable 0136 jobs (backlog 0137).
+
+    Requests scalar-index jobs only for safe, high-confidence typed-column
+    recommendations; JSONB-path predicates are surfaced as advisory promotions and
+    never auto-applied. Returns one auditable outcome per recommendation.
+    """
+    opened = _open_lake_or_exit(lake)
+    suppress_list = [item.strip() for item in suppress.split(",")] if suppress else None
+    outcomes = opened.training.apply_predicate_index_recommendations(
+        reports=_load_report_bodies(reports),
+        limit=limit,
+        force=force,
+        suppress=suppress_list,
+        min_confidence=min_confidence,
+        replace=replace,
+    )
+    if output_format == "json":
+        _emit_json(outcomes)
+        return
+    applied = sum(1 for outcome in outcomes if outcome["outcome"] == "applied")
+    typer.echo(f"applied {applied}/{len(outcomes)} recommendation(s):")
+    for outcome in outcomes:
+        rec = outcome["recommendation"]
+        typer.echo(
+            f"  - [{outcome['outcome']}] {rec['table']}.{rec['column']} "
+            f"({rec['action']}): {outcome['reason']}"
+        )
 
 
 @prewarm_app.command("list")

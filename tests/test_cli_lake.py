@@ -42,7 +42,8 @@ def test_lake_init_creates_tables_without_ingesting(tmp_path):
     lake = Lake.open(lake_path)
     assert lake.table_names() == list(CANONICAL_TABLES)
     for name in lake.table_names():
-        assert lake.table(name).count_rows() == 0
+        expected = 1 if name == "rlds_ingest_claims" else 0
+        assert lake.table(name).count_rows() == expected
 
 
 def test_lake_init_reports_each_table(tmp_path):

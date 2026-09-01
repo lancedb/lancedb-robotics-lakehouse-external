@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import heapq
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -2733,6 +2734,72 @@ def get_training_report(
     # Most recent first when a handle matches several report rows.
     latest = _sorted_by_created(rows, "report_id")[-1]
     return _report_record_from_row(latest)
+
+
+def recent_training_reports(
+    lake: Lake,
+    *,
+    loader_kind: str | None = None,
+    limit: int = 200,
+) -> list[TrainingReportRecord]:
+    """The newest ``limit`` training reports (oldest-first), in bounded memory.
+
+    Selects the newest reports by ``created_at`` in a single streaming scan that
+    keeps at most ``limit`` rows via a bounded min-heap: it never fans out into one
+    full scan per report id, and it never holds more than ``limit`` report bodies
+    plus one batch in memory (the older bodies are evicted as it streams, not all
+    materialized). Returns oldest-first so a caller assigning a chronological
+    ``sequence`` gets increasing order.
+
+    ``training_reports`` is a metadata catalog written only on explicit
+    ``record_training_report``, so a whole-catalog scan is bounded in practice; for
+    long-horizon telemetry at true fleet scale prefer a pre-aggregated rollup over
+    this scan (backlog 0463). Raises if the catalog table is absent
+    (callers that must degrade to "no data" should guard the call).
+    """
+    if limit <= 0:
+        return []
+    predicates = [_Predicate("loader_kind", "=", loader_kind)] if loader_kind else []
+    where_sql = _predicates_sql(predicates)
+    handle = lake.table(TRAINING_REPORTS_TABLE)
+    available = set(handle.schema.names)
+    columns = ["report_id", "report_json", "backend_json", "created_at"]
+    projected = [c for c in columns if c in available] or None
+
+    # Min-heap ordered by (created_at, report_id, tie): the smallest (oldest) is
+    # evicted once the heap exceeds ``limit``, so only the newest ``limit`` rows
+    # survive and peak memory is O(limit) bodies + one batch, not O(catalog). The
+    # monotonic ``tie`` counter keeps the raw-row dict out of any tuple comparison.
+    heap: list[tuple[datetime, str, int, dict[str, Any]]] = []
+    counter = 0
+
+    def _consider(row: Mapping[str, Any]) -> None:
+        nonlocal counter
+        entry = (_created_at_key(row), str(row.get("report_id") or ""), counter, dict(row))
+        counter += 1
+        if len(heap) < limit:
+            heapq.heappush(heap, entry)
+        else:
+            heapq.heappushpop(heap, entry)
+
+    try:
+        query = handle.search()
+        if projected:
+            query = query.select(projected)
+        if where_sql:
+            query = query.where(where_sql)
+        for batch in query.to_batches(batch_size=_SCAN_BATCH_SIZE):
+            for row in batch.to_pylist():
+                _consider(row)
+    except Exception:  # noqa: BLE001 - backends without server-side query: fall back
+        heap = []
+        counter = 0
+        for row in handle.to_arrow().to_pylist():
+            if all(_predicate_matches(p, row) for p in predicates):
+                _consider(row)
+
+    survivors = sorted(heap, key=lambda item: (item[0], item[1]))
+    return [_report_record_from_row(item[3]) for item in survivors]
 
 
 @dataclass(frozen=True)

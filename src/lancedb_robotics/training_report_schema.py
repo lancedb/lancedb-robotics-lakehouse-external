@@ -231,6 +231,42 @@ TRAINING_LOADER_REPORT_SCHEMA: dict[str, Any] = {
         },
         "fallback_events": {"type": "array", "items": {"type": "object"}},
         "disabled_capabilities": {"type": "array", "items": {"type": "string"}},
+        # 0137: additive predicate-planning telemetry (aligned reports only). Only
+        # identifiers, index status, and read-level selectivity -- never literal
+        # predicate values. Optional so pre-0137 and native reports still validate.
+        "predicate_telemetry": {
+            "type": "object",
+            "required": ["predicates"],
+            "properties": {
+                "output_table": _nullable("string"),
+                "backend_kind": _nullable("string"),
+                "backend_supports_scalar_index": {"type": "boolean"},
+                "total_rows": _nullable("integer"),
+                "selected_rows": _nullable("integer"),
+                "selectivity_fraction": _nullable("number"),
+                "filter_columns": {"type": "array", "items": {"type": "string"}},
+                "predicates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["table", "column", "column_kind", "index_status"],
+                        "properties": {
+                            "table": {"type": "string"},
+                            "column": {"type": "string"},
+                            "column_kind": {"enum": ["typed", "jsonb_path"]},
+                            "predicate_role": {"type": "string"},
+                            "used_in_filter": {"type": "boolean"},
+                            "index_status": {"type": "string"},
+                            "index_backed": {"type": "boolean"},
+                            "index_type": _nullable("string"),
+                            "job_status": _nullable("string"),
+                            "num_rows": _nullable("integer"),
+                            "reason": _nullable("string"),
+                        },
+                    },
+                },
+            },
+        },
         "run": {"type": "object"},
     },
     "allOf": [

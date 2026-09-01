@@ -77,6 +77,12 @@ failures tied back to real source scenarios; and the **labeling and data-ops
 teams** whose review decisions should write back into the same substrate
 researchers train from.
 
+> **Evaluating this for a team?** The
+> [AI Research Lead evidence pack](docs/narratives/ai-research-lead-evidence-pack.md)
+> is a 15–30 minute guided evaluation: a runnable mini-demo, every claim linked
+> to its source, an expanded "why not DIY on cloud services?" comparison, a
+> leadership FAQ, and a decision tree for picking the first adoption rung.
+
 ## The problem: episode quality is the bottleneck
 
 Robot **capture formats are write-optimized.** MCAP, rosbag2, and HDF5 are

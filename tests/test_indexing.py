@@ -299,6 +299,8 @@ def test_curation_predicate_index_helper_requests_hot_columns():
         "scenario_id",
         "decision",
         "queue",
+        "source",
+        "reviewer",
         "created_at",
     ]
     chunk_columns = ["view_id", "chunk_index", "start_ordinal", "end_ordinal"]
@@ -326,6 +328,8 @@ def test_curation_predicate_index_status_skips_unsupported_backend():
         "scenario_id",
         "decision",
         "queue",
+        "source",
+        "reviewer",
         "created_at",
     ]
     chunk_columns = ["view_id", "chunk_index", "start_ordinal", "end_ordinal"]

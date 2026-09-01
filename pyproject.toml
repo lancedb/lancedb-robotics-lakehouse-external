@@ -69,6 +69,16 @@ lerobot-native-bench = [
     "av>=12.0",
     "numpy>=1.24",
 ]
+# RLDS/TFDS *ingest* needs only the maintained TensorFlow + TFDS reader stack.
+# It intentionally does not import the archived `rlds` package or Reverb.  The
+# GCS filesystem extra is available on the upstream-supported Python/platform
+# subset; direct `gs://` reads use TensorFlow Application Default Credentials.
+tfds = [
+    "tensorflow[gcs-filesystem]>=2.21,<2.22; platform_system != 'Windows' and python_version < '3.13'",
+    "tensorflow>=2.21,<2.22; platform_system == 'Windows' and python_version < '3.14'",
+    "tensorflow>=2.21,<2.22; python_version >= '3.13' and python_version < '3.14'",
+    "tensorflow-datasets>=4.9.10,<5; python_version < '3.14'",
+]
 rlds = [
     # `rlds` 0.1.x publishes Linux x86_64 wheels only, and the native
     # TensorFlow/RLDS validation stack currently fails to build on Python
@@ -77,9 +87,9 @@ rlds = [
     # job. The upstream `rlds` package imports TensorFlow and Reverb at module
     # import time, so the native stack must include those packages, not only
     # TFDS.
-    "dm-reverb[tensorflow]>=0.14,<0.15; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.13'",
-    "rlds>=0.1; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.13'",
-    "tensorflow-datasets>=4.9; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.13'",
+    "dm-reverb[tensorflow]>=0.14,<0.15; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.12'",
+    "rlds>=0.1; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.12'",
+    "tensorflow-datasets>=4.9; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version < '3.12'",
 ]
 webdataset = ["webdataset>=0.2.86"]
 # Optional: decoded media materialization for native training samples. The base
@@ -186,6 +196,12 @@ conflicts = [
     ],
     [
         { extra = "lerobot-native-bench" },
+        { extra = "rlds" },
+    ],
+    [
+        # The maintained TFDS ingest stack uses TensorFlow 2.21, while the
+        # archived Reverb conformance extra pins TensorFlow 2.15.
+        { extra = "tfds" },
         { extra = "rlds" },
     ],
 ]

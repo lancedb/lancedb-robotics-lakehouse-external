@@ -1,0 +1,197 @@
+# README claim-evidence registry (backlog 0138)
+# ---------------------------------------------------------------------------
+# The README "What you get (feature breadth)" section makes status claims about
+# what this project ships. Marketing-grade claims decay into fiction unless each
+# one is pinned to something in the tree. This registry is that pin: every
+# shipped (✅) or evolving (🚧) claim maps to at least one piece of evidence, and
+# `tests/test_readme_verification.py` fails if a claim has no entry, an entry has
+# no living claim, or any evidence pointer no longer resolves.
+#
+# Planned (🔭) claims are intentionally NOT listed here — they are roadmap, not
+# shipped, so they carry no evidence obligation.
+#
+# ---------------------------------------------------------------------------
+# HOW TO UPDATE THIS REGISTRY (read before editing the README status list)
+# ---------------------------------------------------------------------------
+# A capability moves 🔭 planned -> 🚧 evolving -> ✅ shipped. When you change a
+# README status bullet, update this file in the same change:
+#
+#   * Promote 🔭 -> 🚧/✅: add a new [[claim]] whose `key` is the EXACT bold
+#     title from the README bullet (the text between the ** **), set `status`,
+#     and list evidence. A claim with no evidence is not "shipped".
+#   * Reword a claim: change `key` here to match the new bold title verbatim
+#     (the test matches on exact title text, so drift is caught, not guessed).
+#   * Demote/remove a claim: delete its [[claim]] entry when the README bullet
+#     goes away or reverts to 🔭 planned, otherwise the orphan check fails.
+#
+# Evidence pointers are "<kind>:<target>":
+#   code:<path>       a source module that implements the claim
+#   test:<path>       a test that exercises it
+#   narrative:<path>  a docs/narratives/*.md walkthrough
+#   doc:<path>        any other doc (docs/product, docs/decisions, ...)
+#   decision:<path>   a docs/decisions/NNNN-*.md ADR
+#   backlog:NNNN      a .miagent/backlog/NNNN-*.md item
+# All file kinds resolve to a repo-relative path that must exist; `backlog`
+# resolves to `.miagent/backlog/NNNN-*.md`. Prefer at least one `code:` (or
+# `backlog:` for cross-repo work) so the claim is anchored to behavior, not prose.
+
+[[claim]]
+key = "MCAP ingest"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/ingest.py",
+  "narrative:docs/narratives/feature-set-mcap-robustness-and-scale.md",
+]
+
+[[claim]]
+key = "Payload decoders"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/extract.py",
+  "narrative:docs/narratives/feature-set-typed-field-extraction.md",
+]
+
+[[claim]]
+key = "ROS bag ingest"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/ingest.py",
+  "backlog:0025",
+]
+
+[[claim]]
+key = "LeRobot dataset ingest"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/lerobot_object_store_validation.py",
+  "backlog:0127",
+]
+
+[[claim]]
+key = "Object-store & remote lakes"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/storage.py",
+  "code:src/lancedb_robotics/connections.py",
+  "backlog:0023",
+]
+
+[[claim]]
+key = "Quality gates"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/quality.py",
+  "code:src/lancedb_robotics/maintenance.py",
+]
+
+[[claim]]
+key = "Episodes as first-class objects"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/episodes.py",
+  "narrative:docs/narratives/episode-creation-and-recreation.md",
+]
+
+[[claim]]
+key = "Sub-frame multi-rate alignment"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/align.py",
+  "code:src/lancedb_robotics/aligned_tick_lifecycle.py",
+]
+
+[[claim]]
+key = "Codec-aware video"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/video.py",
+  "code:src/lancedb_robotics/keyframe_maps.py",
+]
+
+[[claim]]
+key = "Captions + embeddings"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/enrich.py",
+  "code:src/lancedb_robotics/embeddings.py",
+]
+
+[[claim]]
+key = "Search"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/search.py",
+  "code:src/lancedb_robotics/indexing.py",
+]
+
+[[claim]]
+key = "Curation & mining workbench"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/curate.py",
+  "doc:docs/product/curation-flywheel-epic.md",
+]
+
+[[claim]]
+key = "Reproducible dataset snapshots"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/dataset.py",
+]
+
+[[claim]]
+key = "Lance-native & aligned training datasets"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/training.py",
+  "narrative:docs/narratives/lance-native-training-datasets.md",
+]
+
+[[claim]]
+key = "Training & evaluation manifests"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/run_manifests.py",
+  "code:src/lancedb_robotics/tracker_sync.py",
+]
+
+[[claim]]
+key = "Boundary projections"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/projections.py",
+  "code:src/lancedb_robotics/export.py",
+]
+
+[[claim]]
+key = "Canonical lineage graph"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/lineage.py",
+  "code:src/lancedb_robotics/lineage_graph.py",
+  "doc:docs/product/lineage-provenance-epic.md",
+]
+
+[[claim]]
+key = "Writeback"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/writeback.py",
+]
+
+[[claim]]
+key = "Reproducible benchmark harness"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/benchmark.py",
+  "narrative:docs/narratives/reproducible-benchmark-suite.md",
+]
+
+[[claim]]
+key = "Enterprise remote training"
+status = "evolving"
+evidence = [
+  "code:src/lancedb_robotics/pylance_execution.py",
+  "code:src/lancedb_robotics/enterprise_conformance.py",
+  "doc:docs/product/enterprise-remote-training-epic.md",
+]
