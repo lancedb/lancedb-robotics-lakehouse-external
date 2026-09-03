@@ -29,6 +29,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from conftest import require_torch_loader
 from mcap.reader import make_reader
 
 from lancedb_robotics.adapters import get_adapter
@@ -419,10 +420,19 @@ def test_encode_videos_packs_real_decoded_frames_not_raw_envelope(tmp_path):
 
 
 def test_live_facade_serves_real_camera_frames_end_to_end(tmp_path):
-    """The v2 facade: state (from ``/diagnostics``) + real camera frames
-    (from ``/image_color/compressed``), live, over the real demo corpus --
-    the full chain this session's work exists to prove: schema_registry ->
-    video.py real-decode -> lerobot_facade.videos.VideoIndex -> facade item.
+    """The v2 facade: state (from ``/radar/range``, a topic ``extract.py``
+    actually types -- ``/diagnostics`` does not, and silently omitting
+    ``observation.state`` was a real gap this test used to miss) + real
+    camera frames (from ``/image_color/compressed``), live, over the real
+    demo corpus -- the full chain this session's work exists to prove:
+    schema_registry -> video.py real-decode -> lerobot_facade.videos.
+    VideoIndex -> facade item. Also proves a genuine ``torch.utils.data.
+    DataLoader`` with the *default* ``collate_fn`` works end to end: it
+    batches ``observation.state`` into a tensor and gathers the raw,
+    variable-length image bytes into a plain list (no custom collate_fn
+    needed) -- confirms `to_torch_dataset`'s "raw bytes, no Pillow" design
+    is actually usable from a real training loop, not just internally
+    consistent.
     """
     from datetime import UTC, datetime
 
@@ -506,28 +516,56 @@ def test_live_facade_serves_real_camera_frames_end_to_end(tmp_path):
         "demo_camera_view",
         run_id=run_id,
         rate_hz=5.0,
-        streams=["/diagnostics", "/image_color/compressed"],
+        streams=["/radar/range", "/image_color/compressed"],
         tolerance_ms=300.0,
-        interpolation={"/diagnostics": "nearest", "/image_color/compressed": "nearest"},
+        interpolation={"/radar/range": "nearest", "/image_color/compressed": "nearest"},
     )
 
     mapping = CanonicalVectorMapping(
-        state_streams=("/diagnostics",), camera_streams=("/image_color/compressed",)
+        state_streams=("/radar/range",), camera_streams=("/image_color/compressed",)
     )
     facade = LiveLeRobotFacade(
         lake, name="demo_camera_view", mapping=mapping, episode_ids=["ep-demo-camera"]
     )
     assert len(facade) > 0
     key = camera_feature_key("/image_color/compressed")
+    image_key = f"observation.images.{key}"
     for index in range(len(facade)):
         item = facade[index]
-        image_bytes = item[f"observation.images.{key}"]
+        assert item["observation.state"] and len(item["observation.state"]) == 4, (
+            f"frame {index} missing/mis-shaped observation.state (radar/range is a 4-float layout)"
+        )
+        image_bytes = item[image_key]
         assert image_bytes.startswith(b"\xff\xd8\xff"), f"frame {index} is not a real JPEG"
 
     # Batched path returns the same real bytes as the single-item path.
     batched = facade.__getitems__(list(range(len(facade))))
     singles = [facade[i] for i in range(len(facade))]
     assert batched == singles
+
+    # A real torch.utils.data.DataLoader with the *default* collate_fn --
+    # not just direct facade[i]/__getitems__ calls -- proves this is usable
+    # from an actual training loop, matching how a real consumer would use it.
+    require_torch_loader()
+    import torch
+    from torch.utils.data import DataLoader
+
+    from lancedb_robotics.lerobot_facade import to_torch_dataset
+
+    torch_dataset = to_torch_dataset(facade)
+    loader = DataLoader(torch_dataset, batch_size=4, shuffle=False)
+    seen = 0
+    for batch in loader:
+        assert isinstance(batch["observation.state"], torch.Tensor)
+        assert batch["observation.state"].dtype == torch.float32
+        assert batch["observation.state"].shape[1] == 4
+        # Raw, variable-length JPEG bytes: default collate correctly leaves
+        # these as a plain list rather than trying to stack them into a
+        # tensor (they have no common length) -- no custom collate_fn needed.
+        assert isinstance(batch[image_key], list)
+        assert all(frame.startswith(b"\xff\xd8\xff") for frame in batch[image_key])
+        seen += batch["observation.state"].shape[0]
+    assert seen == len(facade)
 
 
 # --- nuScenes corpus: the mixed-encoding + lz4 story ------------------------
