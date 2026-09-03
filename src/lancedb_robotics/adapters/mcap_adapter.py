@@ -128,7 +128,9 @@ class McapAdapter:
         during ingest, where the run can be quarantined.
         """
         try:
-            with open_binary_uri(path, storage_options=storage_options, auth_ref=auth_ref) as stream:
+            with open_binary_uri(
+                path, storage_options=storage_options, auth_ref=auth_ref
+            ) as stream:
                 return self._inspect_stream(stream, path)
         except StorageConfigError as exc:
             raise AdapterError(str(exc)) from exc
@@ -146,15 +148,21 @@ class McapAdapter:
         """Yield one canonical message record per MCAP message, in log order.
 
         Each record carries envelope provenance (``topic``/``log_time_ns``/
-        ``sequence``/``message_encoding``/``schema_name``) plus the decoded
-        payload (backlog 0014): ``schema_encoding`` and ``decode_status``
-        (``decoded`` | ``raw`` | ``failed``), ``payload_json`` (canonical JSON of
-        the decoded message, NULL when undecodable), ``payload_blob`` (large
-        binary bytes hoisted out, NULL for scalar messages), and ``decode_error``
-        for non-decoded outcomes. Decode is dispatched per channel by
-        ``(message_encoding, schema_encoding)``, so a single mixed-encoding file
-        (json + protobuf + ros1, as in nuScenes) is handled correctly. A decode
-        failure keeps the row; no message is dropped.
+        ``sequence``/``message_encoding``/``schema_name``/``schema_data``)
+        plus the decoded payload (backlog 0014): ``schema_encoding`` and
+        ``decode_status`` (``decoded`` | ``raw`` | ``failed``), ``payload_json``
+        (canonical JSON of the decoded message, NULL when undecodable),
+        ``payload_blob`` (large binary bytes hoisted out, NULL for scalar
+        messages), and ``decode_error`` for non-decoded outcomes. Decode is
+        dispatched per channel by ``(message_encoding, schema_encoding)``, so a
+        single mixed-encoding file (json + protobuf + ros1, as in nuScenes) is
+        handled correctly. A decode failure keeps the row; no message is
+        dropped. ``schema_data`` is the real message-definition bytes (the
+        channel's MCAP ``Schema.data``) -- the caller persists it
+        content-addressed via ``schema_registry.py`` so ``payload_blob`` stays
+        re-decodable without the source file (``schema_encoding`` alone is
+        descriptive, not sufficient for :class:`~lancedb_robotics.adapters.
+        decoders.PayloadDecoder`).
 
         ``sequence`` is the per-topic message index (0-based, log-time order),
         not MCAP's optional sequence field, which many writers leave at zero.
@@ -172,7 +180,9 @@ class McapAdapter:
         decoder = PayloadDecoder()
         yielded = 0
         try:
-            with open_binary_uri(path, storage_options=storage_options, auth_ref=auth_ref) as stream:
+            with open_binary_uri(
+                path, storage_options=storage_options, auth_ref=auth_ref
+            ) as stream:
                 reader = make_reader(stream, validate_crcs=validate_crcs)
                 for schema, channel, message in reader.iter_messages(log_time_order=True):
                     yield self._message_row(channel, schema, message, per_topic_index, decoder)
@@ -226,7 +236,9 @@ class McapAdapter:
         channels: dict[int, Channel] = {}
         recovered = 0
         try:
-            with open_binary_uri(path, storage_options=storage_options, auth_ref=auth_ref) as stream:
+            with open_binary_uri(
+                path, storage_options=storage_options, auth_ref=auth_ref
+            ) as stream:
                 records = StreamReader(stream, validate_crcs=validate_crcs).records
                 while True:
                     try:
@@ -288,6 +300,11 @@ class McapAdapter:
             "message_encoding": channel.message_encoding,
             "schema_name": schema.name if schema else None,
             "schema_encoding": schema.encoding if schema else None,
+            # The real message-definition bytes -- without these, downstream
+            # storage can only keep schema_encoding (descriptive) and loses the
+            # ability to ever re-decode payload_blob without the source file
+            # (see schema_registry.py / OBSERVATIONS_SCHEMA v5).
+            "schema_data": schema.data if schema else None,
             "decode_status": result.status,
             "decode_error": result.error,
             "payload_json": result.payload_json,
@@ -313,7 +330,9 @@ class McapAdapter:
         Raises the adapter's read-error taxonomy (codec / corruption / invalid).
         """
         try:
-            with open_binary_uri(path, storage_options=storage_options, auth_ref=auth_ref) as stream:
+            with open_binary_uri(
+                path, storage_options=storage_options, auth_ref=auth_ref
+            ) as stream:
                 reader = make_reader(stream)
                 records = [
                     {
@@ -352,7 +371,9 @@ class McapAdapter:
         Raises the adapter's read-error taxonomy (codec / corruption / invalid).
         """
         try:
-            with open_binary_uri(path, storage_options=storage_options, auth_ref=auth_ref) as stream:
+            with open_binary_uri(
+                path, storage_options=storage_options, auth_ref=auth_ref
+            ) as stream:
                 reader = make_reader(stream)
                 records = [
                     {"name": md.name, "metadata": dict(md.metadata)}

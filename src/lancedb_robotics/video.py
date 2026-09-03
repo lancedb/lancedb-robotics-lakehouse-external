@@ -16,6 +16,7 @@ from typing import Any
 import pyarrow as pa
 
 from lancedb_robotics._mp4 import Mp4MetadataError, read_mp4_frame_sample
+from lancedb_robotics.adapters.decoders import PayloadDecoder
 from lancedb_robotics.blob import fetch_blob, fetch_blobs
 from lancedb_robotics.keyframe_maps import (
     KeyframeMapError,
@@ -26,6 +27,7 @@ from lancedb_robotics.keyframe_maps import (
 )
 from lancedb_robotics.lake import Lake
 from lancedb_robotics.lineage import emit_transform_lineage
+from lancedb_robotics.schema_registry import redecode_payload_blob
 from lancedb_robotics.schemas import TRANSFORM_RUNS_SCHEMA, VIDEO_ENCODINGS_SCHEMA
 
 VIDEO_ENCODING_BLOB_COLUMN = "data"
@@ -34,6 +36,8 @@ DEFAULT_GOP_SIZE = 2
 DEFAULT_RESOLUTION = "unknown"
 _FRAME_LEN = struct.Struct(">Q")
 _SOURCE_MP4_DECODER_BACKENDS: dict[str, Any] = {}
+_ROW_ID = "_rowid"
+_TAKE_BATCH_ROWS = 4096
 
 
 class VideoError(Exception):
@@ -50,6 +54,13 @@ class VideoEncodingReport:
     gop_size: int
     encodings_written: int
     encoding_ids: tuple[str, ...]
+    # How many source frames were genuinely re-decoded via schema_registry
+    # (real image bytes) vs. fell back to the raw, still-undecoded wire
+    # envelope (schema_digest absent -- pre-v5 observations, or a decode
+    # failure). Never silent: a caller can tell whether an encoding actually
+    # holds real pixels.
+    frames_redecoded: int = 0
+    frames_raw_envelope: int = 0
 
 
 @dataclass(frozen=True)
@@ -229,8 +240,13 @@ def encode_videos(
         }
     )
     now = datetime.now(UTC)
-    encoding_rows = [
-        _encoding_row(
+    decoder = PayloadDecoder()
+    schema_cache: dict[str, Any] = {}
+    encoding_rows: list[dict[str, Any]] = []
+    frames_redecoded = 0
+    frames_raw_envelope = 0
+    for video in videos:
+        row, redecoded, raw_envelope = _encoding_row(
             lake,
             video,
             codec=codec,
@@ -240,9 +256,12 @@ def encode_videos(
             nvdec_compatible=bool(nvdec_compatible),
             transform_id=transform_id,
             now=now,
+            decoder=decoder,
+            schema_cache=schema_cache,
         )
-        for video in videos
-    ]
+        encoding_rows.append(row)
+        frames_redecoded += redecoded
+        frames_raw_envelope += raw_envelope
 
     table = lake.table("video_encodings")
     for row in encoding_rows:
@@ -272,6 +291,8 @@ def encode_videos(
         gop_size=int(gop_size),
         encodings_written=len(encoding_rows),
         encoding_ids=tuple(row["encoding_id"] for row in encoding_rows),
+        frames_redecoded=frames_redecoded,
+        frames_raw_envelope=frames_raw_envelope,
     )
 
 
@@ -872,7 +893,10 @@ def _encoding_row(
     nvdec_compatible: bool,
     transform_id: str,
     now: datetime,
-) -> dict[str, Any]:
+    decoder: PayloadDecoder | None = None,
+    schema_cache: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], int, int]:
+    """Return ``(encoding_row, frames_redecoded, frames_raw_envelope)``."""
     observation_ids = [str(value) for value in (video.get("observation_ids") or [])]
     if not observation_ids:
         raise VideoError(f"video {video['video_id']!r} has no observation_ids")
@@ -890,7 +914,31 @@ def _encoding_row(
             f"video {video['video_id']!r} cannot be encoded; missing frame bytes for {missing}"
         )
 
-    frames = [payloads[obs_id] for obs_id in observation_ids]
+    metadata = _observation_decode_metadata(lake, observation_ids)
+    frames: list[bytes] = []
+    frames_redecoded = 0
+    frames_raw_envelope = 0
+    for obs_id in observation_ids:
+        meta = metadata.get(obs_id, {})
+        result = redecode_payload_blob(
+            lake,
+            {
+                "schema_digest": meta.get("schema_digest"),
+                "message_encoding": meta.get("message_encoding"),
+                "payload_blob": payloads[obs_id],
+            },
+            decoder=decoder,
+            schema_cache=schema_cache,
+        )
+        if result.status == "decoded" and result.blobs:
+            frames.append(result.blobs[0])
+            frames_redecoded += 1
+        else:
+            # No schema_digest (pre-v5 observation) or decode failed: keep the
+            # raw envelope bytes, today's behavior -- never hard-fail encoding
+            # over a historical row. Visible via the returned counts, not silent.
+            frames.append(payloads[obs_id])
+            frames_raw_envelope += 1
     encoded, keyframe_map = _encode_gops(frames, gop_size)
     keyframe_json = json.dumps(keyframe_map, sort_keys=True, separators=(",", ":"))
     source_hash = _sha256_join(frames)
@@ -908,7 +956,7 @@ def _encoding_row(
     )
     effective_fps = float(fps) if fps is not None else _infer_fps(lake, video)
 
-    return {
+    row = {
         "encoding_id": encoding_id,
         "video_id": video["video_id"],
         "run_id": video["run_id"],
@@ -929,6 +977,38 @@ def _encoding_row(
         "transform_id": transform_id,
         "created_at": now,
     }
+    return row, frames_redecoded, frames_raw_envelope
+
+
+def _observation_decode_metadata(
+    lake: Lake, observation_ids: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Project ``(message_encoding, schema_digest)`` for ``observation_ids``.
+
+    Bounded random access, not an ``observation_id IN (...)`` scan -- mirrors
+    ``dataset_export.py``'s ``_rows_by_id_take`` (the BUG-06 fix): one
+    projected id-column scan resolves logical ids to Lance row ids, then
+    ``take_row_ids`` materializes only the referenced rows.
+    """
+    table = lake.table("observations")
+    wanted = list(dict.fromkeys(observation_ids))
+    if not wanted:
+        return {}
+    index = table.search().select(["observation_id"]).with_row_id(True).to_arrow()
+    rowid_by_id = dict(
+        zip(index["observation_id"].to_pylist(), index[_ROW_ID].to_pylist(), strict=True)
+    )
+    row_ids = [rowid_by_id[value] for value in wanted if value in rowid_by_id]
+    columns = ["observation_id", "message_encoding", "schema_digest"]
+    result: dict[str, dict[str, Any]] = {}
+    for start in range(0, len(row_ids), _TAKE_BATCH_ROWS):
+        chunk = row_ids[start : start + _TAKE_BATCH_ROWS]
+        if not chunk:
+            continue
+        batch = table.take_row_ids(chunk).select(columns).to_arrow()
+        for row in batch.to_pylist():
+            result[row["observation_id"]] = row
+    return result
 
 
 def _encode_gops(frames: list[bytes], gop_size: int) -> tuple[bytes, list[dict[str, int]]]:

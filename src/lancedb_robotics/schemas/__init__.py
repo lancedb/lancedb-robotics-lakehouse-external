@@ -120,7 +120,16 @@ OBSERVATIONS_SCHEMA = _schema(
     # The encoding is a storage-format change, so v2 lakes re-ingest as well.
     # v4 (backlog 0029): observations become the frame grain by carrying stable
     # episode/frame indices plus denormalized hot-path training/filter scalars.
-    "4",
+    # v5: schema_digest added. message_encoding/schema_encoding alone are NOT
+    # enough to re-decode payload_blob for ros1/cdr/protobuf/flatbuffer
+    # messages -- the upstream decoder factories (PayloadDecoder.decode,
+    # adapters/decoders.py) need the real message-definition bytes
+    # (schema.data), which were never persisted. schema_digest points at a
+    # schema_registry row carrying those bytes, content-addressed so the same
+    # channel definition is stored once regardless of how many observations
+    # reference it. NULL on rows ingested before this version -- re-ingest
+    # (the same story as v1->v2/v2->v3) to gain re-decodability.
+    "5",
     [
         pa.field("observation_id", pa.string()),
         pa.field("run_id", pa.string()),
@@ -147,8 +156,9 @@ OBSERVATIONS_SCHEMA = _schema(
         # Decoded payload (backlog 0014). payload_json is the decoded message as
         # canonical JSON (NULL when undecodable); payload_blob carries large
         # binary message bytes hoisted out so re-decode/export need not reopen
-        # the source file (NULL for scalar messages). message_encoding /
-        # schema_encoding are enough to re-decode. decode_status is one of
+        # the source file (NULL for scalar messages). message_encoding +
+        # schema_digest (v5) are what's actually needed to re-decode;
+        # schema_encoding alone is descriptive only. decode_status is one of
         # decoded | raw | failed; decode_error explains raw/failed outcomes.
         #
         # payload_blob is Lance blob-encoded (decision 0024: Lance is the index
@@ -166,6 +176,7 @@ OBSERVATIONS_SCHEMA = _schema(
         _blob(pa.field("payload_blob", pa.large_binary())),
         pa.field("message_encoding", pa.string()),
         pa.field("schema_encoding", pa.string()),
+        pa.field("schema_digest", pa.string()),
         pa.field("decode_status", pa.string()),
         pa.field("decode_error", pa.string()),
         pa.field("state_vector", pa.list_(pa.float32())),
@@ -173,6 +184,23 @@ OBSERVATIONS_SCHEMA = _schema(
         pa.field("caption", pa.string()),
         pa.field("quality_flags", pa.list_(pa.string())),
         pa.field("transform_id", pa.string()),
+        _CREATED_AT,
+    ],
+)
+
+SCHEMA_REGISTRY_SCHEMA = _schema(
+    "schema_registry",
+    "1",
+    [
+        # Content-addressed (sha256 of name+encoding+data): the same channel
+        # message definition is written once regardless of how many
+        # observations/runs reference it (mirrors keyframe_map_artifacts'
+        # content-addressing, keyframe_maps.py). Small metadata, not blob-encoded
+        # -- a schema definition is a few bytes to tens of KB, not media.
+        pa.field("schema_digest", pa.string()),
+        pa.field("schema_name", pa.string()),
+        pa.field("schema_encoding", pa.string()),
+        pa.field("data", pa.large_binary()),
         _CREATED_AT,
     ],
 )
@@ -1664,6 +1692,7 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
     "integration_sources": INTEGRATION_SOURCES_SCHEMA,
     "runs": RUNS_SCHEMA,
     "episodes": EPISODES_SCHEMA,
+    "schema_registry": SCHEMA_REGISTRY_SCHEMA,
     "observations": OBSERVATIONS_SCHEMA,
     "videos": VIDEOS_SCHEMA,
     "video_encodings": VIDEO_ENCODINGS_SCHEMA,

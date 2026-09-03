@@ -91,6 +91,7 @@ class RosBagAdapter:
                         if schema
                         else self._schema_name(reader, connection),
                         "schema_encoding": schema.encoding if schema else None,
+                        "schema_data": schema.data if schema else None,
                         "decode_status": result.status,
                         "decode_error": result.error,
                         "payload_json": result.payload_json,

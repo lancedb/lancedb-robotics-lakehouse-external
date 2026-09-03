@@ -292,6 +292,244 @@ def test_demo_cli_inspect_text(tmp_path):
     assert "ros1" in result.output
 
 
+def test_schema_registry_enables_real_camera_redecode_without_raw_uri(tmp_path):
+    """A real ``/image_color/compressed`` frame is re-decodable from lakehouse
+    data alone, via ``schema_registry`` -- no ``observation_row["raw_uri"]``
+    ever touched in this test's redecode call, unlike
+    ``dataset_export.py``'s exporter workaround (which must reopen the
+    original source file to get the same result)."""
+    from lancedb_robotics.blob import fetch_blob
+    from lancedb_robotics.schema_registry import redecode_payload_blob
+
+    source = _demo_file()
+    lake = Lake.init(tmp_path / "demo.lance")
+    report = ingest_mcap(lake, source, batch_size=256)
+    assert not report.quarantined
+
+    camera_rows = (
+        lake.table("observations")
+        .search()
+        .where("topic = '/image_color/compressed'")
+        .select(["observation_id", "message_encoding", "schema_digest", "decode_status"])
+        .limit(1)
+        .to_arrow()
+        .to_pylist()
+    )
+    assert camera_rows, "demo.mcap should carry /image_color/compressed frames"
+    row = camera_rows[0]
+    assert row["schema_digest"], "camera observations must carry a schema_digest post-ingest"
+
+    payload_blob = fetch_blob(
+        lake.table("observations"),
+        "payload_blob",
+        row["observation_id"],
+        id_column="observation_id",
+        connection_spec=lake.connection_spec,
+    )
+    assert payload_blob, "a real CompressedImage message should hoist its data field to a blob"
+
+    # No raw_uri anywhere in this call: schema_digest + message_encoding +
+    # payload_blob (all lakehouse-resident) are the only inputs.
+    result = redecode_payload_blob(
+        lake,
+        {
+            "schema_digest": row["schema_digest"],
+            "message_encoding": row["message_encoding"],
+            "payload_blob": payload_blob,
+        },
+    )
+    assert result.status == "decoded", result.error
+    assert result.blobs, "a CompressedImage's data field should be hoisted into DecodeResult.blobs"
+
+    # Genuine JPEG magic bytes (SOI marker) -- proves this is real image data,
+    # not the raw ROS envelope (no hard Pillow dependency in this repo).
+    assert result.blobs[0].startswith(b"\xff\xd8\xff")
+
+
+def test_encode_videos_packs_real_decoded_frames_not_raw_envelope(tmp_path):
+    """``video_encodings`` now holds genuinely decoded image bytes for a real
+    camera topic -- ``_encoding_row`` redecodes via ``schema_registry``
+    instead of GOP-packing the raw, still-undecoded wire envelope."""
+    from datetime import UTC, datetime
+
+    import pyarrow as pa
+
+    from lancedb_robotics.blob import fetch_blob
+    from lancedb_robotics.schemas import VIDEOS_SCHEMA
+    from lancedb_robotics.video import decode_frame_from_encoding, encode_videos
+
+    source = _demo_file()
+    lake = Lake.init(tmp_path / "demo.lance")
+    report = ingest_mcap(lake, source, batch_size=256)
+    assert not report.quarantined
+
+    camera_rows = (
+        lake.table("observations")
+        .search()
+        .where("topic = '/image_color/compressed'")
+        .select(["observation_id", "run_id", "timestamp_ns"])
+        .to_arrow()
+        .to_pylist()
+    )
+    assert len(camera_rows) >= 3
+    camera_rows.sort(key=lambda row: row["timestamp_ns"])
+    selected = camera_rows[:3]
+
+    lake.table("videos").add(
+        pa.Table.from_pylist(
+            [
+                {
+                    "video_id": "vid-test-camera",
+                    "run_id": selected[0]["run_id"],
+                    "episode_id": "ep-test-camera",
+                    "episode_index": 0,
+                    "camera_key": "camera_front",
+                    "sensor_id": "camera_front",
+                    "topic": "/image_color/compressed",
+                    "from_timestamp_ns": selected[0]["timestamp_ns"],
+                    "to_timestamp_ns": selected[-1]["timestamp_ns"],
+                    "frame_count": len(selected),
+                    "observation_ids": [row["observation_id"] for row in selected],
+                    "raw_uri": str(source),
+                    "codec": "",
+                    "uri": "",
+                    "transform_id": "tfm-test-video",
+                    "created_at": datetime.now(UTC),
+                }
+            ],
+            schema=VIDEOS_SCHEMA,
+        )
+    )
+
+    encode_report = encode_videos(lake, video_id="vid-test-camera", gop_size=2, fps=10.0)
+    assert encode_report.encodings_written == 1
+    assert encode_report.frames_redecoded == len(selected)
+    assert encode_report.frames_raw_envelope == 0
+
+    encoding_row = lake.table("video_encodings").to_arrow().to_pylist()[0]
+    encoded_blob = fetch_blob(
+        lake.table("video_encodings"),
+        "data",
+        encoding_row["encoding_id"],
+        id_column="encoding_id",
+        connection_spec=lake.connection_spec,
+    )
+    frame = decode_frame_from_encoding(encoding_row, encoded_blob, 0)
+    assert frame.frame.startswith(b"\xff\xd8\xff"), "packed bytes must be a real decoded JPEG"
+
+
+def test_live_facade_serves_real_camera_frames_end_to_end(tmp_path):
+    """The v2 facade: state (from ``/diagnostics``) + real camera frames
+    (from ``/image_color/compressed``), live, over the real demo corpus --
+    the full chain this session's work exists to prove: schema_registry ->
+    video.py real-decode -> lerobot_facade.videos.VideoIndex -> facade item.
+    """
+    from datetime import UTC, datetime
+
+    import pyarrow as pa
+
+    from lancedb_robotics.lerobot_facade import CanonicalVectorMapping, LiveLeRobotFacade
+    from lancedb_robotics.lerobot_facade.videos import camera_feature_key
+    from lancedb_robotics.schemas import EPISODES_SCHEMA, VIDEOS_SCHEMA
+    from lancedb_robotics.video import encode_videos
+
+    source = _demo_file()
+    lake = Lake.init(tmp_path / "demo.lance")
+    report = ingest_mcap(lake, source, batch_size=256)
+    assert not report.quarantined
+    run_id = report.run_id
+
+    camera_rows = (
+        lake.table("observations")
+        .search()
+        .where("topic = '/image_color/compressed'")
+        .select(["observation_id", "timestamp_ns"])
+        .to_arrow()
+        .to_pylist()
+    )
+    camera_rows.sort(key=lambda row: row["timestamp_ns"])
+    now = datetime.now(UTC)
+
+    lake.table("episodes").add(
+        pa.Table.from_pylist(
+            [
+                {
+                    "episode_id": "ep-demo-camera",
+                    "run_id": run_id,
+                    "episode_index": 0,
+                    "from_timestamp_ns": camera_rows[0]["timestamp_ns"],
+                    "to_timestamp_ns": camera_rows[-1]["timestamp_ns"],
+                    "boundary_source": "test",
+                    "outcome": "",
+                    "frame_count": None,
+                    "camera_blobs": [],
+                    "task_id": "demo camera facade",
+                    "embedding": None,
+                    "provenance": "",
+                    "transform_id": "tfm-test-episode",
+                    "created_at": now,
+                }
+            ],
+            schema=EPISODES_SCHEMA,
+        )
+    )
+    lake.table("videos").add(
+        pa.Table.from_pylist(
+            [
+                {
+                    "video_id": "vid-demo-camera",
+                    "run_id": run_id,
+                    "episode_id": "ep-demo-camera",
+                    "episode_index": 0,
+                    "camera_key": camera_feature_key("/image_color/compressed"),
+                    "sensor_id": "camera_front",
+                    "topic": "/image_color/compressed",
+                    "from_timestamp_ns": camera_rows[0]["timestamp_ns"],
+                    "to_timestamp_ns": camera_rows[-1]["timestamp_ns"],
+                    "frame_count": len(camera_rows),
+                    "observation_ids": [row["observation_id"] for row in camera_rows],
+                    "raw_uri": str(source),
+                    "codec": "",
+                    "uri": "",
+                    "transform_id": "tfm-test-video",
+                    "created_at": now,
+                }
+            ],
+            schema=VIDEOS_SCHEMA,
+        )
+    )
+    encode_report = encode_videos(lake, video_id="vid-demo-camera", gop_size=4, fps=30.0)
+    assert encode_report.frames_redecoded == len(camera_rows)
+    assert encode_report.frames_raw_envelope == 0
+
+    lake.align.create_view(
+        "demo_camera_view",
+        run_id=run_id,
+        rate_hz=5.0,
+        streams=["/diagnostics", "/image_color/compressed"],
+        tolerance_ms=300.0,
+        interpolation={"/diagnostics": "nearest", "/image_color/compressed": "nearest"},
+    )
+
+    mapping = CanonicalVectorMapping(
+        state_streams=("/diagnostics",), camera_streams=("/image_color/compressed",)
+    )
+    facade = LiveLeRobotFacade(
+        lake, name="demo_camera_view", mapping=mapping, episode_ids=["ep-demo-camera"]
+    )
+    assert len(facade) > 0
+    key = camera_feature_key("/image_color/compressed")
+    for index in range(len(facade)):
+        item = facade[index]
+        image_bytes = item[f"observation.images.{key}"]
+        assert image_bytes.startswith(b"\xff\xd8\xff"), f"frame {index} is not a real JPEG"
+
+    # Batched path returns the same real bytes as the single-item path.
+    batched = facade.__getitems__(list(range(len(facade))))
+    singles = [facade[i] for i in range(len(facade))]
+    assert batched == singles
+
+
 # --- nuScenes corpus: the mixed-encoding + lz4 story ------------------------
 
 

@@ -72,6 +72,11 @@ from lancedb_robotics.recordings import (
     resolve_recording,
     resolve_shards,
 )
+from lancedb_robotics.schema_registry import (
+    schema_digest,
+    schema_registry_row,
+    write_schema_registry_rows,
+)
 from lancedb_robotics.schemas import (
     ATTACHMENTS_SCHEMA,
     EPISODES_SCHEMA,
@@ -2453,9 +2458,7 @@ def _lerobot_claim_chaos_from_synthetic(
     return workload, watchdog
 
 
-def _lerobot_claim_chaos_real_rehearsal(
-    *, retry_owner_count: int, seed: int
-) -> dict[str, int]:
+def _lerobot_claim_chaos_real_rehearsal(*, retry_owner_count: int, seed: int) -> dict[str, int]:
     """Race real concurrent recovery attempts against a scratch lake.
 
     Verifies the backlog-0379 CAS guard by actually running it rather than
@@ -2553,9 +2556,7 @@ def _lerobot_claim_chaos_crash_points(
     # race itself (retry_owner_count concurrent recoverers) doesn't depend on
     # frame/episode/camera/batch counts, only on retry_owner_count, which is
     # fixed for this call.
-    rehearsal = _lerobot_claim_chaos_real_rehearsal(
-        retry_owner_count=retry_owner_count, seed=seed
-    )
+    rehearsal = _lerobot_claim_chaos_real_rehearsal(retry_owner_count=retry_owner_count, seed=seed)
     frame_batches = max(1, (frame_count + batch_size - 1) // batch_size)
     partial_batches = max(1, frame_batches // 2)
     partial_frames = min(frame_count, partial_batches * batch_size)
@@ -2926,6 +2927,14 @@ def _observation_row(
     payload = json.loads(message["payload_json"]) if message["payload_json"] else None
     typed = extract(message["schema_name"], payload)
     modality = typed.modality or _modality(message["topic"], message["schema_name"])
+    schema_name = message.get("schema_name")
+    schema_encoding = message.get("schema_encoding")
+    schema_data = message.get("schema_data")
+    digest = (
+        schema_digest(name=schema_name, encoding=schema_encoding, data=schema_data)
+        if schema_name and schema_encoding and schema_data
+        else None
+    )
     return {
         "observation_id": f"{run_id}:{message['topic']}:{message['sequence']:06d}",
         "run_id": run_id,
@@ -2949,6 +2958,7 @@ def _observation_row(
         "payload_blob": message["payload_blob"],
         "message_encoding": message["message_encoding"],
         "schema_encoding": message["schema_encoding"],
+        "schema_digest": digest,
         "decode_status": message["decode_status"],
         "decode_error": message["decode_error"],
         "state_vector": typed.state_vector,
@@ -2956,6 +2966,23 @@ def _observation_row(
         "transform_id": transform_id,
         "created_at": created_at,
     }
+
+
+def _note_message_schema(message: dict, seen: dict[str, dict], created_at: datetime) -> None:
+    """Record ``message``'s schema definition into ``seen`` (keyed by digest).
+
+    Content-addressed, in-memory dedup within one ingest run -- mirrors the
+    existing ``schema_ids`` dedup in ``adapters/mcap_adapter.py``'s MCAP-export
+    path. The caller flushes ``seen`` to ``schema_registry`` once, after the
+    message loop (see ``write_schema_registry_rows``).
+    """
+    name = message.get("schema_name")
+    encoding = message.get("schema_encoding")
+    data = message.get("schema_data")
+    if not (name and encoding and data):
+        return
+    row = schema_registry_row(name=name, encoding=encoding, data=data, created_at=created_at)
+    seen.setdefault(row["schema_digest"], row)
 
 
 def ingest_mcap(
@@ -3066,6 +3093,7 @@ def ingest_mcap(
     batch: list[dict] = []
     by_topic: dict[str, int] = {}
     topic_schema: dict[str, tuple[str | None, str | None]] = {}
+    schema_registry_seen: dict[str, dict] = {}
     decode_by_status: dict[str, int] = {}
     decode_by_encoding: dict[str, int] = {}
     decode_raw_by_encoding: dict[str, int] = {}
@@ -3087,6 +3115,7 @@ def ingest_mcap(
             topic = message["topic"]
             by_topic[topic] = by_topic.get(topic, 0) + 1
             topic_schema.setdefault(topic, (message["schema_name"], message["schema_encoding"]))
+            _note_message_schema(message, schema_registry_seen, now)
             status = message["decode_status"]
             decode_by_status[status] = decode_by_status.get(status, 0) + 1
             encoding = message["message_encoding"] or "unknown"
@@ -3121,6 +3150,7 @@ def ingest_mcap(
         integrity_status = exc.status
         integrity_reason = exc.reason
         recovered_count = exc.recovered or total
+    write_schema_registry_rows(lake, list(schema_registry_seen.values()))
     _flush(observations_table, batch)  # remainder, kept even when corruption stopped us
 
     # Source registration: use the inspect report's topic fingerprints when we
@@ -3404,6 +3434,7 @@ def ingest_rosbag(
     observations_table = lake.table("observations")
     batch: list[dict] = []
     by_topic: dict[str, int] = {}
+    schema_registry_seen: dict[str, dict] = {}
     decode_by_status: dict[str, int] = {}
     decode_by_encoding: dict[str, int] = {}
     decode_raw_by_encoding: dict[str, int] = {}
@@ -3415,6 +3446,7 @@ def ingest_rosbag(
     for message in adapter.ingest(path):
         topic = message["topic"]
         by_topic[topic] = by_topic.get(topic, 0) + 1
+        _note_message_schema(message, schema_registry_seen, now)
         status = message["decode_status"]
         decode_by_status[status] = decode_by_status.get(status, 0) + 1
         encoding = message["message_encoding"] or "unknown"
@@ -3439,6 +3471,7 @@ def ingest_rosbag(
         total += 1
         if len(batch) >= batch_size:
             _flush(observations_table, batch)
+    write_schema_registry_rows(lake, list(schema_registry_seen.values()))
     _flush(observations_table, batch)
 
     registration = _register_resolved_source(
@@ -7245,9 +7278,7 @@ def _record_lerobot_ingest_checkpoint(
         if candidate.get("checkpoint_id") == checkpoint_id
     ]
     if len(winners) != 1 or str(winners[0].get("claim_token") or "") != claim_token:
-        _raise_lerobot_claim_lost_race(
-            lake, job_id, operation="claim", checkpoint_id=checkpoint_id
-        )
+        _raise_lerobot_claim_lost_race(lake, job_id, operation="claim", checkpoint_id=checkpoint_id)
 
 
 def _append_lerobot_recovery_checkpoint(
@@ -7400,6 +7431,7 @@ def _ingest_split_recording(
     batch: list[dict] = []
     by_topic: dict[str, int] = {}
     topic_schema: dict[str, tuple[str | None, str | None]] = {}
+    schema_registry_seen: dict[str, dict] = {}
     decode_by_status: dict[str, int] = {}
     decode_by_encoding: dict[str, int] = {}
     decode_raw_by_encoding: dict[str, int] = {}
@@ -7416,6 +7448,7 @@ def _ingest_split_recording(
             topic = message["topic"]
             by_topic[topic] = by_topic.get(topic, 0) + 1
             topic_schema.setdefault(topic, (message["schema_name"], message["schema_encoding"]))
+            _note_message_schema(message, schema_registry_seen, now)
             status = message["decode_status"]
             decode_by_status[status] = decode_by_status.get(status, 0) + 1
             encoding = message["message_encoding"] or "unknown"
@@ -7447,6 +7480,7 @@ def _ingest_split_recording(
         integrity_status = exc.status
         integrity_reason = exc.reason
         recovered_count = exc.recovered or total
+    write_schema_registry_rows(lake, list(schema_registry_seen.values()))
     _flush(observations_table, batch)
 
     source_report = merged_report if merged_report["topics"] else _synthetic_report(topic_schema)
@@ -7706,7 +7740,9 @@ def _finalize_ingest(
     from lancedb_robotics.capability_gates import MAINTENANCE, backend_supports
 
     if not backend_supports(getattr(lake, "connection_spec", None), MAINTENANCE):
-        return {"skipped_reason": "backend does not support local maintenance; deferred compaction/index/prune"}
+        return {
+            "skipped_reason": "backend does not support local maintenance; deferred compaction/index/prune"
+        }
     # Local import: the maintenance -> lineage subgraph is heavier than ingest
     # needs at import time, and only this once-per-ingest finalize uses it.
     # maintain_lake runs compact -> refresh/build indexes -> cleanup in that order,

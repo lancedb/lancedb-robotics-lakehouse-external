@@ -22,6 +22,7 @@ EXPECTED_TABLES = [
     "integration_sources",
     "runs",
     "episodes",
+    "schema_registry",
     "observations",
     "videos",
     "video_encodings",
@@ -78,6 +79,7 @@ ID_COLUMNS = {
     "integration_sources": "source_id",
     "runs": "run_id",
     "episodes": "episode_id",
+    "schema_registry": "schema_digest",
     "observations": "observation_id",
     "videos": "video_id",
     "video_encodings": "encoding_id",
@@ -218,12 +220,15 @@ def test_observations_raw_provenance_fields():
     assert schema.field("raw_sequence").type == pa.int64()
 
 
-def test_observations_is_schema_v4():
+def test_observations_is_schema_v5():
     # Payload columns (backlog 0014) bumped v1 -> v2; blob-encoding payload_blob
     # (backlog 0035 / decision 0024) is a storage-format change: v2 -> v3;
     # stable episode/frame indices and denormalized frame-grain scalars
-    # (backlog 0029 / decision 0025) bump v3 -> v4.
-    assert SCHEMA_VERSIONS["observations"] == "4"
+    # (backlog 0029 / decision 0025) bump v3 -> v4; schema_digest (this
+    # session: payload_blob is only re-decodable with the real message
+    # definition bytes, which message_encoding/schema_encoding alone never
+    # carried) bumps v4 -> v5.
+    assert SCHEMA_VERSIONS["observations"] == "5"
 
 
 def test_observations_episode_frame_fields():
@@ -247,8 +252,19 @@ def test_observations_payload_columns():
     assert schema.field("payload_blob").metadata == {b"lance-encoding:blob": b"true"}
     assert schema.field("message_encoding").type == pa.string()
     assert schema.field("schema_encoding").type == pa.string()
+    # v5: points at a schema_registry row carrying the real message-definition
+    # bytes -- schema_encoding alone is descriptive, not enough to re-decode.
+    assert schema.field("schema_digest").type == pa.string()
     assert schema.field("decode_status").type == pa.string()
     assert schema.field("decode_error").type == pa.string()
+
+
+def test_schema_registry_content_addressed_fields():
+    schema = TABLE_SCHEMAS["schema_registry"]
+    assert schema.field("schema_digest").type == pa.string()
+    assert schema.field("schema_name").type == pa.string()
+    assert schema.field("schema_encoding").type == pa.string()
+    assert schema.field("data").type == pa.large_binary()
 
 
 def test_attachments_manifest_fields():
