@@ -69,6 +69,22 @@ lerobot-native-bench = [
     "av>=12.0",
     "numpy>=1.24",
 ]
+# Dev-only lane for the `lancedb_robotics` lerobot BaseDatasetReader adapter
+# (`lerobot_facade/dataset_reader.py`). Upstream PR huggingface/lerobot#4363
+# ("lance-dataloader", merged to `main` 2026-08-28) added the storage-format
+# registry (`register_dataset_reader`/`BaseDatasetReader`) this adapter
+# implements against, but no PyPI release contains it yet -- `lerobot>=0.4.0`
+# above stays on released versions. Pinned to a specific commit SHA (not a
+# floating branch ref) so this extra is reproducible; bump the SHA deliberately
+# when picking up further upstream changes. Deliberately excluded from `all`
+# and `dev`, and not wired into any existing CI lane -- install into an
+# isolated venv, never the tracked project `.venv`, until a real release
+# includes PR #4363.
+lerobot-main-dev = [
+    "lerobot[dataset] @ git+https://github.com/huggingface/lerobot@3f2c29ef7e44b1ddccbcda3b6a63939e53639e9e",
+    "torch>=2.0",
+    "pillow>=10.0",
+]
 # RLDS/TFDS *ingest* needs only the maintained TensorFlow + TFDS reader stack.
 # It intentionally does not import the archived `rlds` package or Reverb.  The
 # GCS filesystem extra is available on the upstream-supported Python/platform
@@ -199,6 +215,20 @@ conflicts = [
         { extra = "rlds" },
     ],
     [
+        # Both pin `lerobot` from a different source (a PyPI release floor vs. a
+        # specific git-main commit); resolving both at once is nonsensical.
+        { extra = "lerobot" },
+        { extra = "lerobot-main-dev" },
+    ],
+    [
+        { extra = "lerobot-native-bench" },
+        { extra = "lerobot-main-dev" },
+    ],
+    [
+        { extra = "lerobot-main-dev" },
+        { extra = "rlds" },
+    ],
+    [
         # The maintained TFDS ingest stack uses TensorFlow 2.21, while the
         # archived Reverb conformance extra pins TensorFlow 2.15.
         { extra = "tfds" },
@@ -250,6 +280,14 @@ markers = [
     # LANCEDB_ROBOTICS_REQUIRE_LEROBOT_NATIVE_BENCHMARK=1 so dependency/import,
     # sample-access, DataLoader, decode-backend, and metric-key gaps fail.
     "lerobot_native_benchmark: exercises the real official LeRobotDataset benchmark arm",
+    # `lancedb_robotics` BaseDatasetReader adapter integration test (real
+    # upstream `lerobot.datasets.storage`/`LeRobotDataset`, not a hand-built
+    # stand-in for the ABC). Skips cleanly without the dev-only
+    # `lerobot-main-dev` extra (no PyPI release contains the storage-format
+    # registry yet); set LANCEDB_ROBOTICS_REQUIRE_LEROBOT_MAIN_DEV=1 in the
+    # isolated verification venv so a missing/broken install fails instead of
+    # skipping. Select with `pytest -m lerobot_main_dev`.
+    "lerobot_main_dev: exercises the real lerobot main-branch BaseDatasetReader registry (needs the lerobot-main-dev extra)",
     # 0076-audit invocation conformance (backlog 0130). The contract-test mode
     # needs no optional dependency and runs in the default suite; the dedicated
     # CI lane selects it with `-m invocation_conformance`. It additionally probes

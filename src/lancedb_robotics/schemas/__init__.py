@@ -1242,6 +1242,57 @@ LEROBOT_CHECKPOINT_HOLDS_SCHEMA = _schema(
     ],
 )
 
+LEROBOT_VIEWS_SCHEMA = _schema(
+    "lerobot_views",
+    "1",
+    [
+        # Content digest over (definition_json + table_versions): republishing an
+        # unchanged definition over an unchanged lake upserts the same row;
+        # republishing after the lake advanced creates a new view id, so
+        # previously published views stay reproducible (backlog 0491).
+        pa.field("view_id", pa.string()),
+        pa.field("repo_id", pa.string()),
+        pa.field("alignment_id", pa.string()),
+        # Full reproducible view definition: mapping streams, quality policy,
+        # episode selection, fps, robot_type. JSON string, not JSONB, matching
+        # `alignment_jobs.recipe`-style specs.
+        pa.field("definition_json", pa.string()),
+        pa.field("table_versions", _table_versions()),
+        pa.field("fps", pa.int64()),
+        pa.field("robot_type", pa.string()),
+        pa.field("total_frames", pa.int64()),
+        pa.field("total_episodes", pa.int64()),
+        # Camera-stats sampling parameters (method, sample count, downsample
+        # policy) so published normalization statistics are auditable and
+        # reproducible (backlog 0490).
+        pa.field("stats_sampling_json", pa.string()),
+        pa.field("file_count", pa.int64()),
+        pa.field("files_bytes", pa.int64()),
+        pa.field("created_by", pa.string()),
+        _CREATED_AT,
+    ],
+)
+
+LEROBOT_VIEW_FILES_SCHEMA = _schema(
+    "lerobot_view_files",
+    "1",
+    [
+        # `<view_id>/<path>` — the single-column merge_insert upsert key.
+        pa.field("file_id", pa.string()),
+        pa.field("view_id", pa.string()),
+        # Path relative to the dataset root (e.g. "meta/info.json"). Validated
+        # against traversal on materialization, not trusted from the table.
+        pa.field("path", pa.string()),
+        # Deliberately NOT blob-encoded: derived metadata files are small and
+        # bounded (episode index parquet is chunked at a bounded row count per
+        # file), and blob-encoded tables refuse merge_insert upserts.
+        pa.field("content", pa.large_binary()),
+        pa.field("sha256", pa.string()),
+        pa.field("size_bytes", pa.int64()),
+        _CREATED_AT,
+    ],
+)
+
 LINEAGE_ARTIFACTS_SCHEMA = _schema(
     "lineage_artifacts",
     "1",
@@ -1729,6 +1780,8 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
     "rlds_ingest_claims": RLDS_INGEST_CLAIMS_SCHEMA,
     "lerobot_ingest_checkpoints": LEROBOT_INGEST_CHECKPOINTS_SCHEMA,
     "lerobot_checkpoint_holds": LEROBOT_CHECKPOINT_HOLDS_SCHEMA,
+    "lerobot_views": LEROBOT_VIEWS_SCHEMA,
+    "lerobot_view_files": LEROBOT_VIEW_FILES_SCHEMA,
     "lineage_artifacts": LINEAGE_ARTIFACTS_SCHEMA,
     "lineage_executions": LINEAGE_EXECUTIONS_SCHEMA,
     "lineage_edges": LINEAGE_EDGES_SCHEMA,

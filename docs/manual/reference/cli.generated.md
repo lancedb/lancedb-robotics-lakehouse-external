@@ -765,6 +765,10 @@ Rebuild the materialized evaluation_run_metrics surface from evaluation_runs.
 
 Sync manifests with external experiment trackers (import/export/drift).
 
+### `train view`
+
+Publish and inspect version-pinned LeRobot views (with normalization stats).
+
 ### `train warm`
 
 Query-driven cache warming: warm exactly what training reads via queries.

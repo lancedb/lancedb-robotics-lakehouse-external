@@ -127,9 +127,7 @@ def test_corrupt_cbor_payload_is_failed_not_crash():
     assert result.error
 
 
-@pytest.mark.parametrize(
-    "encoding,requirement", [("cbor", "cbor2"), ("msgpack", "msgpack")]
-)
+@pytest.mark.parametrize("encoding,requirement", [("cbor", "cbor2"), ("msgpack", "msgpack")])
 def test_self_describing_binary_degrades_to_raw_when_lib_absent(monkeypatch, encoding, requirement):
     import importlib.util as importlib_util
 
@@ -325,3 +323,119 @@ def test_schemaless_ros_channel_routes_to_raw():
     assert result.status == "raw"
     assert result.payload_json is None
     assert "no schema" in result.error
+
+
+# --- protobuf-backed behaviour (needs the protobuf extra) ----------------
+#
+# Regression coverage for a real bug found building the ABC-130k live
+# LeRobot facade demo notebook: ``_to_jsonable``'s protobuf branch used to
+# delegate the *whole* message straight to ``google.protobuf.json_format.
+# MessageToDict``, which base64-inlines every ``bytes`` field regardless of
+# size -- unlike the ros1/ros2 ``__slots__`` branch above, it never reached
+# this function's own size-threshold bytes handling. So a large protobuf
+# ``bytes`` field (e.g. ``foxglove.CompressedVideo.data``, the real payload
+# behind ABC-130k's camera topics) silently never hoisted to
+# ``payload_blob`` -- it stayed NULL for every message, on every run,
+# regardless of the field's real size. Confirmed independently of these
+# tests: a fresh ingest of real ABC-130k episodes had `payload_blob` NULL
+# for 100% of `/top-camera` observations before this fix.
+
+
+def _build_protobuf_message_class(fields):
+    """Build a throwaway compiled protobuf message class for one test.
+
+    ``fields`` is a list of ``(name, field_number, descriptor_pb2 TYPE_*)``.
+    Uses a fresh ``DescriptorPool`` per call so unrelated tests never collide
+    on the synthetic ``testpkg.Msg`` type name.
+    """
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+    file_proto = descriptor_pb2.FileDescriptorProto()
+    file_proto.name = f"test_decoders_{id(fields)}.proto"
+    file_proto.package = "testpkg"
+    file_proto.syntax = "proto3"
+    msg_proto = file_proto.message_type.add()
+    msg_proto.name = "Msg"
+    for name, number, field_type in fields:
+        field = msg_proto.field.add()
+        field.name = name
+        field.number = number
+        field.type = field_type
+        field.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file_proto)
+    msg_desc = pool.FindMessageTypeByName("testpkg.Msg")
+    return message_factory.GetMessageClass(msg_desc)
+
+
+def _write_protobuf(topic, message):
+    """Return MCAP bytes for one protobuf ``message`` on ``topic``."""
+    from mcap_protobuf.writer import Writer as ProtobufWriter
+
+    buf = io.BytesIO()
+    writer = ProtobufWriter(buf)
+    writer.write_message(topic, message, log_time=1, publish_time=1)
+    writer.finish()
+    return buf.getvalue()
+
+
+def _decode_first_protobuf(mcap_bytes, decoder):
+    from mcap.reader import make_reader
+
+    reader = make_reader(io.BytesIO(mcap_bytes))
+    for schema, channel, message in reader.iter_messages():
+        return decoder.decode(channel.message_encoding, schema, message.data)
+    raise AssertionError("no message in fixture")
+
+
+def test_protobuf_large_bytes_field_hoists_blob_and_elides_json():
+    pytest.importorskip("mcap_protobuf")
+    from google.protobuf.descriptor_pb2 import FieldDescriptorProto
+
+    cls = _build_protobuf_message_class(
+        [
+            ("frame_id", 1, FieldDescriptorProto.TYPE_STRING),
+            ("data", 2, FieldDescriptorProto.TYPE_BYTES),
+        ]
+    )
+    big = bytes(DEFAULT_BLOB_THRESHOLD + 16)
+    mcap_bytes = _write_protobuf("/cam", cls(frame_id="cam0", data=big))
+    result = _decode_first_protobuf(mcap_bytes, PayloadDecoder())
+    assert result.status == "decoded"
+    assert result.payload_blob is not None  # large data hoisted out
+    assert result.blobs == (big,)
+    decoded = json.loads(result.payload_json)
+    assert decoded["data"] == {"__elided_bytes__": len(big)}
+    assert decoded["frame_id"] == "cam0"  # non-bytes field: MessageToDict's shape, untouched
+
+
+def test_protobuf_small_bytes_field_is_inlined_not_hoisted():
+    pytest.importorskip("mcap_protobuf")
+    from google.protobuf.descriptor_pb2 import FieldDescriptorProto
+
+    cls = _build_protobuf_message_class(
+        [
+            ("frame_id", 1, FieldDescriptorProto.TYPE_STRING),
+            ("data", 2, FieldDescriptorProto.TYPE_BYTES),
+        ]
+    )
+    small = b"\x01\x02\x03\x04"
+    mcap_bytes = _write_protobuf("/cam", cls(frame_id="cam0", data=small))
+    result = _decode_first_protobuf(mcap_bytes, PayloadDecoder())
+    assert result.status == "decoded"
+    assert result.payload_blob is None  # under threshold: stays inline
+    decoded = json.loads(result.payload_json)
+    assert decoded["data"] == {"__b64__": base64.b64encode(small).decode("ascii")}
+
+
+def test_protobuf_scalar_message_has_no_blob():
+    pytest.importorskip("mcap_protobuf")
+    from google.protobuf.descriptor_pb2 import FieldDescriptorProto
+
+    cls = _build_protobuf_message_class([("gyro_z", 1, FieldDescriptorProto.TYPE_DOUBLE)])
+    mcap_bytes = _write_protobuf("/imu", cls(gyro_z=0.5))
+    result = _decode_first_protobuf(mcap_bytes, PayloadDecoder())
+    assert result.status == "decoded"
+    assert result.payload_blob is None
+    assert json.loads(result.payload_json) == {"gyro_z": 0.5}

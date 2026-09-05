@@ -29,6 +29,7 @@ trying to do**, not by the order features were built.
   - [Compare Enterprise training runs over time](journeys/training-report-history.md)
   - [Prove Enterprise training behaves the same everywhere](journeys/enterprise-training-conformance.md)
   - [Page a fleet-scale training epoch from a server-side plan](journeys/server-side-plan.md)
+  - [Publish a version-pinned LeRobot view (with normalization stats)](journeys/lerobot-published-views.md)
 - **Reference** — complete, **auto-generated** surface docs. Do not edit these by
   hand; they are regenerated from the code.
   - [CLI reference](reference/cli.generated.md)

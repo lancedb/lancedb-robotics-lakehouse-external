@@ -66,6 +66,12 @@ train_app.add_typer(
     help="Recommend (and optionally apply) scalar indexes from predicate-planning "
     "telemetry in persisted training reports.",
 )
+view_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+train_app.add_typer(
+    view_app,
+    name="view",
+    help="Publish and inspect version-pinned LeRobot views (with normalization stats).",
+)
 
 _LAKE_OPTION = typer.Option(..., "--lake", help="Path or object-store URI to the lake.")
 _SNAPSHOT_OPTION = typer.Option(..., "--snapshot", help="Snapshot name to preview.")
@@ -2061,3 +2067,185 @@ def warm_plan(
         typer.echo("error: --format must be text or json", err=True)
         raise typer.Exit(code=2)
     _emit_query_warm_plan_text(opened, plan)
+
+
+# ---------------------------------------------------------------------------
+# `train view ...` -- published, version-pinned LeRobot views (0490/0491)
+# ---------------------------------------------------------------------------
+
+_VIEW_LAKE_OPTION = typer.Option(..., "--lake", help="Path or object-store URI to the lake.")
+_VIEW_FORMAT_OPTION = typer.Option("text", "--format", help="Output format: text or json.")
+_VIEW_STATE_STREAM_OPTION = typer.Option(
+    [], "--state-stream", help="Stream composing observation.state (repeatable, ordered)."
+)
+_VIEW_ACTION_STREAM_OPTION = typer.Option(
+    [], "--action-stream", help="Stream composing action (repeatable, ordered)."
+)
+_VIEW_CAMERA_STREAM_OPTION = typer.Option(
+    [], "--camera-stream", help="Camera stream mapped to observation.images.* (repeatable)."
+)
+_VIEW_EPISODE_ID_OPTION = typer.Option(
+    [], "--episode-id", help="Restrict to these episode ids (repeatable)."
+)
+_VIEW_STATUS_OPTION = typer.Option([], "--status", help="Quality statuses to admit (repeatable).")
+_VIEW_DEST_ARGUMENT = typer.Argument(..., help="Directory to materialize the meta/ files into.")
+
+
+def _published_view_payload(view) -> dict:
+    return {
+        "view_id": view.view_id,
+        "repo_id": view.repo_id,
+        "alignment_id": view.alignment_id,
+        "total_frames": view.total_frames,
+        "total_episodes": view.total_episodes,
+        "file_count": view.file_count,
+        "files_bytes": view.files_bytes,
+        "created_at": view.created_at,
+    }
+
+
+@view_app.command("publish")
+def view_publish(
+    lake: str = _VIEW_LAKE_OPTION,
+    repo_id: str = typer.Option(..., "--repo-id", help="Client-facing dataset name."),
+    fps: int = typer.Option(..., "--fps", help="Nominal tick rate lerobot tooling paces by."),
+    alignment: str = typer.Option(
+        None, "--alignment", help="Alignment id or name (auto-detected kind)."
+    ),
+    alignment_id: str = typer.Option(None, "--alignment-id", help="Exact alignment id."),
+    name: str = typer.Option(None, "--name", help="Alignment name."),
+    state_streams: list[str] = _VIEW_STATE_STREAM_OPTION,
+    action_streams: list[str] = _VIEW_ACTION_STREAM_OPTION,
+    camera_streams: list[str] = _VIEW_CAMERA_STREAM_OPTION,
+    episode_ids: list[str] = _VIEW_EPISODE_ID_OPTION,
+    statuses: list[str] = _VIEW_STATUS_OPTION,
+    min_confidence: float = typer.Option(
+        None, "--min-confidence", help="Minimum per-tick confidence to admit."
+    ),
+    no_require_streams: bool = typer.Option(
+        False, "--no-require-streams", help="Admit ticks missing some mapped streams."
+    ),
+    robot_type: str = typer.Option(None, "--robot-type", help="robot_type for info.json."),
+    created_by: str = typer.Option(None, "--created-by", help="Recorded publisher identity."),
+    no_stats: bool = typer.Option(
+        False, "--no-stats", help="Skip meta/stats.json (policies then cannot normalize)."
+    ),
+    stats_batch_size: int = typer.Option(
+        None, "--stats-batch-size", help="Frames per bounded stats batch (default 1024)."
+    ),
+    camera_max_samples: int = typer.Option(
+        None,
+        "--camera-max-samples",
+        help="Cap on deterministically sampled frames per camera (default 10000).",
+    ),
+    output_format: str = _VIEW_FORMAT_OPTION,
+) -> None:
+    """Publish one version-pinned LeRobot view of this lake (the deliberate act
+    by which new data is exposed to LeRobot clients)."""
+    from lancedb_robotics.lerobot_facade import (
+        CanonicalVectorMapping,
+        ViewError,
+        publish_view,
+    )
+    from lancedb_robotics.lerobot_facade.manifest import ManifestDeriveError
+    from lancedb_robotics.lerobot_facade.stats import ViewStatsError
+
+    opened = _open_lake_or_exit(lake)
+    stats_options: dict = {}
+    if stats_batch_size is not None:
+        stats_options["batch_size"] = stats_batch_size
+    if camera_max_samples is not None:
+        stats_options["camera_max_samples"] = camera_max_samples
+    try:
+        mapping = CanonicalVectorMapping(
+            state_streams=tuple(state_streams),
+            action_streams=tuple(action_streams),
+            camera_streams=tuple(camera_streams),
+        )
+        published = publish_view(
+            opened,
+            repo_id=repo_id,
+            fps=fps,
+            mapping=mapping,
+            alignment=alignment,
+            alignment_id=alignment_id,
+            name=name,
+            episode_ids=episode_ids or None,
+            statuses=statuses or None,
+            min_confidence=min_confidence,
+            require_streams=not no_require_streams,
+            robot_type=robot_type,
+            created_by=created_by,
+            include_stats=not no_stats,
+            stats_options=stats_options or None,
+        )
+    except (ViewError, ViewStatsError, ManifestDeriveError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if output_format == "json":
+        _emit_json(_published_view_payload(published))
+        return
+    typer.echo(f"published view: {published.view_id}")
+    typer.echo(f"repo_id: {published.repo_id}")
+    typer.echo(f"alignment_id: {published.alignment_id}")
+    typer.echo(f"frames: {published.total_frames}  episodes: {published.total_episodes}")
+    typer.echo(f"files: {published.file_count} ({published.files_bytes} bytes)")
+    typer.echo(
+        "clients can now open it as "
+        f"LeRobotDataset({published.repo_id!r}, root={lake!r}) once the "
+        "lancedb_robotics reader is registered"
+    )
+
+
+@view_app.command("list")
+def view_list(
+    lake: str = _VIEW_LAKE_OPTION,
+    repo_id: str = typer.Option(None, "--repo-id", help="Filter by repo id."),
+    limit: int = typer.Option(20, "--limit", help="Newest views to show."),
+    output_format: str = _VIEW_FORMAT_OPTION,
+) -> None:
+    """List published views, newest first."""
+    from lancedb_robotics.lerobot_facade import ViewError, list_views
+
+    opened = _open_lake_or_exit(lake)
+    try:
+        rows = list_views(opened, repo_id=repo_id, limit=limit)
+    except ViewError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if output_format == "json":
+        _emit_json(rows)
+        return
+    typer.echo(f"views: {len(rows)}")
+    for row in rows:
+        typer.echo(
+            f"  {row['view_id']}  repo_id={row['repo_id']}  "
+            f"frames={row['total_frames']}  episodes={row['total_episodes']}  "
+            f"created_at={row['created_at']}"
+        )
+
+
+@view_app.command("materialize")
+def view_materialize(
+    dest: Path = _VIEW_DEST_ARGUMENT,
+    lake: str = _VIEW_LAKE_OPTION,
+    repo_id: str = typer.Option(None, "--repo-id", help="Resolve the newest view for this repo id."),
+    view_id: str = typer.Option(None, "--view-id", help="Materialize this exact view id."),
+    force: bool = typer.Option(False, "--force", help="Rewrite dest even if it already exists."),
+) -> None:
+    """Materialize a published view's meta/ files to a local directory.
+
+    Clients normally never need this -- the registered reader materializes
+    into a per-view cache automatically when pointed at the lake -- but it is
+    useful for inspection and for pre-seeding an offline root.
+    """
+    from lancedb_robotics.lerobot_facade import ViewError, get_view, materialize_view
+
+    opened = _open_lake_or_exit(lake)
+    try:
+        view = get_view(opened, repo_id=repo_id, view_id=view_id)
+        path = materialize_view(opened, view, dest, lake_uri=lake, force=force)
+    except ViewError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"materialized view {view['view_id']} at {path}")

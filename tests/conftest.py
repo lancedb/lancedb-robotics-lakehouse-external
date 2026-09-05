@@ -20,6 +20,7 @@ _REQUIRE_VIDEO_DECODE_ENV = "LANCEDB_ROBOTICS_REQUIRE_VIDEO_DECODE"
 _REQUIRE_LEROBOT_NATIVE_BENCHMARK_ENV = (
     "LANCEDB_ROBOTICS_REQUIRE_LEROBOT_NATIVE_BENCHMARK"
 )
+_REQUIRE_LEROBOT_MAIN_DEV_ENV = "LANCEDB_ROBOTICS_REQUIRE_LEROBOT_MAIN_DEV"
 _REQUIRE_INVOCATION_CONFORMANCE_ENV = "LANCEDB_ROBOTICS_REQUIRE_INVOCATION_CONFORMANCE"
 
 
@@ -124,6 +125,41 @@ def require_lerobot_native_benchmark():
         pytest.skip(reason)
 
     return components, status
+
+
+def require_lerobot_main_dev():
+    """Gate the ``lancedb_robotics`` BaseDatasetReader adapter integration test.
+
+    Upstream ``huggingface/lerobot`` PR #4363 (the storage-format registry this
+    adapter implements against) is not in any PyPI release yet, so the default
+    dev/CI environment (``lerobot>=0.4.0`` at most, or absent) skips cleanly.
+    The dedicated verification lane installs the dev-only, commit-pinned
+    ``lancedb-robotics[lerobot-main-dev]`` extra into an isolated venv and sets
+    ``LANCEDB_ROBOTICS_REQUIRE_LEROBOT_MAIN_DEV=1`` so a missing/broken install
+    or a moved upstream import fails the lane instead of silently skipping it.
+    """
+
+    if importlib.util.find_spec("lerobot") is None:
+        reason = (
+            "lerobot is not installed; install the dev-only, commit-pinned "
+            "`lancedb-robotics[lerobot-main-dev]` extra in an isolated venv"
+        )
+        if os.environ.get(_REQUIRE_LEROBOT_MAIN_DEV_ENV) == "1":
+            pytest.fail(reason)
+        pytest.skip(reason)
+
+    try:
+        from lerobot.datasets.dataset_reader import BaseDatasetReader  # noqa: F401
+        from lerobot.datasets.storage import register_dataset_reader  # noqa: F401
+    except ImportError as error:
+        reason = (
+            "the installed lerobot predates PR #4363's storage-format registry "
+            f"(register_dataset_reader/BaseDatasetReader): {error}. Install the "
+            "commit-pinned `lancedb-robotics[lerobot-main-dev]` extra."
+        )
+        if os.environ.get(_REQUIRE_LEROBOT_MAIN_DEV_ENV) == "1":
+            pytest.fail(reason)
+        pytest.skip(reason)
 
 
 def require_start_method(method: str) -> None:

@@ -112,6 +112,77 @@ ROS_RANGE = {
 }
 RANGE_STATE = [1.25, 0.02, 4.0, 0.5]
 
+# XDOF ABC-130k protobuf RobotState/GripperState (real field shapes, see
+# docs/YAM_DATA_FORMAT.md): observed streams carry position/velocity/torque,
+# commanded (action) streams carry position only -- same schema name either
+# way, so extract() types both identically (see LAYOUTS' "joint_state"/
+# "gripper" comments for why that's fine: a facade separates observed vs.
+# commanded by stream/topic name, not by extract.py's output field).
+YAM_ROBOT_STATE = {
+    "timestamp": {"seconds": 1751060476, "nanos": 85970432},
+    "position": [-0.57, 0.84, 0.68, -0.12, 0.27, -0.81],
+    "velocity": [-2.34, 1.11, 1.08, 0.02, -1.07, 0.75, -0.14],
+    "torque": [-2.78, 0.69, 11.98, 2.34, -0.01, 0.25, 0.15],
+}
+JOINT_STATE = [-0.57, 0.84, 0.68, -0.12, 0.27, -0.81]
+YAM_ROBOT_ACTION = {
+    "timestamp": {"seconds": 1751060476, "nanos": 85970432},
+    "position": [-0.60, 0.87, 0.71, -0.11, 0.24, -0.79],
+}
+JOINT_ACTION = [-0.60, 0.87, 0.71, -0.11, 0.24, -0.79]
+
+YAM_GRIPPER_STATE = {
+    "timestamp": {"seconds": 1751060476, "nanos": 85970432},
+    "position": [0.957],
+    "velocity": [0.0],
+    "torque": [0.1],
+}
+GRIPPER_STATE = [0.957]
+YAM_GRIPPER_ACTION = {
+    "timestamp": {"seconds": 1751060476, "nanos": 85970432},
+    "position": [0.947],
+}
+GRIPPER_ACTION = [0.947]
+
+# Voxel51 RoboLab-EgoX protobuf RobotState (real field values, decoded
+# directly from a real episode.fo.mcap): the *same bare schema name*
+# "RobotState" as XDOF ABC-130k above -- a genuine cross-dataset collision,
+# confirmed against real data from both producers. Disambiguated by field
+# length (13 on /joint-positions, 8 on /actions), never by content/topic.
+ROBOLAB_JOINT_STATE = {
+    "timestamp": {"seconds": 1000000000},
+    "position": [
+        -0.295654296875,
+        0.401611328125,
+        -0.25732421875,
+        -1.6611328125,
+        0.192138671875,
+        1.9775390625,
+        0.2802734375,
+        1.1920928955078125e-07,
+        4.1723251342773438e-07,
+        -3.2067298889160156e-05,
+        3.2603740692138672e-05,
+        2.9385089874267578e-05,
+        2.6822090148925781e-05,
+    ],
+}
+ROBOLAB_JOINT_STATE_VECTOR = ROBOLAB_JOINT_STATE["position"]
+ROBOLAB_ACTION = {
+    "timestamp": {"seconds": 1000000000},
+    "position": [
+        -0.311767578125,
+        0.455322265625,
+        -0.26220703125,
+        -1.6123046875,
+        0.20361328125,
+        1.9658203125,
+        0.29833984375,
+        0.0,
+    ],
+}
+ROBOLAB_ACTION_VECTOR = ROBOLAB_ACTION["position"]
+
 
 # --- per-type extraction (table-driven over the mapped type set) ------------
 
@@ -132,6 +203,10 @@ RANGE_STATE = [1.25, 0.02, 4.0, 0.5]
         ("foxglove.PoseInFrame", FG_POSE_IN_FRAME, "pose", POSE_STATE, None),
         ("Pose", JSON_POSE, "pose", POSE_STATE, None),
         ("sensor_msgs/Range", ROS_RANGE, "range", RANGE_STATE, None),
+        ("RobotState", YAM_ROBOT_STATE, "joint_state", JOINT_STATE, None),
+        ("GripperState", YAM_GRIPPER_STATE, "gripper", GRIPPER_STATE, None),
+        ("RobotState", ROBOLAB_JOINT_STATE, "robolab_joint_state", ROBOLAB_JOINT_STATE_VECTOR, None),
+        ("RobotState", ROBOLAB_ACTION, "robolab_action", ROBOLAB_ACTION_VECTOR, None),
     ],
 )
 def test_typed_extraction(schema_name, payload, modality, state, action):
@@ -178,6 +253,60 @@ def test_gps_cross_family_equivalence():
     fg = extract("foxglove.LocationFix", FG_LOCATIONFIX)
     assert ros.modality == fg.modality == "gps"
     assert ros.state_vector == pytest.approx(fg.state_vector)
+
+
+def test_yam_robot_state_schema_is_topic_agnostic_state_or_action():
+    # RobotState/GripperState carry no topic identity of their own -- the same
+    # schema serves both an observed (*-state) and a commanded (*-action)
+    # topic, and extract() has no topic argument to tell them apart. It
+    # always types both as a "state_vector" (never "action_vector"); a
+    # facade's CanonicalVectorMapping is what separates observed vs.
+    # commanded, by declaring which *stream names* (topics) are state vs.
+    # action -- not by which extract.py field got populated.
+    action_result = extract("RobotState", YAM_ROBOT_ACTION)
+    assert action_result.modality == "joint_state"
+    assert action_result.state_vector == pytest.approx(JOINT_ACTION)
+    assert action_result.action_vector is None
+
+    gripper_action_result = extract("GripperState", YAM_GRIPPER_ACTION)
+    assert gripper_action_result.modality == "gripper"
+    assert gripper_action_result.state_vector == pytest.approx(GRIPPER_ACTION)
+    assert gripper_action_result.action_vector is None
+
+
+def test_robotstate_schema_name_collision_disambiguated_by_field_length():
+    # XDOF ABC-130k (6-length position) and Voxel51 RoboLab-EgoX (13- and
+    # 8-length position) both use the bare schema name "RobotState" --
+    # extract() must not silently conflate them just because the name matches.
+    yam = extract("RobotState", YAM_ROBOT_STATE)
+    robolab_state = extract("RobotState", ROBOLAB_JOINT_STATE)
+    robolab_action = extract("RobotState", ROBOLAB_ACTION)
+    assert yam.modality == "joint_state"
+    assert robolab_state.modality == "robolab_joint_state"
+    assert robolab_action.modality == "robolab_action"
+    assert yam.state_vector == pytest.approx(JOINT_STATE)
+    assert robolab_state.state_vector == pytest.approx(ROBOLAB_JOINT_STATE_VECTOR)
+    assert robolab_action.state_vector == pytest.approx(ROBOLAB_ACTION_VECTOR)
+
+
+def test_robotstate_with_unrecognized_length_yields_no_modality():
+    # A hypothetical 4th "RobotState" producer with an unrecognized length
+    # must not be silently guessed as one of the 3 known shapes.
+    result = extract("RobotState", {"position": [1.0, 2.0]})
+    assert result.modality is None
+    assert result.state_vector is None
+
+
+def test_robotstate_with_no_payload_yields_no_modality():
+    # Unlike single-candidate schema names (see
+    # test_missing_payload_still_types_modality_from_schema_name below),
+    # "RobotState" is genuinely ambiguous without a payload to check length
+    # against -- a raw/failed row with this schema name honestly can't be
+    # resolved to one of the 3 real shapes, so modality stays None rather
+    # than guessing.
+    result = extract("RobotState", None)
+    assert result.modality is None
+    assert result.state_vector is None
 
 
 # --- structural-matcher fallback (unknown schema name, known shape) ---------
@@ -248,3 +377,7 @@ def test_layout_table_documents_every_emitted_vector():
     assert len(LAYOUTS["pose"]) == len(POSE_STATE)
     assert len(LAYOUTS["twist"]) == len(TWIST_ACTION)
     assert len(LAYOUTS["range"]) == len(RANGE_STATE)
+    assert len(LAYOUTS["joint_state"]) == len(JOINT_STATE)
+    assert len(LAYOUTS["gripper"]) == len(GRIPPER_STATE)
+    assert len(LAYOUTS["robolab_joint_state"]) == len(ROBOLAB_JOINT_STATE_VECTOR)
+    assert len(LAYOUTS["robolab_action"]) == len(ROBOLAB_ACTION_VECTOR)

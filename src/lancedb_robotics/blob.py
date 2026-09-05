@@ -58,10 +58,18 @@ def _to_dataset(
         assert connection_spec is not None  # narrowed by has_pylance_access
         name = table_name or getattr(handle, "name", None)
         if name is not None:
+            # A version-pinned handle (lerobot_facade.views.PinnedLake) marks
+            # itself so this route — which opens its *own* lance dataset rather
+            # than dropping through the handle — honors the pin instead of
+            # silently reading the live table version (backlog 0491: a
+            # published view's reads must never drift).
+            pinned_version = getattr(handle, "_lancedb_robotics_pinned_version", None)
+            version_kwargs = {} if pinned_version is None else {"version": int(pinned_version)}
             return pylance_execution.open_direct_dataset(
                 connection_spec,
                 name,
                 namespace_access_factory=namespace_access_factory,
+                **version_kwargs,
             )
         if hasattr(handle, "to_lance"):
             # A namespace-backed lancedb Table we cannot resolve a table_id for:

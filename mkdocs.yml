@@ -37,6 +37,7 @@ nav:
       - Compare Enterprise training runs over time: journeys/training-report-history.md
       - Prove Enterprise training behaves the same everywhere: journeys/enterprise-training-conformance.md
       - Page a fleet-scale training epoch from a server-side plan: journeys/server-side-plan.md
+      - Publish a version-pinned LeRobot view: journeys/lerobot-published-views.md
   - Reference:
       - CLI: reference/cli.generated.md
       - Python API (lake.*): reference/api.generated.md

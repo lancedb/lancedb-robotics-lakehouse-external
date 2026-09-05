@@ -146,6 +146,47 @@ class LiveLeRobotFacade:
             )
         ]
 
+    def has_feature(self, key: str) -> bool:
+        """True when this facade's mapping declares the vector feature ``key``."""
+        if key == "observation.state":
+            return bool(self.mapping.state_streams)
+        if key == "action":
+            return bool(self.mapping.action_streams)
+        return False
+
+    def tabular_feature_batch(self, indices: Sequence[int]) -> dict[str, list[Any]]:
+        """Vector/scalar feature values for ``indices``, with NO camera decode.
+
+        The bounded-batch seam the view-publish statistics pass (backlog 0490)
+        streams through: identical index math and vector composition to
+        ``__getitems__``, but reads only the underlying tabular dataset —
+        never :class:`VideoIndex`, so a full-view scan decodes zero JPEGs.
+        """
+        normalized = [self._normalize_index(index) for index in indices]
+        plans = [(index, *self._frame_locations[index]) for index in normalized]
+        dataset_indices = [
+            self._dataset_index_by_tick[self._episodes[episode_index].tick_indices[position]]
+            for _, episode_index, position in plans
+        ]
+        samples = self._dataset.__getitems__(dataset_indices)
+        batch: dict[str, list[Any]] = {
+            "index": [index for index, _, _ in plans],
+            "episode_index": [episode_index for _, episode_index, _ in plans],
+            "frame_index": [position for _, _, position in plans],
+            "timestamp": [sample["timestamp_ns"] / 1_000_000_000.0 for sample in samples],
+        }
+        if self.mapping.state_streams:
+            batch["observation.state"] = [
+                compose_vector(sample["streams"], self.mapping.state_streams)
+                for sample in samples
+            ]
+        if self.mapping.action_streams:
+            batch["action"] = [
+                compose_vector(sample["streams"], self.mapping.action_streams)
+                for sample in samples
+            ]
+        return batch
+
     def _camera_requests(
         self, sample: dict[str, Any], episode: FacadeEpisode
     ) -> dict[str, tuple[str, int]]:

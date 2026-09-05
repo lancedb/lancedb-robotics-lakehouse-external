@@ -270,6 +270,20 @@ CURATION_MATERIALIZATION_FILE_PREDICATE_INDEX_COLUMNS = (
 # ``(view_id, target_grain, source_snapshot_name)``. ``target_grain`` /
 # ``storage_kind`` / ``state`` / ``frozen`` are low-cardinality categoricals, so
 # BITMAP; ``created_at`` BTREE keeps the keyset page ordering range-friendly.
+# Published LeRobot view catalog (backlog 0491): `repo_id` is the client-facing
+# resolve key (localize_root hits it on every dataset open) and `view_id` keys
+# both the header row and every file row (materialization fetches file contents
+# one `file_id` at a time).
+LEROBOT_VIEW_PREDICATE_INDEX_COLUMNS = (
+    ("repo_id", "BTREE"),
+    ("view_id", "BTREE"),
+)
+
+LEROBOT_VIEW_FILE_PREDICATE_INDEX_COLUMNS = (
+    ("view_id", "BTREE"),
+    ("file_id", "BTREE"),
+)
+
 CURATION_ROW_PLAN_PREDICATE_INDEX_COLUMNS = (
     ("plan_id", "BTREE"),
     ("view_id", "BTREE"),
@@ -828,6 +842,8 @@ PREDICATE_INDEX_COLUMNS_BY_TABLE: dict[str, tuple[tuple[str, str], ...]] = {
     "curation_materialization_files": CURATION_MATERIALIZATION_FILE_PREDICATE_INDEX_COLUMNS,
     "curation_row_plans": CURATION_ROW_PLAN_PREDICATE_INDEX_COLUMNS,
     "curation_row_plan_chunks": CURATION_ROW_PLAN_CHUNK_PREDICATE_INDEX_COLUMNS,
+    "lerobot_views": LEROBOT_VIEW_PREDICATE_INDEX_COLUMNS,
+    "lerobot_view_files": LEROBOT_VIEW_FILE_PREDICATE_INDEX_COLUMNS,
 }
 
 

@@ -25,6 +25,15 @@ schema name by the *shape* of its decoded fields -- so a vendor ``acme/CustomImu
 still lands as ``imu``. Anything that matches nothing returns ``modality=None``
 (the caller falls back to a topic-based guess) with NULL vectors.
 
+A bare schema name is not always unique across producers: XDOF ABC-130k and
+Voxel51 RoboLab-EgoX both independently chose the generic protobuf message name
+``RobotState`` for real, differently-shaped robots. :data:`_BY_SCHEMA` allows a
+name to map to a *tuple* of candidate types instead of one; each candidate's
+``match`` then disambiguates by real field shape (here, ``position`` length),
+the same predicate mechanism the structural fallback already uses for unknown
+names. An exact name with no matching candidate (and no payload to check)
+yields ``modality=None`` rather than guessing.
+
 The vector layouts are a **versioned, documented contract** (:data:`LAYOUTS` /
 :data:`LAYOUT_VERSION`): each emitted vector's component order is fixed so the
 numbers stay interpretable and stable across runs. Missing or malformed fields
@@ -45,20 +54,57 @@ LAYOUT_VERSION = "1"
 LAYOUTS: dict[str, tuple[str, ...]] = {
     # state vectors
     "imu": (
-        "orientation_x", "orientation_y", "orientation_z", "orientation_w",
-        "angular_velocity_x", "angular_velocity_y", "angular_velocity_z",
-        "linear_acceleration_x", "linear_acceleration_y", "linear_acceleration_z",
+        "orientation_x",
+        "orientation_y",
+        "orientation_z",
+        "orientation_w",
+        "angular_velocity_x",
+        "angular_velocity_y",
+        "angular_velocity_z",
+        "linear_acceleration_x",
+        "linear_acceleration_y",
+        "linear_acceleration_z",
     ),
     "gps": ("latitude", "longitude", "altitude"),
     "pose": (
-        "position_x", "position_y", "position_z",
-        "orientation_x", "orientation_y", "orientation_z", "orientation_w",
+        "position_x",
+        "position_y",
+        "position_z",
+        "orientation_x",
+        "orientation_y",
+        "orientation_z",
+        "orientation_w",
     ),
     "range": ("range", "min_range", "max_range", "field_of_view"),
+    # 6-DoF arm joint positions (XDOF ABC-130k's ``RobotState``, protobuf).
+    # The same schema serves both observed (``/{side}-arm-state``) and
+    # commanded (``/{side}-arm-action``) topics -- ``extract()`` has no topic
+    # argument to disambiguate, so this always lands in ``state_vector``; a
+    # facade's ``CanonicalVectorMapping`` separates observed vs. commanded by
+    # *stream name* (topic), not by which extract.py field was populated.
+    "joint_state": ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6"),
+    # Normalized gripper aperture, 0 = closed, 1 = open (XDOF ABC-130k's
+    # ``GripperState``). Same observed/commanded-by-topic note as joint_state.
+    "gripper": ("aperture",),
+    # 13-value joint/DOF vector (Voxel51 RoboLab-EgoX's ``/joint-positions``,
+    # protobuf ``RobotState`` -- the *same bare schema name* XDOF ABC-130k
+    # uses above for its own 6-DoF arm, a real cross-dataset collision
+    # disambiguated by field length; see `_ROBOLAB_JOINT_STATE`). Component
+    # names are index-only: RoboLab's own docs don't name each DOF, so
+    # nothing beyond "the Nth value in `position`" is claimed.
+    "robolab_joint_state": tuple(f"joint{i}" for i in range(1, 14)),
+    # 8-value command vector (RoboLab-EgoX's ``/actions``, same ``RobotState``
+    # schema name, disambiguated the same way). Same observed/commanded-by-
+    # topic note as joint_state above -- always lands in `state_vector`.
+    "robolab_action": tuple(f"joint{i}" for i in range(1, 9)),
     # action vector
     "twist": (
-        "linear_x", "linear_y", "linear_z",
-        "angular_x", "angular_y", "angular_z",
+        "linear_x",
+        "linear_y",
+        "linear_z",
+        "angular_x",
+        "angular_y",
+        "angular_z",
     ),
 }
 
@@ -174,6 +220,17 @@ def _range_state(msg: dict) -> list[float]:
     ]
 
 
+def _position_vector(msg: dict) -> list[float]:
+    """Whole ``position`` array as floats -- shared by every ``RobotState``
+    producer (XDOF ABC-130k's 6-DoF arm, RoboLab-EgoX's 13/8-length
+    variants); the real length simply comes from the real message."""
+    return [_num(v) for v in msg["position"]]
+
+
+def _yam_gripper_state(msg: dict) -> list[float]:
+    return [_num(msg["position"][0])]
+
+
 # --- type handlers ----------------------------------------------------------
 
 
@@ -182,7 +239,10 @@ class _Type:
     """One robot message type: its modality and how to build its vectors.
 
     ``match`` is the structural predicate used when an unknown schema name has
-    this type's field shape; ``None`` means the type is exact-name-only.
+    this type's field shape, *or* to disambiguate one of several exact-name
+    candidates registered under the same colliding schema name (see
+    :data:`_BY_SCHEMA`'s tuple values); ``None`` means the type is
+    exact-name-only, with no ambiguity to resolve.
     """
 
     modality: str
@@ -196,43 +256,76 @@ def _has(msg: dict, *names: str) -> bool:
 
 
 _IMU_ROS = _Type(
-    "imu", state=_imu_ros_state,
+    "imu",
+    state=_imu_ros_state,
     match=lambda m: _has(m, "orientation", "angular_velocity", "linear_acceleration"),
 )
 _IMU_JSON = _Type(
-    "imu", state=_imu_json_state,
+    "imu",
+    state=_imu_json_state,
     match=lambda m: _has(m, "q", "rotation_rate", "linear_accel"),
 )
 _NAVSAT = _Type(
-    "gps", state=_gps_state,
+    "gps",
+    state=_gps_state,
     match=lambda m: _has(m, "latitude", "longitude", "altitude"),
 )
 _TWIST_STAMPED = _Type(
-    "twist", action=_twist_stamped_action,
+    "twist",
+    action=_twist_stamped_action,
     match=lambda m: isinstance(m.get("twist"), dict) and _has(m["twist"], "linear", "angular"),
 )
 _TWIST = _Type(
-    "twist", action=_twist_action,
+    "twist",
+    action=_twist_action,
     match=lambda m: _has(m, "linear", "angular"),
 )
 _ODOM = _Type(
-    "odometry", state=_odom_state, action=_odom_action,
+    "odometry",
+    state=_odom_state,
+    action=_odom_action,
     match=lambda m: _has(m, "pose", "twist", "child_frame_id"),
 )
 _POSE_IN_FRAME = _Type(
-    "pose", state=_pose_in_frame_state,
-    match=lambda m: isinstance(m.get("pose"), dict)
-    and _has(m["pose"], "position", "orientation")
-    and _has(m, "frame_id"),
+    "pose",
+    state=_pose_in_frame_state,
+    match=lambda m: (
+        isinstance(m.get("pose"), dict)
+        and _has(m["pose"], "position", "orientation")
+        and _has(m, "frame_id")
+    ),
 )
 _JSON_POSE = _Type(
-    "pose", state=_json_pose_state,
+    "pose",
+    state=_json_pose_state,
     match=lambda m: _has(m, "pos", "orientation"),
 )
 _RANGE = _Type(
-    "range", state=_range_state,
+    "range",
+    state=_range_state,
     match=lambda m: _has(m, "range", "radiation_type", "field_of_view", "min_range", "max_range"),
 )
+# XDOF ABC-130k and Voxel51 RoboLab-EgoX both independently chose the
+# generic protobuf message name "RobotState" -- a real cross-dataset schema
+# name collision confirmed against real ingested data from both. Both
+# producers' typed vectors read only `position`, so each candidate's
+# `match` disambiguates by the *real* field length: ABC-130k's YAM arm is
+# always 6, RoboLab's `/joint-positions` is always 13, RoboLab's `/actions`
+# is always 8 (see `_BY_SCHEMA["RobotState"]`, a tuple of these three, tried
+# in order). An unrecognized length (a future 4th producer) yields no
+# vector rather than a wrong guess -- see `extract()`.
+_YAM_ROBOT_STATE = _Type(
+    "joint_state", state=_position_vector, match=lambda m: len(m.get("position") or ()) == 6
+)
+_ROBOLAB_JOINT_STATE = _Type(
+    "robolab_joint_state",
+    state=_position_vector,
+    match=lambda m: len(m.get("position") or ()) == 13,
+)
+_ROBOLAB_ACTION = _Type(
+    "robolab_action", state=_position_vector, match=lambda m: len(m.get("position") or ()) == 8
+)
+_YAM_GRIPPER_STATE = _Type("gripper", state=_yam_gripper_state)
 # Binary / aggregate types: typed by modality, no state/action vector (the
 # structured payload stays in payload_json). Ordered before the scalar types
 # in _STRUCTURAL so e.g. a PointCloud isn't mistaken for something else.
@@ -247,8 +340,10 @@ _DIAGNOSTIC = _Type("diagnostic")
 
 
 # Exact schema-name -> handler. Both the legacy ``pkg/Type`` and the ROS2
-# ``pkg/msg/Type`` spellings map to the same handler.
-_BY_SCHEMA: dict[str, _Type] = {
+# ``pkg/msg/Type`` spellings map to the same handler. A name known to collide
+# across producers (see "RobotState" below) maps to a *tuple* of candidates
+# instead, disambiguated by `_select_exact` using each candidate's `match`.
+_BY_SCHEMA: dict[str, _Type | tuple[_Type, ...]] = {
     "sensor_msgs/Imu": _IMU_ROS,
     "sensor_msgs/msg/Imu": _IMU_ROS,
     "IMU": _IMU_JSON,
@@ -265,6 +360,8 @@ _BY_SCHEMA: dict[str, _Type] = {
     "Pose": _JSON_POSE,
     "sensor_msgs/Range": _RANGE,
     "sensor_msgs/msg/Range": _RANGE,
+    "RobotState": (_YAM_ROBOT_STATE, _ROBOLAB_JOINT_STATE, _ROBOLAB_ACTION),
+    "GripperState": _YAM_GRIPPER_STATE,
     "sensor_msgs/Image": _IMAGE,
     "sensor_msgs/msg/Image": _IMAGE,
     "sensor_msgs/CompressedImage": _IMAGE,
@@ -311,6 +408,25 @@ def _structural_match(payload: dict) -> _Type | None:
     return None
 
 
+def _select_exact(candidates: tuple[_Type, ...], payload: object) -> _Type | None:
+    """Disambiguate a colliding exact schema name by real field shape.
+
+    Every candidate here has a `match`. Without a decoded payload to check
+    (a raw/failed row), there is no way to know which of several real,
+    differently-shaped producers this message came from -- returns ``None``
+    rather than guessing one.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for candidate in candidates:
+        try:
+            if candidate.match is not None and candidate.match(payload):
+                return candidate
+        except Exception:  # noqa: BLE001 - a predicate must never crash extraction
+            continue
+    return None
+
+
 def _safe(fn: VectorFn | None, payload: dict | None) -> list[float] | None:
     if fn is None or not isinstance(payload, dict):
         return None
@@ -326,10 +442,15 @@ def extract(schema_name: str | None, payload: object) -> ExtractResult:
     ``schema_name`` routes by exact name first; an unknown name with a decoded
     ``payload`` (dict) falls back to structural shape matching. ``payload`` may be
     ``None`` (raw/failed rows): the modality is still assigned from the schema
-    name when known, with NULL vectors. Returns ``modality=None`` only when the
-    type could not be determined at all.
+    name when known, with NULL vectors -- *except* a name registered as several
+    colliding candidates (see :data:`_BY_SCHEMA`), which genuinely cannot be
+    resolved without a payload to check shape against, so it stays
+    ``modality=None`` rather than guessing one. Returns ``modality=None``
+    otherwise only when the type could not be determined at all.
     """
     handler = _BY_SCHEMA.get(schema_name or "")
+    if isinstance(handler, tuple):
+        handler = _select_exact(handler, payload)
     if handler is None and isinstance(payload, dict):
         handler = _structural_match(payload)
     if handler is None:

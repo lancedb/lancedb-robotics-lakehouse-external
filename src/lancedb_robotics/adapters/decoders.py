@@ -288,11 +288,27 @@ def _to_jsonable(obj: Any, blobs: list[bytes], threshold: int) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_to_jsonable(v, blobs, threshold) for v in obj]
 
-    # protobuf message -> dict (bytes base64'd by the converter).
+    # protobuf message -> dict. ``MessageToDict`` base64-inlines every ``bytes``
+    # field regardless of size (it has no concept of the blob-hoist threshold),
+    # so a large one (e.g. ``foxglove.CompressedVideo.data``) would otherwise
+    # never reach ``payload_blob`` -- walk the message's own set fields and
+    # re-run just the ``bytes``-typed ones through this function's normal
+    # bytes branch above, overwriting ``MessageToDict``'s inlined copy. Every
+    # other field (including nested messages/well-known types like
+    # ``Timestamp``) keeps ``MessageToDict``'s existing shape untouched.
     if hasattr(obj, "DESCRIPTOR") and hasattr(type(obj), "ListFields"):
+        from google.protobuf.descriptor import FieldDescriptor
         from google.protobuf.json_format import MessageToDict
 
-        return MessageToDict(obj, preserving_proto_field_name=True)
+        result = MessageToDict(obj, preserving_proto_field_name=True)
+        for field, value in obj.ListFields():
+            if field.type != FieldDescriptor.TYPE_BYTES:
+                continue
+            if field.is_repeated:
+                result[field.name] = [_to_jsonable(bytes(v), blobs, threshold) for v in value]
+            else:
+                result[field.name] = _to_jsonable(bytes(value), blobs, threshold)
+        return result
 
     # numpy scalar / array, without importing numpy.
     if hasattr(obj, "item") and hasattr(obj, "dtype") and not hasattr(obj, "__len__"):
