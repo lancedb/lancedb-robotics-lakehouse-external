@@ -80,8 +80,15 @@ lerobot-native-bench = [
 # and `dev`, and not wired into any existing CI lane -- install into an
 # isolated venv, never the tracked project `.venv`, until a real release
 # includes PR #4363.
+#
+# Pinned to a fork SHA, not upstream (backlog 0492): `2a8c3cbc` is upstream
+# `3f2c29ef` plus exactly one commit -- the `lerobot.dataset_readers`
+# entry-point discovery patch (huggingface/lerobot PR #4576, open) -- so the
+# gated lane exercises the real discovery path this package's entry point
+# declaration depends on. Move back to an upstream SHA/release containing
+# PR #4576 once it merges (backlog 0510).
 lerobot-main-dev = [
-    "lerobot[dataset] @ git+https://github.com/huggingface/lerobot@3f2c29ef7e44b1ddccbcda3b6a63939e53639e9e",
+    "lerobot[dataset] @ git+https://github.com/sarwarbhuiyan/lerobot@2a8c3cbc414f111d56ac05c77adc0fb2b8986f37",
     "torch>=2.0",
     "pillow>=10.0",
 ]
@@ -201,8 +208,27 @@ datahub = ["acryl-datahub>=0.14"]
 # CI (mirrors the `embeddings` extra). Alpha upstream, so kept to a floor pin.
 graph = ["lance-graph>=0.5.4"]
 
+# Dataset-reader discovery for lerobot (backlog 0492). Upstream
+# huggingface/lerobot PR #4576 (open) scans this group on the first storage
+# registry lookup, reading entry-point *names* only -- the module is still
+# imported lazily on first use, so lancedb/pyarrow stay unimported until a
+# `lancedb_robotics` dataset is actually opened. Inert on released lerobot
+# versions today (nothing reads the group); once a release ships the
+# discovery patch, `pip install lancedb-robotics` alone makes
+# `LeRobotDataset(root=<published view>)` resolve this format with no manual
+# import and no configuration.
+[project.entry-points."lerobot.dataset_readers"]
+lancedb_robotics = "lancedb_robotics.lerobot_facade.dataset_reader"
+
 [project.scripts]
 lancedb-robotics = "lancedb_robotics.cli:app"
+# TEMPORARY shim (backlog 0492; retired by backlog 0510 once a
+# lerobot release ships PR #4576 and viz accepts URI roots): imports the
+# reader -- the registration lerobot's own console scripts have no seam for
+# today -- localizes a URI --root (upstream parses --root as a Path, mangling
+# schemes), then delegates to `lerobot-dataset-viz`, so Foxglove playback
+# against a published view works before upstream discovery exists.
+lancedb-robotics-lerobot-viz = "lancedb_robotics.lerobot_facade.viz_shim:main"
 
 [tool.uv]
 conflicts = [

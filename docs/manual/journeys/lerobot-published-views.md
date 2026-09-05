@@ -70,10 +70,9 @@ build normalization buffers from the view.
 
 ## 2. Open it from lerobot
 
-With the adapter registered (see the reader's own docs:
-`import lancedb_robotics.lerobot_facade.dataset_reader`), a client points at
-the lake — an object-store URI, or `file:///…` for a local lake — and the
-newest view published under that `repo_id` resolves automatically:
+A client points at the lake — an object-store URI, or `file:///…` for a local
+lake — and the newest view published under that `repo_id` resolves
+automatically. From Python, register the adapter first (one import):
 
 ```python
 import lancedb_robotics.lerobot_facade.dataset_reader  # registers "lancedb_robotics"
@@ -82,6 +81,39 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 dataset = LeRobotDataset("acme/pick-place-v1", root="s3://acme/robot.lance")
 dataset.meta.stats["observation.state"]["mean"]  # populated, from the lake
 ```
+
+The package also declares the format in the `lerobot.dataset_readers`
+entry-point group (see `pyproject.toml`). No released lerobot reads that group
+yet; once upstream entry-point discovery
+([huggingface/lerobot#4576](https://github.com/huggingface/lerobot/pull/4576))
+ships in a release, the manual import above becomes unnecessary — installing
+`lancedb-robotics` is enough for any lerobot process, console scripts
+included, to resolve the format with no configuration.
+
+### Foxglove playback (interim shim)
+
+Until that discovery ships, lerobot's own console scripts have no seam for
+the registering import — `lerobot-dataset-viz` constructs the dataset
+directly — so Foxglove playback goes through a **temporary** shim. It
+registers the format, localizes a URI `--root` into the per-view cache
+(the upstream CLI parses `--root` as a `Path`, which mangles URI schemes
+before its own remote-root detection can run), and hands everything else
+unchanged to `lerobot-dataset-viz`:
+
+```console
+$ lancedb-robotics-lerobot-viz \
+    --repo-id acme/pick-place-v1 \
+    --root file:///path/to/robot.lance \
+    --episode-index 0 \
+    --display-mode foxglove
+# then connect the Foxglove app to ws://127.0.0.1:8765
+```
+
+The shim needs a lerobot with the storage-format registry (the dev-only,
+commit-pinned `lerobot-main-dev` extra — no PyPI release carries it yet) and
+fails with exactly that instruction otherwise. It is interim wiring, not API:
+backlog item 0510 retires it — together with the manual import —
+once a lerobot release discovers the entry-point group.
 
 `localize_root` opens the lake, reads the view's file rows, verifies each
 file's sha256, and materializes `meta/` into a per-view cache directory
