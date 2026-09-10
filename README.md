@@ -372,6 +372,18 @@ whole product vision is finished. Status legend: **✅ shipped · 🚧 evolving 
   media/payload hydration, PyTorch map/iterable/dataloader helpers, loader
   reports, and sample-to-source lineage. No new shard layout.
   ([narrative](docs/narratives/lance-native-training-datasets.md))
+- ✅ **Live LeRobot views over the lake** — publish a version-pinned view once
+  (`train view publish`) and `LeRobotDataset("acme/pick-place-v1",
+  root="s3://acme/robot.lance")` just works, no export step: the reader opens the
+  lake through the upstream storage-format registry (plus a
+  `lerobot.dataset_readers` entry point for zero-config discovery once upstream
+  ships it), serves per-feature normalization stats (`meta/stats.json`,
+  mean/std/min/max + q01–q99), resolves the newest view from a single pointer
+  row with keyset-paged catalog ops wired into `lake maintain`, supports
+  `delta_timestamps` temporal windows (ACT-style action chunking with
+  upstream-exact episode-boundary `*_is_pad` masks and batch-shaped read
+  amplification), and plays back in Foxglove via an interim viz shim.
+  ([journey](docs/manual/journeys/lerobot-published-views.md))
 - ✅ **Training & evaluation manifests** in canonical Lance tables (snapshot/table
   version pins, code/runtime context, params, checkpoints, metrics, optional
   MLflow/W&B refs) — no external tracker required.

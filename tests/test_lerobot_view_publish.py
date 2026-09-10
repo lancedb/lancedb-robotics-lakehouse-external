@@ -738,7 +738,7 @@ class _FlakyTable:
     def merge_insert(self, key):
         return self
 
-    def when_matched_update_all(self):
+    def when_matched_update_all(self, *, where=None):
         return self
 
     def when_not_matched_insert_all(self):

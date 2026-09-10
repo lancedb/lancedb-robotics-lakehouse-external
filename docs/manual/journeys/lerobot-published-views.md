@@ -23,7 +23,8 @@ LeRobot clients. Publishing:
   (`lerobot_views`, `lerobot_view_files`), so any client materializes them
   through the same Lance connection it already has.
 
-The flow is: **publish → open from lerobot → advance the lake without fear**.
+The flow is: **publish → open from lerobot → advance the lake without fear →
+train with temporal windows**.
 
 ## 1. Publish the view
 
@@ -141,23 +142,79 @@ A pinned version that no longer exists (pruned by retention/compaction, or a
 backend without version checkout) raises `StaleViewVersionError` naming the
 table and the remedy: re-publish the view.
 
+## 4. Train with temporal windows (`delta_timestamps`)
+
+Policies with horizons — ACT-style action chunking (`action[t..t+k]`),
+observation history (`observation[t-1, t]`) — configure upstream's
+`delta_timestamps` and the reader assembles the windows:
+
+```python
+dataset = LeRobotDataset(
+    "acme/pick-place-v1",
+    root="s3://acme/robot.lance",
+    delta_timestamps={"action": [i / 20 for i in range(50)]},  # 50-step chunk @ 20 fps
+)
+item = dataset[0]
+item["action"].shape        # (50, action_dim) — stacked window
+item["action_is_pad"]       # bool (50,) — True where t+delta left the episode
+```
+
+Semantics match upstream's own Lance backend exactly: offsets must be
+multiples of `1/fps` (± `tolerance_s`); each window member clamps to its
+episode's bounds (a window never bleeds into a neighboring episode — the
+boundary frame repeats instead); `<key>_is_pad` marks exactly the positions
+whose unclamped offset fell outside the episode. Windowed vector features
+stack to `(k, dim)`; a windowed camera stacks decoded frames to
+`(k, C, H, W)`.
+
+Read costs stay batch-shaped, not window-shaped: each batch hydrates the
+*deduplicated union* of window rows in one aligned-tick read, and camera
+decode happens only where the batch actually needs pixels — a window over
+`action` alone never multiplies camera decode by the chunk size, and a
+windowed camera reuses the GOP-batched decoder across overlapping windows.
+
+Two loud guards replace upstream's silent edge behaviors: a `delta_timestamps`
+key the view's mapping cannot serve raises `ValueError` at construction, and a
+window member whose feature genuinely cannot be hydrated (an unaligned tick
+under a permissive quality policy, a camera with no encoded video) raises
+`WindowHydrationError` instead of fabricating padding.
+
 ## Inspecting and operating
 
 ```bash
 lancedb-robotics train view list --lake ./robot.lance --repo-id acme/pick-place-v1
+lancedb-robotics train view list --lake ./robot.lance --page-size 100   # keyset paging
 lancedb-robotics train view materialize ./inspect-here --lake ./robot.lance \
   --repo-id acme/pick-place-v1
+lancedb-robotics train view compact-catalog --lake ./robot.lance --dry-run
 ```
+
+The plain listing is a bounded convenience surface: past 10k matching views it
+raises loudly instead of degrading. `--page-size`/`--cursor` (the
+`list_view_pages` API) walk a catalog of any size with a stable newest-first
+keyset cursor — views published mid-walk never shift later pages.
+
+Resolving the newest view for a `repo_id` — what every
+`LeRobotDataset(root=<lake>)` open does — reads one `lerobot_view_latest`
+pointer row, maintained newest-wins by publish, instead of scanning headers;
+pre-0507 lakes without a pointer fall back to a backend-ordered top-1 read and
+only then to the guarded scan.
+
+Truly simultaneous identical publishes can land benign duplicate catalog rows
+(reads deduplicate by key). `train view compact-catalog` — also run by `lake
+maintain` — collapses them, keeping the newest copy per key and asserting no
+key loses its last row; the same pass reconciles latest-view pointers a crash
+between a publish's catalog write and its pointer update left stale.
 
 `lake maintain` builds the view catalog's scalar indexes (`repo_id`,
 `view_id`, `file_id`) alongside every other managed predicate index. Old
-lakes gain the two catalog tables with one `lancedb-robotics lake init`.
+lakes gain the three catalog tables with one `lancedb-robotics lake init`.
 
 **Audit note.** The view row carries the full definition JSON, the pinned
 version of every canonical table, totals, the camera-stats sampling
 parameters, `created_by`, and `created_at`; the file rows carry per-file
 sha256 and sizes. Materialization refuses hash mismatches outright.
 
-**What's next.** `delta_timestamps` windowing still raises
-`NotImplementedError` (tracked separately); enterprise `db://` version
-checkout is capability-gated and surfaces a typed error where unsupported.
+**What's next.** Enterprise `db://` version checkout is capability-gated and
+surfaces a typed error where unsupported; the registering import and the viz
+shim retire once upstream entry-point discovery ships (backlog 0510).

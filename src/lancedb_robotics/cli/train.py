@@ -2201,20 +2201,47 @@ def view_publish(
 def view_list(
     lake: str = _VIEW_LAKE_OPTION,
     repo_id: str = typer.Option(None, "--repo-id", help="Filter by repo id."),
-    limit: int = typer.Option(20, "--limit", help="Newest views to show."),
+    limit: int = typer.Option(20, "--limit", help="Newest views to show (unpaged mode)."),
+    page_size: int = typer.Option(
+        None,
+        "--page-size",
+        help="Page the catalog with a bounded keyset page of this many views.",
+    ),
+    cursor: str = typer.Option(
+        None, "--cursor", help="Resume token from a previous page's next_cursor."
+    ),
     output_format: str = _VIEW_FORMAT_OPTION,
 ) -> None:
-    """List published views, newest first."""
-    from lancedb_robotics.lerobot_facade import ViewError, list_views
+    """List published views, newest first.
+
+    Without --page-size this is the bounded convenience listing (loudly guarded
+    past 10k matching views); with --page-size/--cursor it pages the catalog at
+    any size with a stable keyset cursor.
+    """
+    from lancedb_robotics.lerobot_facade import ViewError, list_view_pages, list_views
 
     opened = _open_lake_or_exit(lake)
     try:
-        rows = list_views(opened, repo_id=repo_id, limit=limit)
+        if page_size is not None or cursor is not None:
+            page = list_view_pages(
+                opened,
+                repo_id=repo_id,
+                page_size=page_size if page_size is not None else 100,
+                cursor=cursor,
+            )
+            rows = list(page.rows)
+            next_cursor = page.next_cursor
+        else:
+            rows = list_views(opened, repo_id=repo_id, limit=limit)
+            next_cursor = None
     except ViewError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     if output_format == "json":
-        _emit_json(rows)
+        if next_cursor is not None:
+            _emit_json({"rows": rows, "next_cursor": next_cursor})
+        else:
+            _emit_json(rows)
         return
     typer.echo(f"views: {len(rows)}")
     for row in rows:
@@ -2223,6 +2250,48 @@ def view_list(
             f"frames={row['total_frames']}  episodes={row['total_episodes']}  "
             f"created_at={row['created_at']}"
         )
+    if next_cursor is not None:
+        typer.echo(f"next_cursor: {next_cursor or '(end of listing)'}")
+
+
+@view_app.command("compact-catalog")
+def view_compact_catalog(
+    lake: str = _VIEW_LAKE_OPTION,
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be reclaimed without writing."
+    ),
+    output_format: str = _VIEW_FORMAT_OPTION,
+) -> None:
+    """Collapse physical duplicate rows in the published-view catalog.
+
+    Concurrent identical publishes can land benign same-key duplicate rows
+    (reads deduplicate); this reclaims them. Also runs inside `lake maintain`.
+    """
+    from lancedb_robotics.lerobot_facade import ViewError, compact_view_catalog
+
+    opened = _open_lake_or_exit(lake)
+    try:
+        report = compact_view_catalog(opened, dry_run=dry_run)
+    except ViewError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if output_format == "json":
+        _emit_json(report.to_params())
+        return
+    typer.echo(f"view-catalog compaction ({'dry-run' if dry_run else 'applied'})")
+    for item in report.tables:
+        typer.echo(
+            f"  {item.table}: {item.status}  duplicates={item.duplicate_keys_found}  "
+            f"rows_deleted={item.rows_deleted}  readded={item.canonical_rows_readded}  "
+            f"remaining={item.duplicate_keys_remaining}"
+        )
+    reconcile = report.latest_pointer_reconciliation
+    typer.echo(
+        f"  latest-pointer reconcile: {reconcile.status}  "
+        f"checked={reconcile.pointers_checked}  repaired={reconcile.pointers_repaired}  "
+        f"dangling_removed={reconcile.dangling_pointers_removed}"
+    )
+    typer.echo(f"converged: {report.converged}")
 
 
 @view_app.command("materialize")

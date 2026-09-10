@@ -87,6 +87,7 @@ class MaintenanceReport:
     curation_membership_chunks: dict[str, Any] | None = None
     curation_row_plan_chunks: dict[str, Any] | None = None
     curation_replay_retention: dict[str, Any] | None = None
+    lerobot_view_catalog: dict[str, Any] | None = None
 
 
 def _digest(payload: dict) -> str:
@@ -278,6 +279,7 @@ def maintain_lake(
     curation_chunk_maintenance: bool = True,
     compact_curation_chunks: bool = True,
     curation_replay_retention: bool = True,
+    lerobot_view_catalog_compaction: bool = True,
     created_by: str = "lancedb-robotics",
 ) -> MaintenanceReport:
     """Compact tables, refresh existing indexes, and prune old unpinned versions.
@@ -582,6 +584,33 @@ def maintain_lake(
         except Exception as exc:  # noqa: BLE001 - readiness is best-effort.
             curation_replay_retention_report = {"status": "failed", "reason": str(exc)}
 
+    # Collapse physical duplicate rows in the published-view catalog and repair
+    # stale latest-view pointers (backlog 0507). Concurrent identical publishes
+    # land benign same-key duplicates by design (reads dedupe); something has to
+    # reclaim them, and leaving it to an operator remembering `train view
+    # compact-catalog` means they accumulate forever. Best-effort for ordinary
+    # failures -- but the compaction's data-loss postcondition
+    # (ViewCatalogCompactionError: a key lost its last surviving row) must stay
+    # loud, never a report line inside a successful run (BUG-04 rule). Note this
+    # runs after the per-table compact -> index -> prune loop, so tier-2
+    # re-added fragments stay unindexed and delete debris persists until the
+    # NEXT maintenance cycle (duplicate-key volume only).
+    lerobot_view_catalog_report: dict[str, Any] | None = None
+    if lerobot_view_catalog_compaction and "lerobot_views" in selected:
+        from lancedb_robotics.lerobot_facade.view_lifecycle import (
+            ViewCatalogCompactionError,
+            compact_view_catalog,
+        )
+
+        try:
+            lerobot_view_catalog_report = compact_view_catalog(lake).to_params()
+        except ViewCatalogCompactionError as exc:
+            raise MaintenanceError(
+                f"published-view catalog compaction postcondition failed: {exc}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - other failures are best-effort.
+            lerobot_view_catalog_report = {"status": "failed", "reason": str(exc)}
+
     finished = datetime.now(UTC)
     transform_id = "tfm-maintenance-" + _digest(
         {
@@ -614,6 +643,7 @@ def maintain_lake(
         "curation_membership_chunks": curation_membership_chunks,
         "curation_row_plan_chunks": curation_row_plan_chunks,
         "curation_replay_retention": curation_replay_retention_report,
+        "lerobot_view_catalog": lerobot_view_catalog_report,
     }
     transform_row = {
         "transform_id": transform_id,
@@ -645,4 +675,5 @@ def maintain_lake(
         curation_membership_chunks=curation_membership_chunks,
         curation_row_plan_chunks=curation_row_plan_chunks,
         curation_replay_retention=curation_replay_retention_report,
+        lerobot_view_catalog=lerobot_view_catalog_report,
     )

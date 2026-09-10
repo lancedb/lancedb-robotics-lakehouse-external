@@ -18,15 +18,18 @@ carries no image-decode dependency (no Pillow), matching ``video.py``'s own
 ``VideoFrame.frame: bytes`` convention; a training loop decodes with
 whatever image library it already uses.
 
-``delta_timestamps`` windowing is not implemented, and there are no changes
-to ``dataset_export.py``/the CLI export path -- this reads live, with no
-export step at all.
+``delta_timestamps`` windowing itself lives one layer up, in
+``_reader_core.plan_windows``/``hydrate_windowed_items`` (backlog 0509) --
+this facade stays per-frame and framework-neutral, contributing only the
+:meth:`LiveLeRobotFacade.hydrate_batch` seam those helpers batch through.
+There are no changes to ``dataset_export.py``/the CLI export path -- this
+reads live, with no export step at all.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
 
 from lancedb_robotics.lake import Lake
@@ -116,6 +119,34 @@ class LiveLeRobotFacade:
         return self._to_item(sample, episode, position, index, camera_frames)
 
     def __getitems__(self, indices: Sequence[int]) -> list[dict[str, Any]]:
+        return self.hydrate_batch(indices)
+
+    def hydrate_batch(
+        self,
+        indices: Sequence[int],
+        *,
+        camera_keys_per_frame: Sequence[Collection[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Batched hydration with per-frame camera-decode selection.
+
+        ``camera_keys_per_frame`` carries one collection of
+        ``observation.images.<key>`` feature keys per requested index, naming
+        which camera features to decode for that frame (an empty collection
+        decodes none); ``None`` decodes every mapped camera for every frame —
+        exactly ``__getitems__``'s behavior, which delegates here. Costs stay
+        batch-shaped either way: one ``AlignedFrameTrainingDataset.
+        __getitems__`` call hydrates every tabular tick and one
+        :meth:`VideoIndex.decode_batch` call serves every requested camera
+        frame (each GOP blob fetched/un-zlipped once). The selective form
+        exists for temporal-window assembly (backlog 0509): a window over
+        ``action`` alone must not decode a camera frame per window member,
+        and a windowed camera must decode only at its own window rows.
+        """
+        if camera_keys_per_frame is not None and len(camera_keys_per_frame) != len(indices):
+            raise ValueError(
+                f"camera_keys_per_frame has {len(camera_keys_per_frame)} entries "
+                f"for {len(indices)} indices; pass exactly one collection per index"
+            )
         normalized = [self._normalize_index(index) for index in indices]
         plans = [(index, *self._frame_locations[index]) for index in normalized]
         dataset_indices = [
@@ -127,8 +158,16 @@ class LiveLeRobotFacade:
         camera_frames_per_item: list[dict[str, bytes] | None] = [None] * len(plans)
         if self._video_index is not None:
             per_item_requests = [
-                self._camera_requests(sample, self._episodes[episode_index])
-                for (_, episode_index, _), sample in zip(plans, samples, strict=True)
+                self._camera_requests(
+                    sample,
+                    self._episodes[episode_index],
+                    feature_keys=(
+                        None if camera_keys_per_frame is None else camera_keys_per_frame[position_in_batch]
+                    ),
+                )
+                for position_in_batch, ((_, episode_index, _), sample) in enumerate(
+                    zip(plans, samples, strict=True)
+                )
             ]
             all_requests = [
                 location for requests in per_item_requests for location in requests.values()
@@ -188,15 +227,24 @@ class LiveLeRobotFacade:
         return batch
 
     def _camera_requests(
-        self, sample: dict[str, Any], episode: FacadeEpisode
+        self,
+        sample: dict[str, Any],
+        episode: FacadeEpisode,
+        feature_keys: Collection[str] | None = None,
     ) -> dict[str, tuple[str, int]]:
-        """Resolve this sample's camera streams to ``{feature_key: (encoding_id, frame_index)}``."""
+        """Resolve this sample's camera streams to ``{feature_key: (encoding_id, frame_index)}``.
+
+        ``feature_keys`` (full ``observation.images.<key>`` names) restricts
+        which cameras resolve; ``None`` resolves all mapped camera streams.
+        """
         assert self._video_index is not None
         requests: dict[str, tuple[str, int]] = {}
         for stream in self.mapping.camera_streams:
+            key = camera_feature_key(stream)
+            if feature_keys is not None and f"observation.images.{key}" not in feature_keys:
+                continue
             stream_sample = sample["streams"].get(stream)
             observation_id = stream_sample.get("observation_id") if stream_sample else None
-            key = camera_feature_key(stream)
             location = self._video_index.locate(
                 camera_key=key, episode_id=episode.episode_id, observation_id=observation_id
             )

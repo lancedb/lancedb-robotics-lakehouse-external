@@ -21,6 +21,7 @@ imported at all against this repo's default ``lerobot>=0.4.0`` pin:
 import io
 import json
 import warnings
+from datetime import UTC, datetime
 
 import numpy as np
 import pytest
@@ -235,6 +236,408 @@ def test_reader_core_pipeline_respects_episode_filter(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# delta_timestamps windowing (backlog 0509) -- plan_windows is pure numpy;
+# hydrate_windowed_items runs against the real fixture lake, no lerobot needed
+# ---------------------------------------------------------------------------
+
+# The fixture's episode layout: two episodes of three 20 Hz ticks each.
+_EP_FROM = np.array([0, 3])
+_EP_TO = np.array([3, 6])
+
+
+def test_plan_windows_clamps_to_episode_bounds_and_pads():
+    # Forward window overrunning episode 0's end: clamp to the last frame,
+    # pad exactly the overrun positions (upstream _plan_batch's formulas).
+    plans = core.plan_windows([1], {"action": [0, 1, 2]}, _EP_FROM, _EP_TO)
+    assert plans[0].abs_idx == 1
+    assert plans[0].windows["action"] == [1, 2, 2]
+    assert plans[0].padding["action_is_pad"] == [False, False, True]
+
+    # Backward window underrunning episode 1's start (frame 3 is ep-1's
+    # first): clamps to 3, never bleeds into episode 0's frames.
+    plans = core.plan_windows([3], {"observation.state": [-2, -1, 0]}, _EP_FROM, _EP_TO)
+    assert plans[0].windows["observation.state"] == [3, 3, 3]
+    assert plans[0].padding["observation.state_is_pad"] == [True, True, False]
+
+
+def test_plan_windows_row_union_dedups_across_keys():
+    plans = core.plan_windows(
+        [4], {"action": [0, 1], "observation.state": [-1, 0]}, _EP_FROM, _EP_TO
+    )
+    assert plans[0].rows == frozenset({3, 4, 5})
+
+
+def test_validate_delta_keys_rejects_keys_the_mapping_cannot_serve():
+    mapping = CanonicalVectorMapping(state_streams=("/gps",), action_streams=())
+    core.validate_delta_keys(["observation.state"], mapping)  # served: no raise
+    with pytest.raises(ValueError, match="action"):
+        core.validate_delta_keys(["action"], mapping)
+    with pytest.raises(ValueError, match="next.reward"):
+        core.validate_delta_keys(["next.reward"], mapping)
+
+
+def _varying_two_episode_lake(path, *, camera_topics: tuple[str, ...] = ()):
+    """`_two_episode_lake`'s layout with per-tick distinct vector values.
+
+    The shared fixture's action is 9.0 at every tick, which cannot tell window
+    members apart; here every vector value encodes its tick's sequence number
+    so a stacked window asserts exactly which frames landed where. Each topic
+    in ``camera_topics`` (e.g. ``/cam``) joins the alignment as a vectorless
+    stream (observation ids ``<key>-<ts>``) for the stub-VideoIndex
+    camera-window tests.
+    """
+    import pyarrow as pa
+    from test_lerobot_facade import _RUN_ID, _episode_row, _observation
+
+    from lancedb_robotics.lake import Lake
+    from lancedb_robotics.schemas import EPISODES_SCHEMA, OBSERVATIONS_SCHEMA, RUNS_SCHEMA
+
+    lake = Lake.init(path)
+    lake.table("runs").add(
+        pa.Table.from_pylist(
+            [
+                {
+                    "run_id": _RUN_ID,
+                    "run_kind": "teleop",
+                    "source": "synthetic",
+                    "source_id": "src-facade",
+                    "raw_uri": "memory://facade",
+                    "robot_id": "robot-facade",
+                    "site_id": "lab-facade",
+                    "task_id": "fallback task",
+                    "start_time_ns": 0,
+                    "end_time_ns": 400_000_000,
+                    "duration_ns": 400_000_000,
+                    "software_version": "sw-1",
+                    "hardware_version": "hw-1",
+                    "calibration_version": "cal-1",
+                    "model_version": "",
+                    "metadata": [],
+                    "quality_flags": [],
+                    "transform_id": "tfm-source",
+                    "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                }
+            ],
+            schema=RUNS_SCHEMA,
+        )
+    )
+    lake.table("episodes").add(
+        pa.Table.from_pylist(
+            [
+                _episode_row("ep-0", 0, 0, 149_000_000, "pick"),
+                _episode_row("ep-1", 1, 199_000_000, 349_000_000, "place"),
+            ],
+            schema=EPISODES_SCHEMA,
+        )
+    )
+    rows = []
+    seq = 0
+    for episode_start in (0, 200_000_000):
+        for offset in (0, 50_000_000, 100_000_000):
+            ts = episode_start + offset
+            base = float(seq)
+            rows.append(
+                _observation(
+                    f"gps-{ts}", "/gps", ts, seq, state_vector=[base, base + 0.1, base + 0.2]
+                )
+            )
+            seq += 1
+            rows.append(
+                _observation(
+                    f"imu-{ts}",
+                    "/imu",
+                    ts,
+                    seq,
+                    state_vector=[base + 0.3, base + 0.4, base + 0.5, base + 0.6],
+                )
+            )
+            seq += 1
+            rows.append(_observation(f"action-{ts}", "/action", ts, seq, action_vector=[base]))
+            seq += 1
+            for topic in camera_topics:
+                rows.append(_observation(f"{topic.strip('/')}-{ts}", topic, ts, seq))
+                seq += 1
+    lake.table("observations").add(pa.Table.from_pylist(rows, schema=OBSERVATIONS_SCHEMA))
+
+    streams = ["/gps", "/imu", "/action", *camera_topics]
+    lake.align.create_view(
+        "facade_view",
+        run_id=_RUN_ID,
+        rate_hz=20.0,
+        streams=streams,
+        tolerance_ms=100.0,
+        interpolation={stream: "nearest" for stream in streams},
+    )
+    return lake
+
+
+class _StubVideoIndex:
+    """`VideoIndex` stand-in: real JPEG bytes, recorded locate/decode calls.
+
+    The GOP decode chain has its own conformance suite
+    (`test_lerobot_video_decode_conformance.py` and the realcorpus facade
+    test); what the windowing tests need from a video index is only its
+    contract -- `locate` and batch-deduped `decode_batch` -- plus call
+    recording, so decode *bounds* can be asserted, not just pixel values.
+    """
+
+    def __init__(self, locations: dict[str, tuple[str, int]]):
+        self._locations = locations
+        self.decode_requests: list[list[tuple[str, int]]] = []
+
+    def locate(self, *, camera_key, episode_id, observation_id):
+        del camera_key, episode_id
+        if not observation_id:
+            return None
+        return self._locations.get(observation_id)
+
+    def decode_batch(self, requests):
+        self.decode_requests.append(list(requests))
+        return {request: self.jpeg_for(request) for request in requests}
+
+    @staticmethod
+    def jpeg_for(request: tuple[str, int]) -> bytes:
+        encoding_id, frame_index = request
+        red = 200 if encoding_id.endswith("ep-1") else 50
+        return _jpeg_bytes((red, (frame_index * 60) % 256, 0))
+
+
+def _camera_facade(tmp_path, *, camera_topics: tuple[str, ...] = ("/cam",)):
+    lake = _varying_two_episode_lake(tmp_path / "robot.lance", camera_topics=camera_topics)
+    mapping = CanonicalVectorMapping(
+        state_streams=("/gps", "/imu"), action_streams=("/action",), camera_streams=camera_topics
+    )
+    facade = LiveLeRobotFacade(lake, name="facade_view", mapping=mapping)
+    locations = {}
+    for topic in camera_topics:
+        key = topic.strip("/")
+        for episode_start, episode_id in ((0, "ep-0"), (200_000_000, "ep-1")):
+            for frame_index, offset in enumerate((0, 50_000_000, 100_000_000)):
+                locations[f"{key}-{episode_start + offset}"] = (
+                    f"enc-{key}-{episode_id}",
+                    frame_index,
+                )
+    stub = _StubVideoIndex(locations)
+    facade._video_index = stub
+    return facade, stub
+
+
+def test_hydrate_windowed_items_stacks_vectors_with_boundary_padding(tmp_path):
+    require_torch_loader()
+
+    lake = _varying_two_episode_lake(tmp_path / "robot.lance")
+    mapping = CanonicalVectorMapping(state_streams=("/gps", "/imu"), action_streams=("/action",))
+    facade = LiveLeRobotFacade(lake, name="facade_view", mapping=mapping)
+    reference = [facade[i] for i in range(len(facade))]
+
+    plans = core.plan_windows(
+        [0, 2], {"action": [0, 1], "observation.state": [-1, 0]}, _EP_FROM, _EP_TO
+    )
+    items = core.hydrate_windowed_items(
+        facade, plans, abs_to_facade=None, return_uint8=False, image_transforms=None
+    )
+
+    import torch
+
+    # Frame 0: action window [0, 1] real, state window clamps [-1] -> frame 0.
+    assert items[0]["action"].shape == (2, 1)
+    assert items[0]["action"].dtype == torch.float32
+    assert items[0]["action"].tolist() == [reference[0]["action"], reference[1]["action"]]
+    assert items[0]["action_is_pad"].tolist() == [False, False]
+    assert items[0]["observation.state"].shape == (2, 7)
+    torch.testing.assert_close(
+        items[0]["observation.state"],
+        torch.tensor(
+            [reference[0]["observation.state"], reference[0]["observation.state"]],
+            dtype=torch.float32,
+        ),
+    )
+    assert items[0]["observation.state_is_pad"].tolist() == [True, False]
+
+    # Frame 2 is episode 0's last: the forward window repeats it, padded --
+    # and never bleeds into episode 1's frame 3.
+    assert items[1]["action"].tolist() == [reference[2]["action"], reference[2]["action"]]
+    assert items[1]["action_is_pad"].tolist() == [False, True]
+    torch.testing.assert_close(
+        items[1]["observation.state"],
+        torch.tensor(
+            [reference[1]["observation.state"], reference[2]["observation.state"]],
+            dtype=torch.float32,
+        ),
+    )
+    assert items[1]["observation.state_is_pad"].tolist() == [False, False]
+
+    # Base per-frame fields are untouched by windowing.
+    assert items[1]["episode_index"].item() == 0
+    assert items[1]["frame_index"].item() == 2
+    assert items[1]["task"] == "pick"
+
+
+def test_hydrate_windowed_items_reads_the_row_union_once(tmp_path):
+    require_torch_loader()
+
+    lake = _varying_two_episode_lake(tmp_path / "robot.lance")
+    mapping = CanonicalVectorMapping(state_streams=("/gps", "/imu"), action_streams=("/action",))
+    facade = LiveLeRobotFacade(lake, name="facade_view", mapping=mapping)
+
+    hydrate_calls: list[int] = []
+    original_hydrate = facade.hydrate_batch
+
+    def _spying_hydrate(indices, **kwargs):
+        hydrate_calls.append(len(list(indices)))
+        return original_hydrate(indices, **kwargs)
+
+    facade.hydrate_batch = _spying_hydrate
+
+    # Three overlapping k=2 windows over frames 0..2 stay inside episode 0
+    # (frame 2's forward member clamps onto itself), touching rows {0, 1, 2}:
+    # one hydrate call for the deduplicated union -- 3 rows, not 3 * 2 = 6.
+    plans = core.plan_windows([0, 1, 2], {"action": [0, 1]}, _EP_FROM, _EP_TO)
+    items = core.hydrate_windowed_items(
+        facade, plans, abs_to_facade=None, return_uint8=False, image_transforms=None
+    )
+    assert len(items) == 3
+    assert hydrate_calls == [3]
+
+
+def test_windowed_camera_stacks_frames_with_one_gop_batched_decode(tmp_path, monkeypatch):
+    require_torch_loader()
+
+    facade, stub = _camera_facade(tmp_path)
+
+    # Pin the per-(frame, camera) JPEG-decode cache: dropping it would leave
+    # every value and decode_batch assertion green while multiplying CPU
+    # decode by the window-overlap factor (SKILLS.md: pin every guardrail).
+    real_decode = core.decode_image_bytes
+    decode_calls: list[bytes] = []
+
+    def _counting_decode(data, **kwargs):
+        decode_calls.append(data)
+        return real_decode(data, **kwargs)
+
+    monkeypatch.setattr(core, "decode_image_bytes", _counting_decode)
+
+    plans = core.plan_windows([0, 1], {"observation.images.cam": [-1, 0]}, _EP_FROM, _EP_TO)
+    items = core.hydrate_windowed_items(
+        facade, plans, abs_to_facade=None, return_uint8=False, image_transforms=None
+    )
+
+    import torch
+
+    key = "observation.images.cam"
+    # Frame 0's backward window clamps [-1] onto frame 0 itself: two stacked
+    # copies of frame 0's pixels, first position padded.
+    assert items[0][key].shape[0] == 2  # (k, C, H, W)
+    frame0 = real_decode(
+        stub.jpeg_for(("enc-cam-ep-0", 0)), return_uint8=False, image_transforms=None
+    )
+    frame1 = real_decode(
+        stub.jpeg_for(("enc-cam-ep-0", 1)), return_uint8=False, image_transforms=None
+    )
+    torch.testing.assert_close(items[0][key][0], frame0)
+    torch.testing.assert_close(items[0][key][1], frame0)
+    assert items[0][f"{key}_is_pad"].tolist() == [True, False]
+    torch.testing.assert_close(items[1][key][0], frame0)
+    torch.testing.assert_close(items[1][key][1], frame1)
+    assert items[1][f"{key}_is_pad"].tolist() == [False, False]
+
+    # One decode_batch call for the whole batch, over the deduplicated
+    # window-row union: frames {0, 1}, not 2 samples * k=2 = 4 requests.
+    assert stub.decode_requests == [[("enc-cam-ep-0", 0), ("enc-cam-ep-0", 1)]]
+    # And exactly one PIL decode per distinct (frame, camera) despite the
+    # windows overlapping across both samples.
+    assert len(decode_calls) == 2
+
+
+def test_single_delta_camera_window_squeezes_like_upstream(tmp_path):
+    require_torch_loader()
+
+    facade, stub = _camera_facade(tmp_path)
+    plans = core.plan_windows([1], {"observation.images.cam": [0]}, _EP_FROM, _EP_TO)
+    items = core.hydrate_windowed_items(
+        facade, plans, abs_to_facade=None, return_uint8=False, image_transforms=None
+    )
+    # Upstream squeezes a k=1 video window to (C, H, W); tabular k=1 windows
+    # keep their leading dim (both per LanceDatasetReader._build_item).
+    assert items[0]["observation.images.cam"].dim() == 3
+    assert items[0]["observation.images.cam_is_pad"].tolist() == [False]
+
+
+def test_action_window_never_multiplies_camera_decode(tmp_path):
+    require_torch_loader()
+
+    facade, stub = _camera_facade(tmp_path)
+    # k=3 action window from frame 0 hydrates rows {0, 1, 2}, but the camera
+    # is not windowed: exactly one decoded frame -- the base frame -- not 3.
+    plans = core.plan_windows([0], {"action": [0, 1, 2]}, _EP_FROM, _EP_TO)
+    items = core.hydrate_windowed_items(
+        facade, plans, abs_to_facade=None, return_uint8=False, image_transforms=None
+    )
+    assert stub.decode_requests == [[("enc-cam-ep-0", 0)]]
+    assert items[0]["observation.images.cam"].dim() == 3  # plain per-frame tensor
+    assert items[0]["action"].shape == (3, 1)
+
+
+def test_mixed_windowed_and_plain_cameras_partition_decode(tmp_path):
+    require_torch_loader()
+
+    # Camera A windowed, camera B not: A decodes at exactly its window-row
+    # union, B at exactly the base frames -- the set arithmetic behind
+    # base_camera_keys / camera_keys_per_frame, pinned with two cameras so a
+    # regression to decode-everything-everywhere cannot hide in a
+    # single-camera fixture.
+    facade, stub = _camera_facade(tmp_path, camera_topics=("/cam", "/cam2"))
+    plans = core.plan_windows([1], {"observation.images.cam": [-1, 0]}, _EP_FROM, _EP_TO)
+    items = core.hydrate_windowed_items(
+        facade, plans, abs_to_facade=None, return_uint8=False, image_transforms=None
+    )
+
+    assert len(stub.decode_requests) == 1
+    assert sorted(stub.decode_requests[0]) == [
+        ("enc-cam-ep-0", 0),  # windowed camera, window row 0
+        ("enc-cam-ep-0", 1),  # windowed camera, window row 1 (base)
+        ("enc-cam2-ep-0", 1),  # plain camera, base frame only
+    ]
+    assert items[0]["observation.images.cam"].dim() == 4  # (k, C, H, W)
+    assert items[0]["observation.images.cam2"].dim() == 3  # (C, H, W)
+
+
+def test_windowed_camera_missing_frame_fails_loudly(tmp_path):
+    require_torch_loader()
+
+    facade, stub = _camera_facade(tmp_path)
+    del stub._locations["cam-50000000"]  # frame 1's camera never encoded
+    plans = core.plan_windows([0], {"observation.images.cam": [0, 1]}, _EP_FROM, _EP_TO)
+    with pytest.raises(core.WindowHydrationError, match="observation.images.cam"):
+        core.hydrate_windowed_items(
+            facade, plans, abs_to_facade=None, return_uint8=False, image_transforms=None
+        )
+
+
+def test_hydrate_windowed_items_respects_episode_filter_remapping(tmp_path):
+    require_torch_loader()
+
+    lake = _varying_two_episode_lake(tmp_path / "robot.lance")
+    mapping = CanonicalVectorMapping(state_streams=("/gps", "/imu"), action_streams=("/action",))
+    root = tmp_path / "manifest"
+    _write_manifest(lake, root, repo_id="r", fps=20, mapping=mapping, name="facade_view")
+
+    manifest = core.load_source_manifest(root)
+    # Episode filter [1]: the facade serves only episode 1's three frames, so
+    # absolute window rows (3..5) must remap through absolute_to_relative_idx.
+    facade = core.open_facade(manifest, episodes=[1])
+    unfiltered = core.open_facade(manifest, episodes=None)
+    _, abs_to_rel = core.episode_frame_bounds(_EP_FROM, _EP_TO, [1])
+
+    plans = core.plan_windows([5], {"action": [0, 1]}, _EP_FROM, _EP_TO)
+    items = core.hydrate_windowed_items(
+        facade, plans, abs_to_facade=abs_to_rel, return_uint8=False, image_transforms=None
+    )
+    assert items[0]["action"].tolist() == [unfiltered[5]["action"], unfiltered[5]["action"]]
+    assert items[0]["action_is_pad"].tolist() == [False, True]
+
+
+# ---------------------------------------------------------------------------
 # Real upstream lerobot integration (gated -- see require_lerobot_main_dev)
 # ---------------------------------------------------------------------------
 
@@ -274,9 +677,36 @@ def test_registered_reader_opens_as_real_lerobot_dataset(tmp_path):
     restored = pickle.loads(pickle.dumps(dataset.reader))
     assert restored.get_item(0)["task"] == reference[0]["task"]
 
-    with pytest.raises(NotImplementedError):
+    # delta_timestamps through the real LeRobotDataset stack (backlog 0509):
+    # fps=20, so [0.0, 0.05] is frame deltas [0, 1] and [-0.05, 0.0] is
+    # [-1, 0]; masks/values follow upstream's episode-boundary padding.
+    windowed = LeRobotDataset(
+        "lancedb-robotics/facade-test",
+        root=root,
+        delta_timestamps={"action": [0.0, 0.05], "observation.state": [-0.05, 0.0]},
+    )
+    import torch
+
+    first = windowed[0]
+    assert first["action"].shape == (2, 1)
+    assert first["observation.state"].shape == (2, 7)
+    torch.testing.assert_close(
+        first["action"],
+        torch.tensor([reference[0]["action"], reference[1]["action"]], dtype=torch.float32),
+    )
+    assert first["action_is_pad"].tolist() == [False, False]
+    assert first["observation.state_is_pad"].tolist() == [True, False]
+    episode_end = windowed[2]  # episode 0's last frame
+    torch.testing.assert_close(
+        episode_end["action"],
+        torch.tensor([reference[2]["action"], reference[2]["action"]], dtype=torch.float32),
+    )
+    assert episode_end["action_is_pad"].tolist() == [False, True]
+
+    # A key the view cannot serve fails at construction, not mid-training.
+    with pytest.raises(ValueError, match="next.reward"):
         LeRobotDataset(
-            "lancedb-robotics/facade-test", root=root, delta_timestamps={"observation.state": [0.0]}
+            "lancedb-robotics/facade-test", root=root, delta_timestamps={"next.reward": [0.0]}
         )
 
 
@@ -453,3 +883,91 @@ def test_real_policy_builds_normalization_buffers_and_forward_passes(tmp_path, m
 
     loss, _ = policy.forward(batch)
     assert torch.isfinite(loss)
+
+
+@pytest.mark.lerobot_main_dev
+def test_act_chunking_trains_a_step_via_delta_timestamps(tmp_path, monkeypatch):
+    """0509 acceptance: a real ACT policy with a nonzero action horizon trains
+    one optimizer step against a published view, with the action chunk and its
+    ``action_is_pad`` mask produced by the reader's ``delta_timestamps``
+    windowing -- not hand-assembled by the test (contrast the 0490 test
+    above, written when the reader still raised ``NotImplementedError``)."""
+    require_lerobot_main_dev()
+    require_torch_loader()
+
+    import torch
+    from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.act.modeling_act import ACTPolicy
+    from lerobot.processor.normalize_processor import NormalizerProcessorStep
+
+    import lancedb_robotics.lerobot_facade.dataset_reader  # noqa: F401
+    from lancedb_robotics.lerobot_facade import publish_view
+
+    monkeypatch.setenv("LANCEDB_ROBOTICS_VIEW_CACHE", str(tmp_path / "view-cache"))
+    lake_path = tmp_path / "robot.lance"
+    lake = _two_episode_lake(lake_path)
+    mapping = CanonicalVectorMapping(state_streams=("/gps", "/imu"), action_streams=("/action",))
+    publish_view(lake, repo_id="acme/pick-place-v1", fps=20, mapping=mapping, name="facade_view")
+
+    chunk = 2
+    fps = 20
+    dataset = LeRobotDataset(
+        "acme/pick-place-v1",
+        root=f"file://{lake_path}",
+        delta_timestamps={"action": [i / fps for i in range(chunk)]},
+    )
+
+    # The reader assembles the horizon: (chunk, action_dim) plus the pad mask,
+    # padded exactly at each episode's tail frame.
+    item = dataset[0]
+    assert item["action"].shape == (chunk, 1)
+    assert item["action_is_pad"].tolist() == [False, False]
+    assert dataset[2]["action_is_pad"].tolist() == [False, True]
+
+    config = ACTConfig(
+        input_features={
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+            "observation.environment_state": PolicyFeature(type=FeatureType.ENV, shape=(7,)),
+        },
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(1,))},
+        normalization_mapping={
+            FeatureType.STATE: NormalizationMode.MEAN_STD,
+            FeatureType.ACTION: NormalizationMode.MEAN_STD,
+        },
+        chunk_size=chunk,
+        n_action_steps=1,
+        dim_model=32,
+        n_heads=2,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        use_vae=False,
+    )
+    policy = ACTPolicy(config)
+    normalizer = NormalizerProcessorStep(
+        features={**config.input_features, **config.output_features},
+        norm_map=config.normalization_mapping,
+        stats=dataset.meta.stats,
+    )
+
+    from lerobot.lerobot_types import TransitionKey
+
+    items = [dataset[i] for i in (0, 3)]  # one sample per episode
+    batch = {
+        "observation.state": torch.stack([item["observation.state"] for item in items]),
+        "action": torch.stack([item["action"] for item in items]),
+        "action_is_pad": torch.stack([item["action_is_pad"] for item in items]),
+    }
+    normalized_observation = normalizer(
+        {TransitionKey.OBSERVATION: {"observation.state": batch["observation.state"]}}
+    )[TransitionKey.OBSERVATION]
+    batch["observation.state"] = normalized_observation["observation.state"]
+    batch["observation.environment_state"] = batch["observation.state"]
+
+    optimizer = torch.optim.SGD(policy.parameters(), lr=1e-3)
+    loss, _ = policy.forward(batch)
+    assert torch.isfinite(loss)
+    loss.backward()
+    optimizer.step()  # a real optimizer step, not just a forward pass

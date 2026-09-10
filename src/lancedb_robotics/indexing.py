@@ -277,11 +277,19 @@ CURATION_MATERIALIZATION_FILE_PREDICATE_INDEX_COLUMNS = (
 LEROBOT_VIEW_PREDICATE_INDEX_COLUMNS = (
     ("repo_id", "BTREE"),
     ("view_id", "BTREE"),
+    # Keyset paging (list_view_pages) pushes `created_at < timestamp '...'`
+    # plus a descending sort into Lance on every page; BTREE keeps that
+    # range-friendly (backlog 0507).
+    ("created_at", "BTREE"),
 )
 
 LEROBOT_VIEW_FILE_PREDICATE_INDEX_COLUMNS = (
     ("view_id", "BTREE"),
     ("file_id", "BTREE"),
+)
+
+LEROBOT_VIEW_LATEST_PREDICATE_INDEX_COLUMNS = (
+    ("repo_id", "BTREE"),
 )
 
 CURATION_ROW_PLAN_PREDICATE_INDEX_COLUMNS = (
@@ -844,6 +852,7 @@ PREDICATE_INDEX_COLUMNS_BY_TABLE: dict[str, tuple[tuple[str, str], ...]] = {
     "curation_row_plan_chunks": CURATION_ROW_PLAN_CHUNK_PREDICATE_INDEX_COLUMNS,
     "lerobot_views": LEROBOT_VIEW_PREDICATE_INDEX_COLUMNS,
     "lerobot_view_files": LEROBOT_VIEW_FILE_PREDICATE_INDEX_COLUMNS,
+    "lerobot_view_latest": LEROBOT_VIEW_LATEST_PREDICATE_INDEX_COLUMNS,
 }
 
 

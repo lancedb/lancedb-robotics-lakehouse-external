@@ -25,10 +25,14 @@ the thin wiring that satisfies the real ``BaseDatasetReader`` ABC, verified
 against real upstream code by the ``lerobot_main_dev``-marked integration
 test.
 
-``delta_timestamps`` is out of scope for v1 (``LiveLeRobotFacade`` implements
-no windowing today) and raises ``NotImplementedError`` explicitly, matching
-``LanceDatasetReader``'s own precedent of rejecting out-of-scope features
-(e.g. its ``image_keys`` check) rather than silently ignoring them.
+``delta_timestamps`` (backlog 0509) reuses upstream's own validation and
+seconds-to-frames conversion (``check_delta_timestamps``/``get_delta_indices``
+from ``lerobot.datasets.feature_utils``, exactly as ``LanceDatasetReader``
+does), then hands integer frame deltas to ``_reader_core.plan_windows``/
+``hydrate_windowed_items`` — clamping, ``<key>_is_pad`` masks, and stacked
+window shapes all mirror upstream ``LanceDatasetReader._plan_batch``. The one
+deliberate deviation: a delta key the view's mapping cannot serve raises
+``ValueError`` at construction instead of upstream's silent mask-only items.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ from pathlib import Path
 
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.dataset_reader import BaseDatasetReader
+from lerobot.datasets.feature_utils import check_delta_timestamps, get_delta_indices
 from lerobot.datasets.storage import register_dataset_reader
 
 from . import _reader_core
@@ -67,14 +72,11 @@ class LancedbRoboticsDatasetReader(BaseDatasetReader):
         depth_output_unit: str = "mm",
         token: str | bool | None = None,
     ) -> None:
-        if delta_timestamps is not None:
-            raise NotImplementedError(
-                f"delta_timestamps windowing is not supported by storage_format="
-                f"{STORAGE_FORMAT!r} yet; open without delta_timestamps. "
-                "LiveLeRobotFacade implements no windowing today -- this is "
-                "tracked as a follow-on, not a v1 gap in this reader."
-            )
         self.meta = meta
+        self.delta_indices: dict[str, list[int]] | None = None
+        if delta_timestamps is not None:
+            check_delta_timestamps(delta_timestamps, meta.fps, tolerance_s)
+            self.delta_indices = get_delta_indices(delta_timestamps, meta.fps)
         self.return_uint8 = return_uint8
         self.set_image_transforms(image_transforms)
 
@@ -92,6 +94,8 @@ class LancedbRoboticsDatasetReader(BaseDatasetReader):
         ):
             root_path = Path(root)
         self._manifest = _reader_core.load_source_manifest(root_path)
+        if self.delta_indices is not None:
+            _reader_core.validate_delta_keys(list(self.delta_indices), self._manifest.mapping)
         self.episodes: list[int] | None = sorted(episodes) if episodes is not None else None
         self._facade = None
 
@@ -101,6 +105,7 @@ class LancedbRoboticsDatasetReader(BaseDatasetReader):
         # a manifest whose episode ranges don't tile [0, total_frames) would
         # make EpisodeAwareSampler silently index the wrong frames.
         _reader_core.validate_episode_tiling(ep_from, ep_to, int(meta.total_frames))
+        self._ep_from, self._ep_to = ep_from, ep_to
         self._rel_to_abs, self._absolute_to_relative_idx = _reader_core.episode_frame_bounds(
             ep_from, ep_to, self.episodes
         )
@@ -132,6 +137,8 @@ class LancedbRoboticsDatasetReader(BaseDatasetReader):
         return self._absolute_to_relative_idx
 
     def get_item(self, idx: int) -> dict:
+        if self.delta_indices is not None:
+            return self._get_windowed_items([idx])[0]
         return _reader_core.facade_item_to_lerobot_item(
             self._ensure_facade()[idx],
             return_uint8=self.return_uint8,
@@ -139,6 +146,8 @@ class LancedbRoboticsDatasetReader(BaseDatasetReader):
         )
 
     def get_items(self, indices: list[int]) -> list[dict]:
+        if self.delta_indices is not None:
+            return self._get_windowed_items(list(indices))
         facade = self._ensure_facade()
         return [
             _reader_core.facade_item_to_lerobot_item(
@@ -146,6 +155,35 @@ class LancedbRoboticsDatasetReader(BaseDatasetReader):
             )
             for item in facade.__getitems__(list(indices))
         ]
+
+    def _get_windowed_items(self, indices: list[int]) -> list[dict]:
+        facade = self._ensure_facade()
+        assert self.delta_indices is not None
+        plans = _reader_core.plan_windows(
+            [self._resolve_abs_idx(idx) for idx in indices],
+            self.delta_indices,
+            self._ep_from,
+            self._ep_to,
+        )
+        return _reader_core.hydrate_windowed_items(
+            facade,
+            plans,
+            abs_to_facade=self._absolute_to_relative_idx,
+            return_uint8=self.return_uint8,
+            image_transforms=self._image_transforms,
+        )
+
+    def _resolve_abs_idx(self, idx: int) -> int:
+        # Mirrors upstream LanceDatasetReader._resolve_abs_idx: lerobot hands
+        # this reader *relative* indices (positions within the episode filter).
+        idx = int(idx)
+        if idx < 0:
+            idx += self._num_frames
+        if not 0 <= idx < self._num_frames:
+            raise IndexError(
+                f"Index {idx} is out of range for a dataset of {self._num_frames} frames."
+            )
+        return int(self._rel_to_abs[idx]) if self._rel_to_abs is not None else idx
 
     # ── Lazy facade (picklable: never carries a live connection) ──────
 

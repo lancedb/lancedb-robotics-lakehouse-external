@@ -1293,6 +1293,26 @@ LEROBOT_VIEW_FILES_SCHEMA = _schema(
     ],
 )
 
+LEROBOT_VIEW_LATEST_SCHEMA = _schema(
+    "lerobot_view_latest",
+    "1",
+    [
+        # Client-facing dataset name -- the single-column merge_insert upsert
+        # key. One pointer row per repo_id resolves `get_view(repo_id=...)` (the
+        # default LeRobotDataset(root=<lake>) open path) with a point read
+        # instead of a catalog scan (backlog 0507).
+        pa.field("repo_id", pa.string()),
+        # The newest published view for this repo_id. Publish maintains it with
+        # a newest-wins conditional upsert on `view_created_at`, so a
+        # late-arriving older publish never regresses the pointer.
+        pa.field("view_id", pa.string()),
+        # The pointed-at view's own created_at (the newest-wins comparison
+        # key) -- distinct from this pointer row's write stamp below.
+        pa.field("view_created_at", pa.timestamp("us", tz="UTC")),
+        _CREATED_AT,
+    ],
+)
+
 LINEAGE_ARTIFACTS_SCHEMA = _schema(
     "lineage_artifacts",
     "1",
@@ -1782,6 +1802,7 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
     "lerobot_checkpoint_holds": LEROBOT_CHECKPOINT_HOLDS_SCHEMA,
     "lerobot_views": LEROBOT_VIEWS_SCHEMA,
     "lerobot_view_files": LEROBOT_VIEW_FILES_SCHEMA,
+    "lerobot_view_latest": LEROBOT_VIEW_LATEST_SCHEMA,
     "lineage_artifacts": LINEAGE_ARTIFACTS_SCHEMA,
     "lineage_executions": LINEAGE_EXECUTIONS_SCHEMA,
     "lineage_edges": LINEAGE_EDGES_SCHEMA,

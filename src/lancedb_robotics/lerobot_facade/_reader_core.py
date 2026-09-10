@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +30,11 @@ from lancedb_robotics.lake import Lake
 
 from .mapping import CanonicalVectorMapping
 from .reader import LiveLeRobotFacade
+from .videos import camera_feature_key
 
 STORAGE_FORMAT = "lancedb_robotics"
 SOURCE_MANIFEST_FILENAME = "lancedb_robotics_source.json"
+CAMERA_FEATURE_PREFIX = "observation.images."
 
 
 class ManifestDriftError(Exception):
@@ -299,6 +302,206 @@ def localize_root(
         raise FileNotFoundError(
             f"cannot resolve a published view for {repo_id!r} at {root_str}: {exc}"
         ) from exc
+
+
+class WindowHydrationError(Exception):
+    """A delta-timestamps window member could not be hydrated.
+
+    Raised when a windowed feature is absent on one of its window's frames —
+    a vector the mapping composes to ``None`` (possible only under
+    ``require_streams=False``/subset configurations) or a camera frame with no
+    aligned observation or encoded video. Windows stack ``k`` values into one
+    tensor, so unlike the per-frame path there is no "omit the key for this
+    item" fallback; a hole must fail loudly, never pad silently with data that
+    was never recorded.
+    """
+
+
+@dataclass(frozen=True)
+class WindowPlan:
+    """One sample's resolved delta-timestamps windows, in absolute frame space.
+
+    Mirrors upstream ``LanceDatasetReader._plan_batch`` (``lerobot/datasets/
+    lance_backend.py``) exactly: each window member is ``abs_idx + delta``
+    clamped to the episode's ``[start, end - 1]``, and the matching
+    ``<key>_is_pad`` flag is true iff the unclamped position falls outside
+    ``[start, end)`` — upstream's episode-boundary padding semantics, which
+    the gated parity test verifies against the real reader, not docs.
+    """
+
+    abs_idx: int
+    windows: dict[str, list[int]]
+    padding: dict[str, list[bool]]
+    rows: frozenset[int]
+
+
+def plan_windows(
+    abs_indices: Sequence[int],
+    delta_indices: dict[str, list[int]],
+    dataset_from_index: np.ndarray,
+    dataset_to_index: np.ndarray,
+) -> list[WindowPlan]:
+    """Resolve each absolute frame index to its per-key windows and pad masks.
+
+    ``delta_indices`` maps feature keys to *integer frame* deltas (upstream's
+    ``get_delta_indices(delta_timestamps, fps)`` output). Episode membership
+    comes from ``searchsorted`` over the episode start index, exactly like
+    upstream ``_episode_index_for_abs_idx`` — valid because
+    ``validate_episode_tiling`` has already guaranteed the ranges tile
+    ``[0, total_frames)``.
+    """
+    total_frames = int(dataset_to_index[-1]) if len(dataset_to_index) else 0
+    plans: list[WindowPlan] = []
+    for abs_index in abs_indices:
+        abs_idx = int(abs_index)
+        if not 0 <= abs_idx < total_frames:
+            # Callers normalize first (LancedbRoboticsDatasetReader._resolve_abs_idx);
+            # without this guard a negative searchsorted result would silently
+            # wrap to the *last* episode's bounds instead of failing.
+            raise IndexError(
+                f"absolute frame index {abs_idx} is outside [0, {total_frames})"
+            )
+        episode = int(np.searchsorted(dataset_from_index, abs_idx, side="right") - 1)
+        start = int(dataset_from_index[episode])
+        end = int(dataset_to_index[episode])
+        windows: dict[str, list[int]] = {}
+        padding: dict[str, list[bool]] = {}
+        rows: set[int] = {abs_idx}
+        for key, deltas in delta_indices.items():
+            window = [min(max(abs_idx + delta, start), end - 1) for delta in deltas]
+            windows[key] = window
+            rows.update(window)
+            padding[f"{key}_is_pad"] = [not (start <= abs_idx + delta < end) for delta in deltas]
+        plans.append(
+            WindowPlan(abs_idx=abs_idx, windows=windows, padding=padding, rows=frozenset(rows))
+        )
+    return plans
+
+
+def validate_delta_keys(delta_keys: Sequence[str], mapping: CanonicalVectorMapping) -> None:
+    """Reject delta-timestamps keys this manifest's mapping cannot serve.
+
+    Upstream readers silently emit only a ``<key>_is_pad`` mask for a key they
+    don't recognize; here an unknown key is a configuration error surfaced at
+    construction (typed error over silent degradation, SKILLS.md §1) — a
+    policy windowing a feature that will never appear should fail before
+    training starts, not produce mask-only items.
+    """
+    allowed = set()
+    if mapping.state_streams:
+        allowed.add("observation.state")
+    if mapping.action_streams:
+        allowed.add("action")
+    allowed.update(
+        f"{CAMERA_FEATURE_PREFIX}{camera_feature_key(stream)}" for stream in mapping.camera_streams
+    )
+    unknown = sorted(set(delta_keys) - allowed)
+    if unknown:
+        raise ValueError(
+            f"delta_timestamps keys {unknown} are not served by this view; "
+            f"this manifest's mapping declares {sorted(allowed)}"
+        )
+
+
+def hydrate_windowed_items(
+    facade: LiveLeRobotFacade,
+    plans: Sequence[WindowPlan],
+    *,
+    abs_to_facade: dict[int, int] | None,
+    return_uint8: bool,
+    image_transforms: Callable | None,
+) -> list[dict[str, Any]]:
+    """Assemble lerobot items with delta-timestamps windows for one batch.
+
+    Read amplification stays batch-shaped, not window-shaped (backlog 0509):
+    the union of every plan's rows is deduplicated and hydrated through one
+    :meth:`LiveLeRobotFacade.hydrate_batch` call (one batched tick read; one
+    GOP-batched camera decode), with camera decode requested only where the
+    assembled items need pixels — every non-windowed camera at base frames
+    only, each windowed camera at its own window rows only. Each distinct
+    ``(frame, camera)`` JPEG decodes once per batch even when windows overlap.
+
+    Output matches upstream ``LanceDatasetReader`` item shapes exactly: a
+    windowed vector key is a ``(k, dim)`` float32 tensor (``k == 1``
+    included), a windowed camera key stacks to ``(k, C, H, W)`` with ``k == 1``
+    squeezed to ``(C, H, W)`` (upstream's ``squeeze(0)``), and every windowed
+    key gains a ``<key>_is_pad`` bool tensor of length ``k``.
+    """
+    import torch
+
+    if not plans:
+        return []
+    delta_keys = set().union(*(plan.windows.keys() for plan in plans))
+    windowed_camera_keys = {key for key in delta_keys if key.startswith(CAMERA_FEATURE_PREFIX)}
+    windowed_vector_keys = delta_keys - windowed_camera_keys
+
+    union_abs = sorted({row for plan in plans for row in plan.rows})
+    facade_indices = (
+        list(union_abs) if abs_to_facade is None else [abs_to_facade[row] for row in union_abs]
+    )
+
+    all_camera_keys = {
+        f"{CAMERA_FEATURE_PREFIX}{camera_feature_key(stream)}"
+        for stream in facade.mapping.camera_streams
+    }
+    base_camera_keys = all_camera_keys - windowed_camera_keys
+    camera_keys_by_abs: dict[int, set[str]] = {row: set() for row in union_abs}
+    for plan in plans:
+        camera_keys_by_abs[plan.abs_idx] |= base_camera_keys
+        for key in windowed_camera_keys:
+            for row in plan.windows[key]:
+                camera_keys_by_abs[row].add(key)
+
+    items = facade.hydrate_batch(
+        facade_indices,
+        camera_keys_per_frame=[camera_keys_by_abs[row] for row in union_abs],
+    )
+    item_by_abs = dict(zip(union_abs, items, strict=True))
+
+    decoded_cache: dict[tuple[int, str], Any] = {}
+
+    def _window_value(row: int, key: str, plan: WindowPlan) -> Any:
+        value = item_by_abs[row].get(key)
+        if value is None:
+            raise WindowHydrationError(
+                f"delta_timestamps window for {key!r} needs frame {row} (window of "
+                f"frame {plan.abs_idx}), but the facade serves no value there — "
+                "an unaligned tick or a camera with no encoded video for that "
+                "episode. Publish the view with require_streams covering this "
+                "stream, or drop the key from delta_timestamps."
+            )
+        return value
+
+    def _decoded_frame(row: int, key: str, plan: WindowPlan) -> Any:
+        if (row, key) not in decoded_cache:
+            decoded_cache[(row, key)] = decode_image_bytes(
+                _window_value(row, key, plan),
+                return_uint8=return_uint8,
+                image_transforms=image_transforms,
+            )
+        return decoded_cache[(row, key)]
+
+    results: list[dict[str, Any]] = []
+    for plan in plans:
+        base = dict(item_by_abs[plan.abs_idx])
+        for key in windowed_camera_keys:
+            base.pop(key, None)  # stacked below via the shared decode cache
+        item = facade_item_to_lerobot_item(
+            base, return_uint8=return_uint8, image_transforms=image_transforms
+        )
+        for key in windowed_vector_keys:
+            item[key] = torch.tensor(
+                [_window_value(row, key, plan) for row in plan.windows[key]],
+                dtype=torch.float32,
+            )
+        for key in windowed_camera_keys:
+            frames = [_decoded_frame(row, key, plan) for row in plan.windows[key]]
+            stacked = torch.stack(frames)
+            item[key] = stacked.squeeze(0) if len(frames) == 1 else stacked
+        for key, mask in plan.padding.items():
+            item[key] = torch.tensor(mask, dtype=torch.bool)
+        results.append(item)
+    return results
 
 
 def decode_image_bytes(

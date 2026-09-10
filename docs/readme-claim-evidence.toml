@@ -148,6 +148,17 @@ evidence = [
 ]
 
 [[claim]]
+key = "Live LeRobot views over the lake"
+status = "shipped"
+evidence = [
+  "code:src/lancedb_robotics/lerobot_facade/views.py",
+  "code:src/lancedb_robotics/lerobot_facade/dataset_reader.py",
+  "test:tests/test_lerobot_view_publish.py",
+  "test:tests/test_lerobot_dataset_reader.py",
+  "doc:docs/manual/journeys/lerobot-published-views.md",
+]
+
+[[claim]]
 key = "Training & evaluation manifests"
 status = "shipped"
 evidence = [
