@@ -6,10 +6,17 @@ data, close the loop with model outputs and feedback, and operate the whole thin
 with lineage, evidence, and rebuild planning.
 
 This is the *learn-and-use* view. It is deliberately organized by **what you are
-trying to do**, not by the order features were built.
+trying to do**, not by the order features were built. If you are new here, the
+[tutorial](tutorials/train-from-the-lake.md) is the fastest way to get a
+working mental model: it goes from a raw log to a training batch in one
+sitting, offline.
 
 ## How this manual is organized
 
+- **Tutorials** — start here. One guided path, run start to finish against a
+  bundled fixture, teaching the shape of the system by building something
+  that works.
+  - [From a raw log to a training batch](tutorials/train-from-the-lake.md)
 - **Concepts** — the mental model you need before anything else: the lake and its
   canonical tables, the lineage graph, and the line between the open-source core
   and enterprise/plugin layers.
@@ -18,7 +25,8 @@ trying to do**, not by the order features were built.
   - [Storage and auth](concepts/storage-and-auth.md)
   - [OSS core vs. enterprise/plugin](concepts/oss-core-vs-enterprise.md)
   - [The training loader report contract](concepts/training-loader-report.md)
-- **Journeys** — end-to-end walkthroughs of a real task.
+- **Journeys** — end-to-end walkthroughs of a real task, for when you know
+  the system and need the reference treatment of one workflow.
   - [Bring a LeRobot dataset into the lake](journeys/lerobot-ingest.md)
   - [Bring an RLDS / TFDS dataset into the lake](journeys/rlds-ingest.md)
   - [The rebuild loop: invalidate → plan → approve → dispatch](journeys/rebuild-loop.md)
@@ -43,8 +51,10 @@ The `reference/*.generated.md` pages are produced by
 `scripts/gen_docs_reference.py` from the live Typer command tree, the `lake.*`
 namespace objects, and `TABLE_SCHEMAS`. `tests/test_docs_reference_current.py`
 fails the suite if they drift from the code, so the reference is always true to the
-shipped surface. The Concepts and Journeys chapters are hand-written and kept
-current manually as the code changes.
+shipped surface. The Tutorials, Concepts, and Journeys chapters are hand-written and
+kept current manually as the code changes, and held to
+`tests/test_manual_docs_verification.py` for links, command names, and nav
+coverage.
 
 To regenerate the reference after a code change:
 

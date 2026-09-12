@@ -3,9 +3,7 @@
 A lake is addressed by a URI, and the URI's scheme decides how it connects and how
 credentials resolve. This chapter covers the connection kinds and the one auth
 principle that runs through all of them. The step-by-step how-to lives in the
-Getting Started "connecting" chapter (forthcoming); the implemented resolver paths
-are documented in
-[enterprise remote & namespace paths](../../product/enterprise-remote-namespace-paths.md).
+Getting Started "connecting" chapter (forthcoming).
 
 ## The connection kinds
 

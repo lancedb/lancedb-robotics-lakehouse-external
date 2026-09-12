@@ -44,6 +44,7 @@ REGISTRY = ROOT / "docs" / "readme-claim-evidence.toml"
 REQUIRED_SECTION_PREFIXES = [
     "Who this is for",
     "Quickstart",
+    "Train from the lake",  # runnable ingest -> align -> publish -> batch path
     "What you get",         # feature-breadth status list
     "Adopt incrementally",
     "What stays external",  # a.k.a. "What Remains External"

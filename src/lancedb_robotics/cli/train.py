@@ -2318,3 +2318,95 @@ def view_materialize(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"materialized view {view['view_id']} at {path}")
+
+
+@view_app.command("retire")
+def view_retire(
+    view_id: str = typer.Argument(..., help="Exact view id to retire (lrv-...)."),
+    lake: str = _VIEW_LAKE_OPTION,
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Retire even the newest/pointer-target view (the pointer is re-pointed).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be deleted without writing."
+    ),
+    output_format: str = _VIEW_FORMAT_OPTION,
+) -> None:
+    """Retire one published view: delete its header, file rows, and pointer rows.
+
+    The current latest-pointer target / newest view per repo_id is refused
+    without --force. Idempotent: re-running after a crash converges, and an
+    unknown view id reports status "absent" rather than failing.
+    """
+    from lancedb_robotics.lerobot_facade import ProtectedViewError, ViewError, retire_view
+
+    opened = _open_lake_or_exit(lake)
+    try:
+        report = retire_view(opened, view_id, force=force, dry_run=dry_run)
+    except ProtectedViewError as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except ViewError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if output_format == "json":
+        _emit_json(report.to_params())
+        return
+    typer.echo(f"retire {report.view_id}: {report.status}")
+    typer.echo(
+        f"  header_rows={report.header_rows_deleted}  "
+        f"file_rows={report.file_rows_deleted}  "
+        f"pointer_rows={report.pointer_rows_deleted}  "
+        f"pointer={report.pointer_action}"
+    )
+    if report.detail:
+        typer.echo(f"  {report.detail}")
+
+
+@view_app.command("readiness")
+def view_readiness_report(
+    lake: str = _VIEW_LAKE_OPTION,
+    no_readability: bool = typer.Option(
+        False,
+        "--no-readability",
+        help="Skip per-pin checkout probes (classification by on-disk/tag state only).",
+    ),
+    output_format: str = _VIEW_FORMAT_OPTION,
+) -> None:
+    """Report whether every published view can still open at its pinned versions.
+
+    Classifies each view-pinned (table, version) as protected / unprotected /
+    pruned / unreadable, rolls that up per view, and states the backend's
+    pinned-open conformance (supported, capability-gated, or unavailable).
+    Also runs inside `lake maintain`.
+    """
+    from lancedb_robotics.lerobot_facade import ViewError, view_readiness
+
+    opened = _open_lake_or_exit(lake)
+    try:
+        report = view_readiness(opened, check_readability=not no_readability)
+    except ViewError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if output_format == "json":
+        _emit_json(report.to_dict())
+        return
+    backend = report.backend
+    typer.echo(f"view readiness: {report.status}  (backend: {backend.status})")
+    typer.echo(
+        f"  views: checked={report.views_checked}  ready={report.views_ready}  "
+        f"at_risk={report.views_at_risk}  unchecked={report.views_remaining}"
+    )
+    for pin in report.pins:
+        if pin.status == "protected":
+            continue
+        typer.echo(f"  {pin.table}@{pin.version}: {pin.status}  views={pin.view_count}")
+    for item in report.at_risk_views:
+        typer.echo(
+            f"  at-risk view {item['view_id']} (repo_id={item['repo_id']}): "
+            + ", ".join(item["at_risk_pins"])
+        )
+    for action in report.suggested_actions:
+        typer.echo(f"  action: {action}")

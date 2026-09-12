@@ -1,0 +1,2 @@
+{"run_id": "run-be4244bb87aeb236", "external_id": "teleop-take-1", "task_id": "pick the cube", "outcome": "success", "from_timestamp_ns": 1700000000000000000, "to_timestamp_ns": 1700000001950000000}
+{"run_id": "run-be4244bb87aeb236", "external_id": "teleop-take-2", "task_id": "pick the cube", "outcome": "success", "from_timestamp_ns": 1700000002000000000, "to_timestamp_ns": 1700000003950000000}

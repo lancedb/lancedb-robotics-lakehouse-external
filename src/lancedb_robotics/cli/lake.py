@@ -158,6 +158,36 @@ _LEROBOT_RETAIN_FAILED_OPTION = typer.Option(
     "--lerobot-retain-failed-per-source",
     help="Keep this many failed LeRobot job histories fully expanded per source.",
 )
+_PROTECT_LEROBOT_VIEWS_OPTION = typer.Option(
+    True,
+    "--protect-lerobot-views/--no-protect-lerobot-views",
+    help="Tag the table versions published LeRobot views pin before version cleanup.",
+)
+_LEROBOT_VIEW_RETENTION_OPTION = typer.Option(
+    True,
+    "--lerobot-view-retention/--no-lerobot-view-retention",
+    help="Report published-view retention candidates and reclaim orphaned view file rows.",
+)
+_LEROBOT_VIEW_RETENTION_APPLY_OPTION = typer.Option(
+    False,
+    "--apply-lerobot-view-retention",
+    help="Actually retire the reported published-view retention candidates (default: report only).",
+)
+_LEROBOT_VIEW_RETENTION_DAYS_OPTION = typer.Option(
+    90.0,
+    "--lerobot-view-retention-days",
+    help="Published views older than this many days are retention candidates; use -1 to ignore age.",
+)
+_LEROBOT_VIEW_RETAIN_LATEST_OPTION = typer.Option(
+    5,
+    "--lerobot-view-retain-latest-per-repo",
+    help="Never make the newest N published views per repo_id retention candidates (min 1).",
+)
+_LEROBOT_VIEW_READINESS_OPTION = typer.Option(
+    True,
+    "--lerobot-view-readiness/--no-lerobot-view-readiness",
+    help="Report whether published views can still open at their pinned table versions.",
+)
 
 
 @lake_app.command("init")
@@ -313,6 +343,12 @@ def maintain(
     lerobot_checkpoint_status: list[str] | None = _LEROBOT_CHECKPOINT_STATUS_OPTION,
     lerobot_retain_completed_per_source: int = _LEROBOT_RETAIN_COMPLETED_OPTION,
     lerobot_retain_failed_per_source: int = _LEROBOT_RETAIN_FAILED_OPTION,
+    protect_lerobot_views: bool = _PROTECT_LEROBOT_VIEWS_OPTION,
+    lerobot_view_retention: bool = _LEROBOT_VIEW_RETENTION_OPTION,
+    apply_lerobot_view_retention: bool = _LEROBOT_VIEW_RETENTION_APPLY_OPTION,
+    lerobot_view_retention_days: float = _LEROBOT_VIEW_RETENTION_DAYS_OPTION,
+    lerobot_view_retain_latest_per_repo: int = _LEROBOT_VIEW_RETAIN_LATEST_OPTION,
+    lerobot_view_readiness: bool = _LEROBOT_VIEW_READINESS_OPTION,
     auth_ref: str | None = _AUTH_REF_OPTION,
     remote_auth_ref: str | None = _REMOTE_AUTH_REF_OPTION,
     namespace_auth_ref: str | None = _NAMESPACE_AUTH_REF_OPTION,
@@ -388,6 +424,16 @@ def maintain(
             ),
             lerobot_checkpoint_retain_completed_per_source=lerobot_retain_completed_per_source,
             lerobot_checkpoint_retain_failed_per_source=lerobot_retain_failed_per_source,
+            protect_lerobot_views=protect_lerobot_views,
+            lerobot_view_retention=lerobot_view_retention,
+            lerobot_view_retention_apply=apply_lerobot_view_retention,
+            lerobot_view_retention_older_than=(
+                None
+                if lerobot_view_retention_days < 0
+                else timedelta(days=lerobot_view_retention_days)
+            ),
+            lerobot_view_retain_latest_per_repo=lerobot_view_retain_latest_per_repo,
+            lerobot_view_readiness=lerobot_view_readiness,
             request_predicate_index_jobs=request_predicate_index_jobs,
             apply_predicate_recommendations=apply_predicate_recommendations,
         )
@@ -420,6 +466,32 @@ def maintain(
                 f"{crr.get('status')} "
                 f"(backend {crr.get('backend', {}).get('status')}, "
                 f"{crr.get('snapshots_checked', 0)} snapshots, {at_risk} at-risk pins)"
+            )
+    if report.lerobot_view_retention:
+        lvr = report.lerobot_view_retention
+        if lvr.get("status") == "failed":
+            typer.echo(f"lerobot view retention: skipped ({lvr.get('reason')})")
+        else:
+            policy = lvr.get("policy") or {}
+            orphans = lvr.get("orphan_file_rows") or {}
+            typer.echo(
+                "lerobot view retention: "
+                f"{policy.get('status')} "
+                f"({policy.get('candidate_count', 0)} candidate(s), "
+                f"{len(policy.get('applied') or [])} retired, "
+                f"orphan file rows deleted {orphans.get('file_rows_deleted', 0)})"
+            )
+    if report.lerobot_view_readiness:
+        lvrd = report.lerobot_view_readiness
+        if lvrd.get("status") == "failed":
+            typer.echo(f"lerobot view readiness: skipped ({lvrd.get('reason')})")
+        else:
+            typer.echo(
+                "lerobot view readiness: "
+                f"{lvrd.get('status')} "
+                f"(backend {lvrd.get('backend', {}).get('status')}, "
+                f"{lvrd.get('views_checked', 0)} views, "
+                f"{lvrd.get('views_at_risk', 0)} at risk)"
             )
     if report.lerobot_checkpoint_retention:
         retention_report = report.lerobot_checkpoint_retention

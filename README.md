@@ -169,7 +169,8 @@ Lance. The raw log stays archival truth, not a runtime dependency.
 
 ## Quickstart
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). To go straight from a
+raw log to a training batch, skip to [Train from the lake](#train-from-the-lake).
 
 ```bash
 # Install the package + dev tooling into .venv
@@ -303,6 +304,93 @@ Object-store lakes work the same way — pass an `s3://` / `gs://` / `az://` /
 stay where they live (`runs.raw_uri`) while the lake materializes canonical rows,
 decoded columns, embeddings, and indexes. Credentials are resolved in-memory and
 never written to lake tables.
+
+## Train from the lake
+
+The vertical slice above ends at a snapshot. This is the other half: **one raw
+log becomes a training batch**, served two different ways from the same rows —
+this project's native torch loader, and first-party
+[LeRobot](https://github.com/huggingface/lerobot) tooling — with no export step
+between them.
+
+Five commands build the lake, against a bundled 9 KB fixture so it runs offline:
+
+```bash
+lancedb-robotics lake init --lake ./robot.lance
+lancedb-robotics ingest mcap tests/fixtures/teleop.mcap --lake ./robot.lance
+lancedb-robotics quality validate --lake ./robot.lance --profile tests/fixtures/teleop-profile.json
+lancedb-robotics episodes import-intervals --lake ./robot.lance --file tests/fixtures/teleop-episodes.jsonl
+lancedb-robotics align create teleop_20hz --lake ./robot.lance --rate-hz 20 --run-id run-be4244bb87aeb236 --stream /joint-positions --stream /gripper --stream /action
+```
+
+That is 240 raw observations from a 4-second teleoperation log, validated
+against a quality profile, cut into two labeled episodes, and reconciled into 80
+synchronized 20 Hz ticks. The run id is content-addressed — a digest of the
+log's bytes, not its path — so it is the same on every machine.
+
+**Ending A — a native torch DataLoader.** No new file layout, no shard
+directory:
+
+```python
+from lancedb_robotics import Lake
+
+dataset = Lake.open("./robot.lance").training.aligned_dataset(
+    "teleop_20hz",
+    streams=["/joint-positions", "/gripper", "/action"],
+    require_streams=True,
+    shuffle=True,
+    shuffle_seed=17,
+)
+loader = dataset.torch_dataloader(
+    batch_size=8, num_workers=2, adapter="iterable", multiprocessing_context="spawn"
+)
+```
+
+The seeded shuffle makes an epoch reproducible and resumable (`resume_from` is
+global, not per-worker). `multiprocessing_context="spawn"` is required, not
+decoration: Lance readers are not fork-safe.
+
+**Ending B — the same ticks as a real `LeRobotDataset`.** Publish a
+version-pinned view, then open it by `repo_id` against the lake itself:
+
+```bash
+lancedb-robotics train view publish --lake ./robot.lance \
+  --repo-id demo/teleop-v1 --fps 20 --name teleop_20hz \
+  --state-stream /joint-positions --state-stream /gripper \
+  --action-stream /action --robot-type so100
+```
+
+```python
+import lancedb_robotics.lerobot_facade.dataset_reader   # registers "lancedb_robotics"
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+dataset = LeRobotDataset(
+    "demo/teleop-v1",
+    root="file:///absolute/path/to/robot.lance",
+    delta_timestamps={"action": [i / 20 for i in range(8)]},   # ACT-style chunk
+)
+dataset[0]["action"].shape          # (8, 6) -- stacked window
+dataset[0]["action_is_pad"]         # bool (8,) -- True past the episode's end
+```
+
+Publishing pins every canonical table's version and derives LeRobot's `meta/`
+manifest — including the `stats.json` normalization statistics — so a dataset
+opened mid-training keeps serving exactly the frames it served at publish time,
+however far the live lake advances underneath.
+
+> **One caveat, stated plainly.** Ending B's *open* needs the registering
+> import above and the dev-only, commit-pinned `lerobot-main-dev` extra — in its
+> own venv, since it conflicts with the released `lerobot` extra — because no
+> PyPI lerobot release discovers the `lerobot.dataset_readers` entry-point group
+> yet
+> ([huggingface/lerobot#4576](https://github.com/huggingface/lerobot/pull/4576)).
+> Everything else here — ingest, validation, episodes, alignment, publish, and
+> all of Ending A — works on a released lerobot or with none installed.
+
+**[The full tutorial](docs/manual/tutorials/train-from-the-lake.md)** walks every
+step, explains what each table gained, adds Foxglove playback, and shows the
+same flow against a public Hugging Face dataset (`lerobot/pusht`) and against
+your own logs.
 
 ---
 

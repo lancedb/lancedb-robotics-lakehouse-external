@@ -88,6 +88,8 @@ class MaintenanceReport:
     curation_row_plan_chunks: dict[str, Any] | None = None
     curation_replay_retention: dict[str, Any] | None = None
     lerobot_view_catalog: dict[str, Any] | None = None
+    lerobot_view_retention: dict[str, Any] | None = None
+    lerobot_view_readiness: dict[str, Any] | None = None
 
 
 def _digest(payload: dict) -> str:
@@ -280,6 +282,13 @@ def maintain_lake(
     compact_curation_chunks: bool = True,
     curation_replay_retention: bool = True,
     lerobot_view_catalog_compaction: bool = True,
+    protect_lerobot_views: bool = True,
+    lerobot_view_pin_max_views: int | None = None,
+    lerobot_view_retention: bool = True,
+    lerobot_view_retention_apply: bool = False,
+    lerobot_view_retention_older_than: timedelta | None = None,
+    lerobot_view_retain_latest_per_repo: int | None = None,
+    lerobot_view_readiness: bool = True,
     created_by: str = "lancedb-robotics",
 ) -> MaintenanceReport:
     """Compact tables, refresh existing indexes, and prune old unpinned versions.
@@ -347,9 +356,33 @@ def maintain_lake(
         ).to_params()
     snapshot_pin_details = snapshot_retention_pin_details(lake)
     lineage_pin_details = lineage_retention_pin_details(lake) if protect_lineage else {}
+    # Versions pinned by non-retired published LeRobot views (backlog 0508) join
+    # the same tag-before-cleanup pin map as snapshots and lineage: pruning one
+    # would turn every open of the referencing view into StaleViewVersionError.
+    # NOT best-effort -- silently skipping these pins and then pruning is the
+    # exact data-loss shape the pin map exists to prevent, so a failure here
+    # fails maintenance loudly before any cleanup runs.
+    lerobot_view_pin_details: dict[str, dict[int, dict[str, Any]]] = {}
+    if protect_lerobot_views:
+        from lancedb_robotics.lerobot_facade.view_retention import (
+            view_retention_pin_details,
+        )
+
+        try:
+            if lerobot_view_pin_max_views is not None:
+                lerobot_view_pin_details = view_retention_pin_details(
+                    lake, max_views=lerobot_view_pin_max_views
+                )
+            else:
+                lerobot_view_pin_details = view_retention_pin_details(lake)
+        except Exception as exc:  # noqa: BLE001 - refuse to prune with unknown pins.
+            raise MaintenanceError(
+                f"cannot resolve published-view version pins: {exc}"
+            ) from exc
     retention_pin_details = merge_retention_pin_details(
         snapshot_pin_details,
         lineage_pin_details,
+        lerobot_view_pin_details,
     )
     table_reports: dict[str, TableMaintenanceReport] = {}
 
@@ -611,6 +644,57 @@ def maintain_lake(
         except Exception as exc:  # noqa: BLE001 - other failures are best-effort.
             lerobot_view_catalog_report = {"status": "failed", "reason": str(exc)}
 
+    # Published-view retention (backlog 0508). Report-only by default: the
+    # policy plan (age + retain-N-newest-per-repo candidates) is computed and
+    # reported every run, but deleting candidates requires the explicit
+    # `lerobot_view_retention_apply` opt-in -- published views are
+    # reproducibility contracts (0111 activation posture). Orphan file-row
+    # reconciliation (headerless rows a crashed publish/retire left) DOES apply:
+    # the rows are invisible to every reader, and the grace window keeps
+    # in-flight publishes safe. Best-effort: never fails maintenance.
+    lerobot_view_retention_report: dict[str, Any] | None = None
+    if lerobot_view_retention and "lerobot_views" in selected:
+        try:
+            from lancedb_robotics.lerobot_facade.view_retention import (
+                DEFAULT_RETAIN_LATEST_PER_REPO,
+                DEFAULT_VIEW_RETENTION_AGE,
+                apply_view_retention,
+                reconcile_orphan_view_files,
+            )
+
+            lerobot_view_retention_report = {
+                "policy": apply_view_retention(
+                    lake,
+                    older_than=(
+                        lerobot_view_retention_older_than
+                        if lerobot_view_retention_older_than is not None
+                        else DEFAULT_VIEW_RETENTION_AGE
+                    ),
+                    retain_latest_per_repo=(
+                        lerobot_view_retain_latest_per_repo
+                        if lerobot_view_retain_latest_per_repo is not None
+                        else DEFAULT_RETAIN_LATEST_PER_REPO
+                    ),
+                    dry_run=not lerobot_view_retention_apply,
+                ).to_params(),
+                "applied": bool(lerobot_view_retention_apply),
+                "orphan_file_rows": reconcile_orphan_view_files(lake).to_params(),
+            }
+        except Exception as exc:  # noqa: BLE001 - retention reporting is best-effort.
+            lerobot_view_retention_report = {"status": "failed", "reason": str(exc)}
+
+    # Published-view readiness (backlog 0508, 0143 shape). Runs AFTER the
+    # per-table loop above tagged every merged pin, so freshly-protected view
+    # pins report `protected` in the same run. Read-only and best-effort.
+    lerobot_view_readiness_report: dict[str, Any] | None = None
+    if lerobot_view_readiness and "lerobot_views" in selected:
+        try:
+            from lancedb_robotics.lerobot_facade.view_retention import view_readiness
+
+            lerobot_view_readiness_report = view_readiness(lake).to_dict()
+        except Exception as exc:  # noqa: BLE001 - readiness is best-effort.
+            lerobot_view_readiness_report = {"status": "failed", "reason": str(exc)}
+
     finished = datetime.now(UTC)
     transform_id = "tfm-maintenance-" + _digest(
         {
@@ -644,6 +728,8 @@ def maintain_lake(
         "curation_row_plan_chunks": curation_row_plan_chunks,
         "curation_replay_retention": curation_replay_retention_report,
         "lerobot_view_catalog": lerobot_view_catalog_report,
+        "lerobot_view_retention": lerobot_view_retention_report,
+        "lerobot_view_readiness": lerobot_view_readiness_report,
     }
     transform_row = {
         "transform_id": transform_id,
@@ -676,4 +762,6 @@ def maintain_lake(
         curation_row_plan_chunks=curation_row_plan_chunks,
         curation_replay_retention=curation_replay_retention_report,
         lerobot_view_catalog=lerobot_view_catalog_report,
+        lerobot_view_retention=lerobot_view_retention_report,
+        lerobot_view_readiness=lerobot_view_readiness_report,
     )

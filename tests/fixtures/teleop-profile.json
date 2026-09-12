@@ -1,0 +1,10 @@
+{
+  "name": "teleop",
+  "required_topics": [
+    { "topic": "/joint-positions", "min_count": 20 },
+    { "topic": "/action", "min_count": 20 }
+  ],
+  "decodable_topics": ["/joint-positions", "/gripper", "/action"],
+  "require_monotonic": true,
+  "require_overlap": true
+}

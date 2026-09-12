@@ -20,8 +20,7 @@ Two properties fall out of blob encoding:
 - **Late materialization.** Training fetches only the bytes it needs, by row id,
   at load time — not by pre-materializing a column into RAM.
 
-This is the foundational choice; the other three follow from it. See
-[decision 0024 — Lance is the index and fast-access layer](../../decisions/0024-lance-is-the-index-and-fast-access-layer.md).
+This is the foundational choice; the other three follow from it.
 
 ## 2. Denormalized, one wide table per grain — no joins
 
@@ -34,8 +33,7 @@ rows are reached by a point `take` by id, not a relational join.
 
 This is not a storage micro-optimization — it is the natural fit for Lance's
 columnar, random-access model and for the way training and curation actually query
-(filter the grain, then take the payloads). See
-[decision 0025 — denormalized, enrich-as-column data modeling](../../decisions/0025-denormalized-enrich-as-column-data-modeling.md).
+(filter the grain, then take the payloads).
 
 ## 3. Enrichment is additive, never an in-place rewrite
 
@@ -53,7 +51,6 @@ Why this matters to you as a user:
 - **A row is stable across versions.** An `observation_id` refers to the same
   logical sample no matter how many enrichment columns have been added since.
 
-See [decision 0026 — blob-safe additive write mechanism](../../decisions/0026-blob-safe-additive-write-mechanism.md).
 
 ## 4. Content-addressed, portable IDs
 
@@ -65,8 +62,7 @@ idempotent (no duplicate rows).
 
 The trade-off to know: switching an old, path-keyed lake to content-addressed IDs
 is a breaking migration (re-ingest into a fresh lake); you cannot mix the two ID
-schemes in one lake. See
-[decision 0023 — content-addressed portable run IDs](../../decisions/0023-content-addressed-portable-run-ids.md).
+schemes in one lake.
 
 ## How the four fit together
 

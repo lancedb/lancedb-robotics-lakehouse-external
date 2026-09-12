@@ -142,6 +142,17 @@ A pinned version that no longer exists (pruned by retention/compaction, or a
 backend without version checkout) raises `StaleViewVersionError` naming the
 table and the remedy: re-publish the view.
 
+That error should never arise from routine maintenance: `lake maintain` tags
+every table version pinned by a non-retired published view (the same managed
+pin tags that protect snapshot and lineage pins) before its version cleanup
+runs, so pruning skips them. `train view readiness` — also a `lake maintain`
+report section — classifies every view-pinned `(table, version)` as
+`protected` / `unprotected` / `pruned` / `unreadable`, rolls that up per view,
+and states the backend's pinned-open conformance (`supported` locally and on
+object stores; `capability-gated` on a `db://` remote without version
+checkout, where a pinned open is a typed error, never a silent latest-read;
+`unavailable` where a namespace manages versioning).
+
 ## 4. Train with temporal windows (`delta_timestamps`)
 
 Policies with horizons — ACT-style action chunking (`action[t..t+k]`),
@@ -187,6 +198,8 @@ lancedb-robotics train view list --lake ./robot.lance --page-size 100   # keyset
 lancedb-robotics train view materialize ./inspect-here --lake ./robot.lance \
   --repo-id acme/pick-place-v1
 lancedb-robotics train view compact-catalog --lake ./robot.lance --dry-run
+lancedb-robotics train view readiness --lake ./robot.lance
+lancedb-robotics train view retire lrv-0123456789abcdef --lake ./robot.lance --dry-run
 ```
 
 The plain listing is a bounded convenience surface: past 10k matching views it
@@ -210,11 +223,36 @@ between a publish's catalog write and its pointer update left stale.
 `view_id`, `file_id`) alongside every other managed predicate index. Old
 lakes gain the three catalog tables with one `lancedb-robotics lake init`.
 
+### End of life: retire and retention
+
+`train view retire <view_id>` deletes a view's header, file rows, and pointer
+rows. The view the `lerobot_view_latest` pointer targets — or the newest view
+for its `repo_id` — is refused with a typed error unless `--force`, because
+retiring it changes what every `LeRobotDataset(root=<lake>)` open resolves;
+with `--force` the pointer is re-pointed at the newest remaining view. Retire
+is idempotent: re-running after a crash converges, and once a view's header
+and pins are gone, `lake maintain`'s version cleanup is free to reclaim the
+table versions only that view was holding.
+
+A retention *policy* (age plus retain-N-newest-per-repo, defaults 90 days /
+5 views, the newest view per repo never eligible) is **report-only by
+default**: every `lake maintain` run reports the current candidates, and
+nothing is deleted until an operator passes
+`--apply-lerobot-view-retention` — published views are reproducibility
+contracts, so enforcement is a deliberate act, not a side effect.
+
+Publish writes file rows first and the header last (its crash-safety order),
+so a crashed publish leaves invisible headerless file rows; `lake maintain`
+reclaims them once they age past a grace window (24 h) that keeps in-flight
+publishes safe.
+
 **Audit note.** The view row carries the full definition JSON, the pinned
 version of every canonical table, totals, the camera-stats sampling
 parameters, `created_by`, and `created_at`; the file rows carry per-file
 sha256 and sizes. Materialization refuses hash mismatches outright.
 
-**What's next.** Enterprise `db://` version checkout is capability-gated and
-surfaces a typed error where unsupported; the registering import and the viz
-shim retire once upstream entry-point discovery ships (backlog 0510).
+**What's next.** Enterprise `db://` version checkout stays capability-gated —
+`view_pin_conformance` / `train view readiness` state the posture per backend
+and a pinned open is always a typed error or a working pin (never a silent
+latest-read); the registering import and the viz shim retire once upstream
+entry-point discovery ships (backlog 0510).

@@ -145,6 +145,8 @@ status = "shipped"
 evidence = [
   "code:src/lancedb_robotics/training.py",
   "narrative:docs/narratives/lance-native-training-datasets.md",
+  "doc:docs/manual/tutorials/train-from-the-lake.md",
+  "test:tests/test_tutorial_train_from_the_lake.py",
 ]
 
 [[claim]]
@@ -156,6 +158,7 @@ evidence = [
   "test:tests/test_lerobot_view_publish.py",
   "test:tests/test_lerobot_dataset_reader.py",
   "doc:docs/manual/journeys/lerobot-published-views.md",
+  "doc:docs/manual/tutorials/train-from-the-lake.md",
 ]
 
 [[claim]]

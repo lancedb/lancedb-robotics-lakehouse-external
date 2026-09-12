@@ -20,6 +20,8 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Tutorials:
+      - From a raw log to a training batch: tutorials/train-from-the-lake.md
   - Concepts:
       - Overview: concepts/overview.md
       - Architecture: concepts/architecture.md
