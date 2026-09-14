@@ -9,7 +9,8 @@ those same three tables into a ``lance-graph`` property graph so operators can r
 Cypher audit / blast-radius queries over the exact same rows -- with no copy to
 Neo4j, Kùzu, or DataHub.
 
-Design decisions:
+Design decisions (each rationale is recorded alongside the code it
+governs):
 
 - ``lance-graph`` is never a hard dependency. The backend degrades with an
   actionable missing-extra error, mirroring the embeddings/integration adapter

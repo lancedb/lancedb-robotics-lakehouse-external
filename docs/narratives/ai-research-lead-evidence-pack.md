@@ -40,17 +40,17 @@ demonstrated *as a methodology*, or cited *from an external source*.
 | Claim | Where it is grounded | Evidence kind |
 | --- | --- | --- |
 | Raw log → validated episodes → searchable windows → reproducible snapshot → training reads → replay export runs end to end | [baseline showcase narrative](baseline-ingest-to-training-showcase.md) + the pinned test [`tests/test_integration_showcase.py`](../../tests/test_integration_showcase.py) | **Local fixture, runnable** |
-| Enrichment is additive, never an in-place rewrite; old snapshots stay reproducible | decision [0026](../decisions/0026-blob-safe-additive-write-mechanism.md); `add_columns` semantics | **Design decision + code** |
-| Payloads (video, lidar, large binaries) are blob-encoded columns *in* Lance, not external pointers | decision [0024](../decisions/0024-lance-is-the-index-and-fast-access-layer.md) | **Design decision** |
-| IDs are content-addressed, so splits/lineage reproduce across machines | decision [0023](../decisions/0023-content-addressed-portable-run-ids.md) | **Design decision + code** |
-| One wide table per grain, reached by point `take`/lineage, never a join | decision [0025](../decisions/0025-denormalized-enrich-as-column-data-modeling.md); [open questions](../product/open-questions.md) | **Design decision** |
+| Enrichment is additive, never an in-place rewrite; old snapshots stay reproducible | decision 0026; `add_columns` semantics | **Design decision + code** |
+| Payloads (video, lidar, large binaries) are blob-encoded columns *in* Lance, not external pointers | decision 0024 | **Design decision** |
+| IDs are content-addressed, so splits/lineage reproduce across machines | decision 0023 | **Design decision + code** |
+| One wide table per grain, reached by point `take`/lineage, never a join | decision 0025; open questions | **Design decision** |
 | Version-pinned, randomly accessible, shuffled training reads straight from a snapshot — no new shard layout | [Lance-native training narrative](lance-native-training-datasets.md) | **Local fixture, runnable** |
-| Curation/mining workbench (dedup, diversify, stratify, mine failures, saved views, review queues, distribution gaps) | [curation flywheel epic](../product/curation-flywheel-epic.md); `curate` command group | **Shipped surface** |
-| Lineage traces a bad checkpoint back to its exact training slice and source log | [lineage/provenance epic](../product/lineage-provenance-epic.md); `lineage` command group | **Shipped surface** |
-| Performance numbers are structured, reproducible reports, not marketing | [reproducible benchmark suite](reproducible-benchmark-suite.md); backlog [0034](../../.miagent/backlog/0034-benchmark-suite.md) | **Methodology** |
-| NVIDIA SILA: ~10× curation throughput; job startup 30–60 min → ~5 min on a single Lance source of truth | [product vision → Proof Points](../product/product-vision.md#proof-points) | **External proof point** |
-| stable-worldmodel: Push-T throughput ~3.4× over HDF5, ~3.6× over MP4 locally | [product vision → Proof Points](../product/product-vision.md#proof-points) | **External proof point** |
-| ~1.5M IOPS random access on the Lance format | [product vision → Proof Points](../product/product-vision.md#proof-points) | **External proof point (LanceDB-published)** |
+| Curation/mining workbench (dedup, diversify, stratify, mine failures, saved views, review queues, distribution gaps) | curation flywheel epic; `curate` command group | **Shipped surface** |
+| Lineage traces a bad checkpoint back to its exact training slice and source log | lineage/provenance epic; `lineage` command group | **Shipped surface** |
+| Performance numbers are structured, reproducible reports, not marketing | [reproducible benchmark suite](reproducible-benchmark-suite.md); backlog 0034 | **Methodology** |
+| NVIDIA SILA: ~10× curation throughput; job startup 30–60 min → ~5 min on a single Lance source of truth | product vision → Proof Points | **External proof point** |
+| stable-worldmodel: Push-T throughput ~3.4× over HDF5, ~3.6× over MP4 locally | product vision → Proof Points | **External proof point** |
+| ~1.5M IOPS random access on the Lance format | product vision → Proof Points | **External proof point (LanceDB-published)** |
 
 **Read the evidence-kind column literally.** A "local fixture" number describes a
 tiny deterministic sample built for tests — it proves the *code path works and is
@@ -185,7 +185,7 @@ that as a hard rule (see the testing standards in [SKILLS.md](../../SKILLS.md):
 *"never quote a performance number without a retained artifact"*). Concretely:
 
 - The harness is the [reproducible benchmark suite](reproducible-benchmark-suite.md)
-  (backlog [0034](../../.miagent/backlog/0034-benchmark-suite.md)): `bench prepare`
+  (backlog 0034): `bench prepare`
   → `bench run` (or `run-public-lerobot`) → `validate-public-lerobot`.
 - Every reportable number is anchored to a **report id + artifact manifest** that
   records the git commit, the pinned dataset revision, the storage tier, the
@@ -202,7 +202,7 @@ Read benchmark claims in three tiers, and never blur them:
    gives you the shape; you produce the value.
 3. **External proof points** (cited, third-party or upstream): evidence the
    substrate approach scales in the real world. See
-   [product vision → Proof Points](../product/product-vision.md#proof-points) for
+   product vision → Proof Points for
    NVIDIA SILA (~10× curation throughput; job startup 30–60 min → ~5 min),
    stable-worldmodel (Push-T ~3.4× over HDF5, ~3.6× over MP4 locally), and the
    ~1.5M IOPS LanceDB-published format benchmark — each with its source.
@@ -255,7 +255,7 @@ Enterprise remote training (`db://` loading, cache/prewarm, live-endpoint
 hardening and larger-scale orchestration). Planned: foundation-model-as-indexer,
 deeper simulation/reconstruction lineage (Cosmos/NuRec/OpenUSD/Isaac), and
 Iceberg/Delta coexistence. Do not read a 🔭 row as shipped — the
-[enterprise remote training epic](../product/enterprise-remote-training-epic.md)
+enterprise remote training epic
 tracks the scale sequencing.
 
 ---
@@ -307,9 +307,9 @@ tool expects, then write its useful outputs back into the lake with lineage.
 
 Roadmap and Enterprise-scale work is tracked, not implied complete — see the
 README status table and the linked epics
-([curation](../product/curation-flywheel-epic.md),
-[lineage](../product/lineage-provenance-epic.md),
-[enterprise remote training](../product/enterprise-remote-training-epic.md)).
+(curation,
+lineage,
+enterprise remote training).
 
 ---
 
@@ -331,7 +331,7 @@ this pack drifts:
   `<…>` templates) are left behind.
 
 This is the same class of check backlog
-[0138](../../.miagent/backlog/0138-readme-claim-link-and-command-verification.md)
+0138
 applies to the README's claim/link/command surface; the helper functions here are
 written to be promotable into that shared registry when 0138 lands.
 
@@ -344,6 +344,6 @@ written to be promotable into that shared registry when 0138 lands.
   default training path over pinned snapshots.
 - [Reproducible benchmark suite](reproducible-benchmark-suite.md) — performance
   claims as structured, validated reports.
-- [PRD](../product/prd.md) · [product vision](../product/product-vision.md) ·
-  [substrate strategy](../product/lancedb-physical-ai-substrate-strategy.md).
+- PRD · product vision ·
+  substrate strategy.
 - [Manual](../manual/index.md) · [CLI reference](../manual/reference/cli.generated.md).

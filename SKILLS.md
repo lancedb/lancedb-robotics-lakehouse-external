@@ -67,7 +67,7 @@ the API looks the way it does; see
 - Never let an operation silently degrade to a slower/costlier path without
   telling the caller. The enterprise-conformance invariant is: **typed error OR
   explicit fallback, never silent local materialization** (backlog
-  [0116](.miagent/backlog/0116-enterprise-training-conformance-and-fault-injection.md) /
+  0116 /
   `enterprise_conformance.py`,
   `MetadataOnlyViolationError` in `training.py`). A user who thinks they got a
   metadata-only op and actually triggered a full remote fetch has been lied to.
@@ -223,7 +223,7 @@ corpus never fits in RAM.** Concretely, on every new read path:
   the brute-force baseline before trusting it: a real run against this corpus
   saw near-zero recall at default IVF_PQ params, and the lever that mattered was
   `refine_factor`, not `nprobes` (tracked in
-  [backlog 0183](.miagent/backlog/0183-ann-vector-index-validation-at-scale.md)).
+  backlog 0183).
   A vector index with unvalidated recall is worse than exact scan, because it
   looks like it's working.
 

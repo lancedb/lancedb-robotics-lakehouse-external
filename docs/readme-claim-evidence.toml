@@ -56,7 +56,6 @@ key = "ROS bag ingest"
 status = "shipped"
 evidence = [
   "code:src/lancedb_robotics/ingest.py",
-  "backlog:0025",
 ]
 
 [[claim]]
@@ -64,7 +63,6 @@ key = "LeRobot dataset ingest"
 status = "shipped"
 evidence = [
   "code:src/lancedb_robotics/lerobot_object_store_validation.py",
-  "backlog:0127",
 ]
 
 [[claim]]
@@ -73,7 +71,6 @@ status = "shipped"
 evidence = [
   "code:src/lancedb_robotics/storage.py",
   "code:src/lancedb_robotics/connections.py",
-  "backlog:0023",
 ]
 
 [[claim]]
@@ -129,7 +126,6 @@ key = "Curation & mining workbench"
 status = "shipped"
 evidence = [
   "code:src/lancedb_robotics/curate.py",
-  "doc:docs/product/curation-flywheel-epic.md",
 ]
 
 [[claim]]
@@ -183,7 +179,6 @@ status = "shipped"
 evidence = [
   "code:src/lancedb_robotics/lineage.py",
   "code:src/lancedb_robotics/lineage_graph.py",
-  "doc:docs/product/lineage-provenance-epic.md",
 ]
 
 [[claim]]
@@ -207,5 +202,4 @@ status = "evolving"
 evidence = [
   "code:src/lancedb_robotics/pylance_execution.py",
   "code:src/lancedb_robotics/enterprise_conformance.py",
-  "doc:docs/product/enterprise-remote-training-epic.md",
 ]
